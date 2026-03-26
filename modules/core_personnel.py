@@ -20,30 +20,55 @@ def _get_db_connection():
     conn.row_factory = sqlite3.Row
     return conn
 
+
 def add_employee(emp_data, profile_data, reason="新员工入职", change_date=None):
-    actual_date = change_date if change_date else datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    # 以前的逻辑：初始快照时间跟着操作时间走（导致老员工导入时空错乱）
+    # actual_date = change_date if change_date else datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+    # 👇 [核心修改] 强行时空对齐：初始快照的时间，必须 100% 锁死在员工的“入职日期”！
+    join_date = emp_data.get('join_company_date')
+    if join_date:
+        # 如果有入职日期，初始快照的生效时间直接穿越回他入职的那一天
+        initial_snapshot_time = f"{join_date} 00:00:00"
+    else:
+        initial_snapshot_time = change_date if change_date else datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+    # 动态调整快照类型名称，消除“老员工今天入职”的违和感
+    snapshot_type = "期初建档" if "导入" in reason else "新员工入职"
+
     conn = _get_db_connection()
     cursor = conn.cursor()
     try:
+        # 1. 写入主表
         cursor.execute("""
-            INSERT INTO employees (emp_id, name, id_card, dept_id, post_rank, post_grade, status, join_company_date)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (emp_data['emp_id'], emp_data['name'], emp_data['id_card'], emp_data['dept_id'], emp_data['post_rank'], emp_data['post_grade'], emp_data.get('status', '在职'), emp_data.get('join_company_date')))
-
+                       INSERT INTO employees (emp_id, name, id_card, dept_id, post_rank, post_grade, status,
+                                              join_company_date)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                       """, (emp_data['emp_id'], emp_data['name'], emp_data['id_card'], emp_data['dept_id'],
+                             emp_data['post_rank'], emp_data['post_grade'], emp_data.get('status', '在职'),
+                             emp_data.get('join_company_date')))
+        # 2. 写入扩展表
         cursor.execute("""
-            INSERT INTO employee_profiles (emp_id, pos_id, tech_grade, title_order, education_level, degree, school_name, major, graduation_date, first_job_date)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (emp_data['emp_id'], profile_data.get('pos_id'), profile_data.get('tech_grade'), profile_data.get('title_order', 999), profile_data.get('education_level'), profile_data.get('degree'), profile_data.get('school_name'), profile_data.get('major'), profile_data.get('graduation_date'), profile_data.get('first_job_date')))
-
+                       INSERT INTO employee_profiles (emp_id, pos_id, tech_grade, title_order, education_level, degree,
+                                                      school_name, major, graduation_date, first_job_date)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                       """, (emp_data['emp_id'], profile_data.get('pos_id'), profile_data.get('tech_grade'),
+                             profile_data.get('title_order', 999), profile_data.get('education_level'),
+                             profile_data.get('degree'), profile_data.get('school_name'), profile_data.get('major'),
+                             profile_data.get('graduation_date'), profile_data.get('first_job_date')))
+        # 3. 写入快照流水表（使用对其后的 initial_snapshot_time 和 snapshot_type）
         cursor.execute("""
-            INSERT INTO personnel_changes (emp_id, change_type, new_dept_id, new_pos_id, new_tech_grade, new_post_rank, new_post_grade, change_date, change_reason) 
-            VALUES (?, '入职', ?, ?, ?, ?, ?, ?, ?)
-        """, (emp_data['emp_id'], emp_data['dept_id'], profile_data.get('pos_id'), profile_data.get('tech_grade'), emp_data['post_rank'], emp_data['post_grade'], actual_date, reason))
-
+                       INSERT INTO personnel_changes (emp_id, change_type, new_dept_id, new_pos_id, new_tech_grade,
+                                                      new_post_rank, new_post_grade, change_date, change_reason)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                       """, (emp_data['emp_id'], snapshot_type, emp_data['dept_id'], profile_data.get('pos_id'),
+                             profile_data.get('tech_grade'), emp_data['post_rank'], emp_data['post_grade'],
+                             initial_snapshot_time, reason))
         conn.commit()
         return True, f"成功为 {emp_data['name']} 建立档案。"
     except Exception as e:
-        conn.rollback(); return False, str(e)
+        conn.rollback();
+        return False, str(e)
     finally:
         conn.close()
 

@@ -499,7 +499,16 @@ elif current_page == "🕰️ 历史变动流水":
         if hs: f_h = f_h[f_h['emp_name'].str.contains(hs, na=False) | f_h['emp_id'].str.contains(hs, na=False)]
         if ht: f_h = f_h[f_h['change_type'].isin(ht)]
         if hd: f_h = f_h[f_h['old_dept_name'].isin(hd)]
-        if len(d_range) == 2: f_h = f_h[(f_h['dt_obj'].dt.date >= d_range[0]) & (f_h['dt_obj'].dt.date <= d_range[1])]
+        if len(d_range) == 2:
+            # 1. 剔除因没填入职时间导致的空时间(NaT)，防止引擎比对时死机
+            f_h = f_h.dropna(subset=['dt_obj'])
+
+            # 2. 将你选择的日期强转为 Pandas 的时间戳，并包裹一整天的时间范围
+            start_dt = pd.to_datetime(d_range[0])
+            end_dt = pd.to_datetime(d_range[1]) + pd.Timedelta(days=1, seconds=-1)
+
+            # 3. 同类型安全比对
+            f_h = f_h[(f_h['dt_obj'] >= start_dt) & (f_h['dt_obj'] <= end_dt)]
 
         with st.sidebar:
             if not f_h.empty:
