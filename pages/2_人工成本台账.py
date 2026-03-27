@@ -14,6 +14,10 @@ import os
 import io
 from datetime import datetime
 
+# [新增排版引入] 用于 Excel 报表精装修
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+
 st.set_page_config(page_title="人工成本台账", layout="wide")
 
 
@@ -154,35 +158,131 @@ NUMERIC_COLS = list(LEDGER_MAP.keys())[5:]
 
 
 # ==============================================================================
-# 小计与总计运算引擎 (复用模块)
+# 财务级报表引擎：绝对排序、隔离与汇总 (拆除静默雷区版 V3.40)
 # ==============================================================================
 def add_subtotals_and_totals(df, numeric_cols):
     if df.empty: return df
+
+    conn = _get_db_connection()
+    try:
+        # 1. 绝对安全的单表拉取：部门权重
+        dept_df = pd.read_sql_query("SELECT dept_name, sort_order FROM departments", conn)
+        dept_weights = dict(zip(dept_df['dept_name'], dept_df['sort_order']))
+
+        # 2. 绝对安全的单表拉取：岗位权重 (修正表名 positions 和字段 sort_order)
+        pos_df = pd.read_sql_query("SELECT pos_id, sort_order FROM positions", conn)
+        pos_weights = dict(zip(pos_df['pos_id'], pos_df['sort_order']))
+
+        # 3. 绝对安全的单表拉取：人员岗级与岗位挂靠
+        emp_df = pd.read_sql_query("SELECT emp_id, post_rank FROM employees", conn)
+        ep_df = pd.read_sql_query("SELECT emp_id, pos_id FROM employee_profiles", conn)
+
+        # 在 Python 内存中安全拼装人员行政基因，拒绝 SQL JOIN 连环暴雷
+        personnel_meta = {}
+        emp_merged = pd.merge(emp_df, ep_df, on='emp_id', how='left')
+        for _, r in emp_merged.iterrows():
+            eid = str(r['emp_id'])
+            # 如果档案没填岗级，默认沉底 9999
+            p_rank = float(r['post_rank']) if pd.notna(r['post_rank']) else 9999.0
+            p_id = r['pos_id']
+            # 从岗位字典匹配权重
+            p_weight = pos_weights.get(p_id, 9999)
+            personnel_meta[eid] = {
+                'pos_weight': p_weight,
+                'rank_order': p_rank
+            }
+    except Exception as e:
+        # 撕开掩护：如果连基础表都读不出来，直接在后台大喊大叫，绝不静默装死
+        print(f"🚨 [致命错误] 排序引擎拉取底层档案崩溃: {e}")
+        dept_weights, personnel_meta = {}, {}
+    finally:
+        conn.close()
+
+    # 4. 政治正确核心比对器
+    def get_combined_sorter(row):
+        emp_id = str(row.get('工号', ''))
+        emp_status = str(row.get('人员状态', ''))
+        dept_name = str(row.get('归属部门', ''))
+
+        # A. 部门大排序
+        if emp_status == '退休' or '离退休' in dept_name:
+            dept_block_weight = 9999
+        elif emp_status == '公共账目' or '统筹' in dept_name or '公共' in dept_name:
+            dept_block_weight = 9998
+        else:
+            dept_block_weight = dept_weights.get(dept_name, 999)
+
+        # B. 部门内部人员精细化排序
+        meta = personnel_meta.get(emp_id, {})
+        raw_pos_weight = meta.get('pos_weight', 9999)
+        raw_pers_rank = meta.get('rank_order', 9999.0)
+
+        # 先排部门 -> 再排岗位权重(图里的1,2,99) -> 再排个人岗级(带小数点的2.1/2.2)
+        return (dept_block_weight, raw_pos_weight, raw_pers_rank, emp_id)
+
+    # 5. 生成基因列并执行强制排序
+    df['__sort_tuple__'] = df.apply(get_combined_sorter, axis=1)
+    df[['__dept_block__', '__pos_base__', '__pers_rank__', '__fallback_id__']] = pd.DataFrame(
+        df['__sort_tuple__'].tolist(), index=df.index)
+
+    df = df.sort_values(by=['__dept_block__', '__pos_base__', '__pers_rank__', '__fallback_id__'],
+                        ascending=[True, True, True, True])
+
+    # ===== 下方的物理切割与合计代码保持绝对不变 =====
     final_rows = []
 
-    # 按照部门进行分组，保持原有排序
-    dept_groups = df.groupby('归属部门', sort=False)
+    active_mask = df['__dept_block__'] < 9999
+    active_df = df[active_mask]
+    retired_df = df[~active_mask]
 
-    for dept_name, group in dept_groups:
-        final_rows.append(group)  # 塞入该部门的所有员工明细
+    temp_cols = ['__sort_tuple__', '__dept_block__', '__pos_base__', '__pers_rank__', '__fallback_id__']
 
-        # 计算该部门的小计
-        subtotal = pd.Series(index=group.columns, dtype='object')
-        subtotal['归属部门'] = dept_name
-        subtotal['姓名'] = '【部门小计】'
+    if not active_df.empty:
+        for dept_name, group in active_df.groupby('归属部门', sort=False):
+            final_rows.append(group.drop(columns=temp_cols))
+
+            subtotal = pd.Series(index=df.columns, dtype='object')
+            subtotal['归属部门'] = dept_name
+            subtotal['姓名'] = '【小计】'
+            for col in numeric_cols:
+                if col in group.columns: subtotal[col] = group[col].sum()
+            final_rows.append(pd.DataFrame([subtotal.drop(labels=temp_cols)]))
+
+        grand_total = pd.Series(index=df.columns, dtype='object')
+        grand_total['归属部门'] = '【在职及统筹部分】'
+        grand_total['姓名'] = '【实际成本总计】'
         for col in numeric_cols:
-            if col in group.columns: subtotal[col] = group[col].sum()
-        final_rows.append(pd.DataFrame([subtotal]))
+            if col in active_df.columns: grand_total[col] = active_df[col].sum()
+        final_rows.append(pd.DataFrame([grand_total.drop(labels=temp_cols)]))
 
-    # 计算全公司总计
-    grand_total = pd.Series(index=df.columns, dtype='object')
-    grand_total['归属部门'] = '【全公司】'
-    grand_total['姓名'] = '【总计】'
-    for col in numeric_cols:
-        if col in df.columns: grand_total[col] = df[col].sum()
-    final_rows.append(pd.DataFrame([grand_total]))
+    if not retired_df.empty:
+        empty_row = pd.Series(index=df.columns.drop(temp_cols), dtype='object')
+        final_rows.extend([pd.DataFrame([empty_row])] * 3)
 
-    return pd.concat(final_rows, ignore_index=True)
+        for dept_name, group in retired_df.groupby('归属部门', sort=False):
+            final_rows.append(group.drop(columns=temp_cols))
+
+            retire_subtotal = pd.Series(index=df.columns, dtype='object')
+            retire_subtotal['归属部门'] = dept_name
+            retire_subtotal['姓名'] = '【小计】'
+            for col in numeric_cols:
+                if col in group.columns: retire_subtotal[col] = group[col].sum()
+            final_rows.append(pd.DataFrame([retire_subtotal.drop(labels=temp_cols)]))
+
+    final_df = pd.concat(final_rows, ignore_index=True)
+
+    seq_list = []
+    current_seq = 1
+    for _, row in final_df.iterrows():
+        name_val = str(row.get('姓名', ''))
+        if pd.isna(row.get('姓名')) or '【' in name_val:
+            seq_list.append("")
+        else:
+            seq_list.append(current_seq)
+            current_seq += 1
+
+    final_df.insert(0, '序号', seq_list)
+    return final_df
 
 # ==============================================================================
 # UI 消息锁
@@ -235,6 +335,44 @@ def get_ledger_data(month_filter=None, dept_filter=None):
 
 
 # ==============================================================================
+# Excel 财务级排版渲染引擎
+# ==============================================================================
+def format_excel_sheet(worksheet, df_columns):
+    # 1. 冻结首行，方便领导往下滚动查阅
+    worksheet.freeze_panes = 'A2'
+
+    # 2. 定义标准财务边框与表头底色
+    thin_border = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'),
+                         bottom=Side(style='thin'))
+    header_fill = PatternFill(start_color="D9D9D9", end_color="D9D9D9", fill_type="solid")  # 高级灰
+
+    # 3. 逐列进行精细化渲染
+    for col_idx, col_name in enumerate(df_columns, 1):
+        col_letter = get_column_letter(col_idx)
+
+        # 智能扩充列宽 (如果是金额列稍微宽点，部门/姓名等适中)
+        worksheet.column_dimensions[col_letter].width = 15 if col_name in NUMERIC_COLS else 12
+        worksheet.column_dimensions[col_letter].width = 8 if col_name == '序号' else (15 if col_name in NUMERIC_COLS else 12)
+        # 遍历该列所有单元格
+        for row_idx in range(1, worksheet.max_row + 1):
+            cell = worksheet[f"{col_letter}{row_idx}"]
+            cell.border = thin_border  # 加上全框线
+
+            if row_idx == 1:
+                # 表头渲染：加粗、居中、填色
+                cell.font = Font(bold=True)
+                cell.fill = header_fill
+                cell.alignment = Alignment(horizontal='center', vertical='center')
+            else:
+                # 数据行渲染
+                if col_name in NUMERIC_COLS:
+                    # [核心] 所有金额列强制变为带千分位和两位小数的财务格式
+                    cell.number_format = '#,##0.00'
+                    cell.alignment = Alignment(horizontal='right', vertical='center')
+                else:
+                    # 姓名、部门等文本居中
+                    cell.alignment = Alignment(horizontal='center', vertical='center')
+# ==============================================================================
 # 页面框架
 # ==============================================================================
 st.title("💰 人工成本台账管理中心")
@@ -264,20 +402,29 @@ with tab1:
                              dept_filter=f_dept if f_dept else None)
 
     if not raw_df.empty:
-        # 顶层指标卡片
+        # 计算顶层指标
         total_cost = raw_df['total_labor_cost'].sum()
         total_gross = raw_df['gross_salary_total'].sum()
+        total_other = raw_df['other_cost_total'].sum() # [新增] 提取其他人工成本合计
         total_headcount = len(raw_df)
 
-        m1, m2, m3 = st.columns(3)
+        # 将原来的 3 列改为 4 列展示
+        m1, m2, m3, m4 = st.columns(4)
         m1.metric("当期总人工成本 (元)", f"{total_cost:,.2f}")
-        m2.metric("当期总工资应发 (元)", f"{total_gross:,.2f}")
-        m3.metric("发薪/核算总人次", f"{total_headcount} 人次")
+        m2.metric("工资应发合计 (元)", f"{total_gross:,.2f}")
+        m3.metric("其他人工成本合计 (元)", f"{total_other:,.2f}") # [新增] 展示其他成本
+        m4.metric("发薪/核算总人次", f"{total_headcount} 人次")
 
-        # 核心数据流展示 (替换为纯净中文表头)
+        # 核心数据流展示
+        # 核心数据流展示 (注入中文表头与序号)
         disp_df = raw_df.rename(columns=DB_TO_CN_MAP)
-        st.dataframe(disp_df[[col for col in LEDGER_MAP.keys() if col in disp_df.columns]], use_container_width=True,
-                     hide_index=True)
+        disp_cols = [col for col in LEDGER_MAP.keys() if col in disp_df.columns]
+        disp_final = disp_df[disp_cols].copy()
+
+        # [新增] 为前端看板强行插入自增的序号列
+        disp_final.insert(0, '序号', range(1, len(disp_final) + 1))
+
+        st.dataframe(disp_final, use_container_width=True, hide_index=True)
     else:
         st.info("💡 当前筛选条件下暂无台账数据。")
 
@@ -324,6 +471,9 @@ with tab2:
                     summary_final = add_subtotals_and_totals(summary_cn, NUMERIC_COLS)
                     summary_final.to_excel(writer, index=False, sheet_name='累计汇总')
 
+                    # [新增] 触发排版渲染
+                    format_excel_sheet(writer.sheets['累计汇总'], summary_final.columns)
+
                     # ======= Sheet 2~N: 生成各单月的【明细表】 =======
                     # 按照选中的月份顺序列出
                     for month in sorted(selected_months):
@@ -345,6 +495,9 @@ with tab2:
                             safe_sheet_name = f"{safe_month[:28]}明细"
 
                             month_final.to_excel(writer, index=False, sheet_name=safe_sheet_name)
+
+                            # [新增] 触发排版渲染
+                            format_excel_sheet(writer.sheets[safe_sheet_name], month_final.columns)
 
                 # 4. 推送下载
                 file_name = f"人工成本台账汇报_{len(selected_months)}个月汇总.xlsx"

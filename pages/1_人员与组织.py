@@ -286,17 +286,105 @@ elif current_page == "👥 人员档案":
     with c1: q_name = st.text_input("工号/姓名")
     with c2: q_dept = st.multiselect("部门", options=df_depts['dept_name'].tolist())
     with c3: q_status = st.multiselect("状态", options=["在职", "离职", "退休"], default=["在职"])
-    with c4: st.write(""); export_btn = st.button("📥 导出当前名单")
 
     f_df = df_emps.copy()
     if q_name: f_df = f_df[f_df['name'].str.contains(q_name) | f_df['emp_id'].str.contains(q_name)]
     if q_dept: f_df = f_df[f_df['dept_name'].isin(q_dept)]
     if q_status: f_df = f_df[f_df['status'].isin(q_status)]
 
+    # ==========================================================================
+    # [核心修复 1] 注入与财务台账同等级别的绝对排序基因
+    # ==========================================================================
+    if not f_df.empty:
+        # 提取部门与岗位权重
+        dept_weight_map = {r['dept_name']: r['sort_order'] for _, r in df_depts.iterrows()} if not df_depts.empty else {}
+        pos_weight_map = {r['pos_name']: r['sort_order'] for _, r in df_positions.iterrows()} if not df_positions.empty else {}
+
+        def get_emp_sort_keys(row):
+            d_name = str(row.get('dept_name', ''))
+            p_name = str(row.get('pos_name', ''))
+            status = str(row.get('status', ''))
+
+            # 1. 部门大权重
+            if status == '退休' or '离退休' in d_name: d_weight = 9999
+            elif status == '公共账目' or '统筹' in d_name or '公共' in d_name: d_weight = 9998
+            else: d_weight = dept_weight_map.get(d_name, 999)
+
+            # 2. 岗位大权重 (图里总经理1，副总2)
+            p_weight = pos_weight_map.get(p_name, 999)
+
+            # 3. 个人锚点小权重 (带小数点的 21.2)
+            try: r_weight = float(row.get('post_rank', 9999.0)) if pd.notna(row.get('post_rank')) else 9999.0
+            except: r_weight = 9999.0
+
+            return (d_weight, p_weight, r_weight, str(row.get('emp_id', '')))
+
+        # 执行强力排序
+        f_df['__sort_tuple__'] = f_df.apply(get_emp_sort_keys, axis=1)
+        f_df[['__dw__', '__pw__', '__rw__', '__id__']] = pd.DataFrame(f_df['__sort_tuple__'].tolist(), index=f_df.index)
+        f_df = f_df.sort_values(by=['__dw__', '__pw__', '__rw__', '__id__'], ascending=[True, True, True, True])
+        f_df = f_df.drop(columns=['__sort_tuple__', '__dw__', '__pw__', '__rw__', '__id__'])
+
+    # ==========================================================================
+    # [核心修复 2] 满血版全量美化导出引擎
+    # ==========================================================================
+    with c4:
+        st.write("")
+        if not f_df.empty:
+            import sqlite3, os
+            from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+            from openpyxl.utils import get_column_letter
+
+            def format_roster_sheet(worksheet, df_columns):
+                worksheet.freeze_panes = 'A2'
+                thin_border = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
+                header_fill = PatternFill(start_color="D9D9D9", end_color="D9D9D9", fill_type="solid")
+                for col_idx, col_name in enumerate(df_columns, 1):
+                    col_letter = get_column_letter(col_idx)
+                    # 身份证、学校名字长一点，其它适中
+                    worksheet.column_dimensions[col_letter].width = 20 if col_name in ['身份证号', '毕业院校', '专业'] else 13
+                    for row_idx in range(1, worksheet.max_row + 1):
+                        cell = worksheet[f"{col_letter}{row_idx}"]
+                        cell.border = thin_border
+                        if row_idx == 1:
+                            cell.font = Font(bold=True)
+                            cell.fill = header_fill
+                        cell.alignment = Alignment(horizontal='center', vertical='center')
+
+            # 击穿底层：拉取扩展表数据实现“绝对全量”
+            db_path = os.path.join('database', 'hr_core.db')
+            conn = sqlite3.connect(db_path)
+            profiles_df = pd.read_sql_query("SELECT * FROM employee_profiles", conn)
+            conn.close()
+
+            # 拼接并重命名
+            out_df = pd.merge(f_df, profiles_df, on='emp_id', how='left')
+            out_df = out_df.rename(columns={
+                'emp_id': '工号', 'name': '姓名', 'id_card': '身份证号', 'dept_name': '部门', 'pos_name': '岗位',
+                'post_rank': '岗级', 'post_grade': '档次', 'tech_grade': 'T级', 'join_company_date': '入职日期',
+                'status': '状态', 'education_level': '学历', 'degree': '学位', 'school_name': '毕业院校',
+                'major': '专业', 'graduation_date': '毕业日期', 'first_job_date': '参加工作日期'
+            })
+
+            # 整理老板想看的专业顺序
+            eo = ['工号', '姓名', '部门', '岗位', '岗级', '档次', 'T级', '状态', '入职日期', '参加工作日期', '身份证号', '学历', '学位', '毕业院校', '专业', '毕业日期']
+            out_df = out_df[[c for c in eo if c in out_df.columns]]
+
+            # 执行导出与渲染
+            ob = io.BytesIO()
+            with pd.ExcelWriter(ob, engine='openpyxl') as w:
+                out_df.to_excel(w, index=False, sheet_name='员工花名册')
+                format_roster_sheet(w.sheets['员工花名册'], out_df.columns)
+
+            st.download_button("📥 导出全量美化名单", data=ob.getvalue(), file_name=f"人员档案_{date.today()}.xlsx", type="primary")
+        else:
+            st.button("📥 导出全量美化名单", disabled=True)
+
+    # 渲染到前端界面的展示列
     disp = f_df.rename(columns=EMP_COL_MAP)
+    # [核心修复：补回防爆底线] 确保无论有没有选中人，变量都存在
     t_emp_sel = None
     if not disp.empty:
-        # [核心防御 2026-03-27] 动态列名推导，确保绝对不会出现 KeyError
         target_cols = ['工号', '姓名', '部门', '岗位', 'T级', '岗级', '档次', '状态']
         ui_cols = [c for c in target_cols if c in disp.columns]
 
@@ -305,15 +393,22 @@ elif current_page == "👥 人员档案":
         edited_df = st.data_editor(disp_ui, hide_index=True, use_container_width=True, key=st.session_state.editor_key, column_config={"✅勾选修改": st.column_config.CheckboxColumn(required=True)})
         selected_rows = edited_df[edited_df["✅勾选修改"] == True]
         if not selected_rows.empty:
-            t_emp_sel = df_emps[df_emps['emp_id'] == selected_rows.iloc[0]['工号']].iloc[0]
-            st.info(f"已锁定: {t_emp_sel['name']}")
+            sel_id = selected_rows.iloc[0]['工号']
 
-    if export_btn:
-        eo = ['工号', '姓名', '部门', '岗位', '身份证号', '岗级', '档次', 'T级', '入职日期', '学历', '学位', '毕业院校', '专业', '毕业日期', '参加工作日期', '状态']
-        out_df = disp[[c for c in eo if c in disp.columns]] if not disp.empty else pd.DataFrame()
-        ob = io.BytesIO()
-        with pd.ExcelWriter(ob, engine='openpyxl') as w: out_df.to_excel(w, index=False, sheet_name='花名册')
-        st.download_button("点击下载 Excel", data=ob.getvalue(), file_name=f"人员档案.xlsx")
+            # 拉取完整底层数据用于回显
+            import sqlite3, os
+            db_path = os.path.join('database', 'hr_core.db')
+            conn = sqlite3.connect(db_path)
+            conn.row_factory = sqlite3.Row
+            full_emp_df = pd.read_sql_query("""
+                SELECT e.*, p.* FROM employees e 
+                LEFT JOIN employee_profiles p ON e.emp_id = p.emp_id 
+                WHERE e.emp_id = ?
+            """, conn, params=[sel_id])
+            conn.close()
+
+            t_emp_sel = full_emp_df.iloc[0].to_dict() if not full_emp_df.empty else df_emps[df_emps['emp_id'] == sel_id].iloc[0]
+            st.info(f"已锁定: {t_emp_sel['name']}")
 
     st.divider()
 
@@ -398,7 +493,10 @@ elif current_page == "👥 人员档案":
                 def_d = t_emp_sel.get('dept_id') if t_emp_sel is not None else None
                 fdept = st.selectbox("部门*", options=list(dm.keys()), format_func=lambda x: dm[x], index=list(dm.keys()).index(def_d) if def_d in dm else 0) if dm else None
 
-                frank = st.number_input("岗级*", 0, 28, int(t_emp_sel.get('post_rank', 11)) if t_emp_sel is not None and pd.notna(t_emp_sel.get('post_rank')) else 11)
+                # 强行开启小数支持，步长为 0.1
+                frank = st.number_input("岗级*", 0.0, 28.0,
+                                        float(t_emp_sel.get('post_rank', 11.0)) if t_emp_sel is not None and pd.notna(
+                                            t_emp_sel.get('post_rank')) else 11.0, step=0.1, format="%.1f")
 
                 g_opts = ["-","A","B","C","D","E","F","G","H","I","J"]
                 cur_g = str(t_emp_sel.get('post_grade', 'E')) if t_emp_sel is not None and pd.notna(t_emp_sel.get('post_grade')) else 'E'
@@ -410,8 +508,10 @@ elif current_page == "👥 人员档案":
 
                 ftg = st.text_input("T级", value=str(t_emp_sel.get('tech_grade', "")) if t_emp_sel is not None and pd.notna(t_emp_sel.get('tech_grade')) else "")
 
-                fjoin_val = pd.to_datetime(t_emp_sel.get('join_company_date')) if t_emp_sel is not None and pd.notna(t_emp_sel.get('join_company_date')) else date.today()
-                fjoin = st.date_input("入职日", value=fjoin_val)
+                fjoin_val = pd.to_datetime(t_emp_sel.get('join_company_date')) if t_emp_sel is not None and pd.notna(
+                    t_emp_sel.get('join_company_date')) else date.today()
+                # 强行突破 10 年限制
+                fjoin = st.date_input("入职日", value=fjoin_val, min_value=date(1950, 1, 1))
 
                 # 👇 新增：附加学籍与工作时间区 👇
                 st.write("**--- 附加学籍与工作时间 ---**")
@@ -432,16 +532,14 @@ elif current_page == "👥 人员档案":
                                             value=str(t_emp_sel.get('major', "")) if t_emp_sel is not None and pd.notna(
                                                 t_emp_sel.get('major')) else "")
                 with fp3:
-                    f_grad_date_val = pd.to_datetime(
-                        t_emp_sel.get('graduation_date')) if t_emp_sel is not None and pd.notna(
-                        t_emp_sel.get('graduation_date')) else None
-                    f_grad_date = st.date_input("毕业日期", value=f_grad_date_val)
+                    # [核心修复 2]：强制转换为标准 date 对象，防止 Streamlit 时间轴崩溃
+                    grad_raw = t_emp_sel.get('graduation_date') if t_emp_sel is not None else None
+                    f_grad_date_val = pd.to_datetime(grad_raw).date() if pd.notna(grad_raw) and str(grad_raw).strip() != '' else None
+                    f_grad_date = st.date_input("毕业日期", value=f_grad_date_val, min_value=date(1950, 1, 1))
 
-                    # 核心找回：参加工作时间 (工龄计算基准)
-                    f_first_work_val = pd.to_datetime(
-                        t_emp_sel.get('first_job_date')) if t_emp_sel is not None and pd.notna(
-                        t_emp_sel.get('first_job_date')) else None
-                    f_first_work = st.date_input("参加工作时间*", value=f_first_work_val)
+                    first_work_raw = t_emp_sel.get('first_job_date') if t_emp_sel is not None else None
+                    f_first_work_val = pd.to_datetime(first_work_raw).date() if pd.notna(first_work_raw) and str(first_work_raw).strip() != '' else None
+                    f_first_work = st.date_input("参加工作时间*", value=f_first_work_val, min_value=date(1950, 1, 1))
                 # 👆 新增结束 👆
 
             st.write("**--- 状态与快照控制 ---**")
@@ -457,7 +555,10 @@ elif current_page == "👥 人员档案":
                 elif t_emp_sel is not None and not frsn: st.error("必填说明")
                 else:
                     idc_val = fidc.strip() if fidc.strip() else None
-                    ed = {'emp_id': fid, 'name': fname, 'id_card': idc_val, 'dept_id': int(fdept), 'post_rank': int(frank), 'post_grade': fgrade, 'status': fst, 'join_company_date': fjoin.strftime('%Y-%m-%d')}
+                    # [核心修复 3]：将 int(frank) 强转改为 float(frank)，彻底保住 2.1 这种精细化锚点
+                    ed = {'emp_id': fid, 'name': fname, 'id_card': idc_val, 'dept_id': int(fdept),
+                          'post_rank': float(frank), 'post_grade': fgrade, 'status': fst,
+                          'join_company_date': fjoin.strftime('%Y-%m-%d')}
                     # 👇 修改：将找回的字段存入扩展表字典 👇
                     pd_i = {
                         'pos_id': int(fpos) if fpos else None,
