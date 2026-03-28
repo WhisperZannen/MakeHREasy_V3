@@ -533,39 +533,27 @@ with tab3:
 
             try:
                 for idx, row in in_df.iterrows():
+                    # ==========================================================
+                    # [核心修复：智能清洗引擎]
+                    # 自动拦截报表导出时产生的“小计”、“总计”、“防撞空行”等无效数据
+                    # ==========================================================
+                    e_name = str(row.get('姓名', '')).strip()
+                    d_name = str(row.get('归属部门', '')).strip()
+
+                    # 规则 A：只要姓名或部门名称里带有特殊括号【】，一律判定为汇总行，直接跳过
+                    if '【' in e_name or '【' in d_name:
+                        continue
+
                     # 校验核心双主键
                     c_month = str(row.get('核算月份', '')).strip()
                     e_id = str(row.get('工号', '')).strip()
 
+                    # 规则 B：防撞空行或关键主键缺失，直接跳过
                     if not c_month or not e_id or c_month == 'nan' or e_id == 'nan':
-                        err_logs.append(f"行 {idx + 2}: 核算月份或工号缺失，跳过。")
                         continue
 
                     # 构建写入字典，缺失的数值列一律填充为 0.0
                     db_data = {}
-                    for cn_col, db_col in LEDGER_MAP.items():
-                        val = row.get(cn_col)
-                        if db_col in ['cost_month', 'emp_id', 'emp_name', 'dept_name', 'emp_status']:
-                            db_data[db_col] = str(val).strip() if pd.notna(val) else ""
-                        else:
-                            try:
-                                db_data[db_col] = float(val) if pd.notna(val) else 0.0
-                            except:
-                                db_data[db_col] = 0.0
-
-                    # 动态构建 SQLite 的 UPSERT 语句 (ON CONFLICT DO UPDATE)
-                    cols = list(db_data.keys())
-                    placeholders = ",".join(["?"] * len(cols))
-                    updates = ",".join([f"{c}=excluded.{c}" for c in cols if c not in ['cost_month', 'emp_id']])
-
-                    sql = f"""
-                        INSERT INTO labor_cost_ledger ({','.join(cols)})
-                        VALUES ({placeholders})
-                        ON CONFLICT(cost_month, emp_id) 
-                        DO UPDATE SET {updates}
-                    """
-                    cursor.execute(sql, tuple(db_data.values()))
-                    success_count += 1
 
                 conn.commit()
                 if err_logs: st.warning("部分记录未成功:\n" + "\n".join(err_logs))
