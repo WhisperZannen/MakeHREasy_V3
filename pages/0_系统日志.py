@@ -3,7 +3,7 @@ from modules.utils import get_git_changelog
 
 st.set_page_config(page_title="系统更新日志", layout="wide")
 
-st.title("🕰️ 系统演化日志")
+st.title("🕰️ 系统更新日志")
 st.caption("基于 Git Commit 记录自动生成，记录项目每一次的成长与纠偏。")
 
 changelog_df = get_git_changelog(limit=30)
