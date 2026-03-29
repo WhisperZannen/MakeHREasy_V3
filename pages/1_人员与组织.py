@@ -1,11 +1,11 @@
 # ==============================================================================
 # 文件路径: pages/1_人员与组织.py
-# 功能描述: 人员与组织架构管理中枢 (V3.18 强类型防爆与全量满血版)
+# 功能描述: 人员与组织架构管理中枢 (V3.19 挂靠人员兼容与工号解耦版)
 # 实现了什么具体逻辑:
 #   1. [核心防御] 彻底修复 Pandas Series 布尔判定歧义导致的 ValueError。
 #   2. [核心防御] 引入动态列名推导，根除 KeyError: ['部门'] not in index 崩溃。
 #   3. [全量复原] 满血召回“历史变动流水”的侧边栏高级多维筛选与时段 Excel 导出。
-#   4. [绝对全量] 保持部门导入、岗位导入、人员 UPSERT(含离退自动入池) 模块一字不漏。
+#   4. [状态对齐] 全面接入“挂靠人员”状态，支持以社保编号作为虚拟工号录入。
 # ==============================================================================
 
 import streamlit as st
@@ -60,7 +60,7 @@ if 'editor_key' not in st.session_state:
 DEPT_COL_MAP = {'dept_id': '部门ID', 'dept_name': '部门名称', 'dept_category': '性质', 'parent_dept_id': '上级ID', 'sort_order': '权重', 'status': '状态'}
 POS_COL_MAP = {'pos_id': '岗位ID', 'pos_name': '岗位名称', 'pos_category': '序列', 'sort_order': '权重', 'status': '状态'}
 EMP_COL_MAP = {
-    'emp_id': '工号', 'name': '姓名', 'id_card': '身份证号', 'dept_id': '部门ID', 'pos_id': '岗位ID',
+    'emp_id': '工号/编号', 'name': '姓名', 'id_card': '身份证号', 'dept_id': '部门ID', 'pos_id': '岗位ID',
     'post_rank': '岗级', 'post_grade': '档次', 'join_company_date': '入职日期', 'status': '状态',
     'pos_name': '岗位', 'tech_grade': 'T级', 'dept_name': '部门'
 }
@@ -283,9 +283,9 @@ elif current_page == "👥 人员档案":
 
     st.subheader("🔍 人员检索与档案控制")
     c1, c2, c3, c4 = st.columns(4)
-    with c1: q_name = st.text_input("工号/姓名")
+    with c1: q_name = st.text_input("工号/姓名/社保编号")
     with c2: q_dept = st.multiselect("部门", options=df_depts['dept_name'].tolist())
-    with c3: q_status = st.multiselect("状态", options=["在职", "离职", "退休"], default=["在职"])
+    with c3: q_status = st.multiselect("状态", options=["在职", "离职", "退休","挂靠人员"], default=["在职", "挂靠人员"])
 
     f_df = df_emps.copy()
     if q_name: f_df = f_df[f_df['name'].str.contains(q_name) | f_df['emp_id'].str.contains(q_name)]
@@ -307,6 +307,7 @@ elif current_page == "👥 人员档案":
 
             # 1. 部门大权重
             if status == '退休' or '离退休' in d_name: d_weight = 9999
+            elif status == '挂靠人员': d_weight = 9000  # [新增] 挂靠人员排在在职之后，离退休之前
             elif status == '公共账目' or '统筹' in d_name or '公共' in d_name: d_weight = 9998
             else: d_weight = dept_weight_map.get(d_name, 999)
 
@@ -360,14 +361,14 @@ elif current_page == "👥 人员档案":
             # 拼接并重命名
             out_df = pd.merge(f_df, profiles_df, on='emp_id', how='left')
             out_df = out_df.rename(columns={
-                'emp_id': '工号', 'name': '姓名', 'id_card': '身份证号', 'dept_name': '部门', 'pos_name': '岗位',
+                'emp_id': '工号/编号', 'name': '姓名', 'id_card': '身份证号', 'dept_name': '部门', 'pos_name': '岗位',
                 'post_rank': '岗级', 'post_grade': '档次', 'tech_grade': 'T级', 'join_company_date': '入职日期',
                 'status': '状态', 'education_level': '学历', 'degree': '学位', 'school_name': '毕业院校',
                 'major': '专业', 'graduation_date': '毕业日期', 'first_job_date': '参加工作日期'
             })
 
             # 整理老板想看的专业顺序
-            eo = ['工号', '姓名', '部门', '岗位', '岗级', '档次', 'T级', '状态', '入职日期', '参加工作日期', '身份证号', '学历', '学位', '毕业院校', '专业', '毕业日期']
+            eo = ['工号/编号', '姓名', '部门', '岗位', '岗级', '档次', 'T级', '状态', '入职日期', '参加工作日期', '身份证号', '学历', '学位', '毕业院校', '专业', '毕业日期']
             out_df = out_df[[c for c in eo if c in out_df.columns]]
 
             # 执行导出与渲染
@@ -385,7 +386,7 @@ elif current_page == "👥 人员档案":
     # [核心修复：补回防爆底线] 确保无论有没有选中人，变量都存在
     t_emp_sel = None
     if not disp.empty:
-        target_cols = ['工号', '姓名', '部门', '岗位', 'T级', '岗级', '档次', '状态']
+        target_cols = ['工号/编号', '姓名', '部门', '岗位', 'T级', '岗级', '档次', '状态']
         ui_cols = [c for c in target_cols if c in disp.columns]
 
         disp_ui = disp[ui_cols].copy()
@@ -393,7 +394,7 @@ elif current_page == "👥 人员档案":
         edited_df = st.data_editor(disp_ui, hide_index=True, use_container_width=True, key=st.session_state.editor_key, column_config={"✅勾选修改": st.column_config.CheckboxColumn(required=True)})
         selected_rows = edited_df[edited_df["✅勾选修改"] == True]
         if not selected_rows.empty:
-            sel_id = selected_rows.iloc[0]['工号']
+            sel_id = selected_rows.iloc[0]['工号/编号']
 
             # 拉取完整底层数据用于回显
             import sqlite3, os
@@ -413,7 +414,7 @@ elif current_page == "👥 人员档案":
     st.divider()
 
     with st.expander("📥 批量智能导入 (支持离退免检与存在即更新)"):
-        st.info("💡 若状态填为【离职/退休】，部门岗位可留空，系统将自动编入【离退休公共池】与【无岗位】，岗级记为 0。")
+        st.info("💡 若状态填为【离职/退休】，部门岗位可留空，系统将自动编入【离退休公共池】；若状态为【挂靠人员】，工号可填入社保编号。")
         t1, t2 = st.columns(2)
         with t1:
             icols = ['工号', '姓名', '状态', '所属部门', '岗位', '技术等级(T级)', '身份证号', '岗级', '档次', '入职日期', '参加工作日期', '学历', '学位', '毕业院校', '专业', '毕业日期']
@@ -481,11 +482,11 @@ elif current_page == "👥 人员档案":
 
     # [核心修复 2026-03-27] 极度严谨的类型推导，彻底根绝 ValueError 歧义死机
     with st.expander("📝 单条维护区", expanded=True):
-        if t_emp_sel is None: st.warning("💡 新增模式。如果录入离退休人员，部门/岗位请选系统默认的公共池。")
+        if t_emp_sel is None: st.warning("💡 新增模式。如果录入挂靠人员，工号处可直接填写其社保编号。")
         with st.form("emp_form", clear_on_submit=True):
             f1, f2, f3 = st.columns(3)
             with f1:
-                fid = st.text_input("工号*", value=str(t_emp_sel.get('emp_id', "")) if t_emp_sel is not None else "", disabled=(t_emp_sel is not None))
+                fid = st.text_input("工号/社保编号*", value=str(t_emp_sel.get('emp_id', "")) if t_emp_sel is not None else "", help="挂靠人员请直接填写社保编号", disabled=(t_emp_sel is not None))
                 fname = st.text_input("姓名*", value=str(t_emp_sel.get('name', "")) if t_emp_sel is not None else "")
                 fidc = st.text_input("身份证", value=str(t_emp_sel.get('id_card', "")) if t_emp_sel is not None and pd.notna(t_emp_sel.get('id_card')) else "")
             with f2:
@@ -546,7 +547,8 @@ elif current_page == "👥 人员档案":
             cs1, cs2, cs3 = st.columns(3)
             with cs1:
                 cur_s = str(t_emp_sel.get('status', '在职')) if t_emp_sel is not None and pd.notna(t_emp_sel.get('status')) else "在职"
-                fst = st.selectbox("当前状态", ["在职", "离职", "退休"], index=["在职", "离职", "退休"].index(cur_s) if cur_s in ["在职", "离职", "退休"] else 0)
+                s_opts = ["在职", "挂靠人员", "离职", "退休"]
+                fst = st.selectbox("当前状态", s_opts, index=s_opts.index(cur_s) if cur_s in s_opts else 0)
             with cs2: fcd = st.date_input("生效日期*", value=date.today())
             with cs3: frsn = st.text_input("变动说明*", placeholder="必填")
 

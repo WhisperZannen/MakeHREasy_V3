@@ -418,14 +418,39 @@ with tab2:
             st.warning("请填写目标月份！")
         else:
             conn = _get_db_connection()
+            # 1. 拉取基准月账单
             base_df = pd.read_sql_query("SELECT * FROM labor_cost_ledger WHERE cost_month = ?", conn, params=[base_month])
-            active_emps = pd.read_sql_query("SELECT emp_id, name, dept_id, status FROM employees WHERE status = '在职'", conn)
-            # [核心修复] 拆解危险的 zip 单行代码，使用原生 Pandas 序列映射，绝不引发长短键值对报错
-            _tmp_dept_df = pd.read_sql_query("SELECT dept_id, dept_name FROM departments", conn)
-            dept_dict = dict(zip(_tmp_dept_df['dept_id'], _tmp_dept_df['dept_name']))
+            # 2. 拉取全量员工（获取最新状态，用于清理离职）
+            all_emps = pd.read_sql_query("SELECT emp_id, name, dept_id, status FROM employees", conn)
+            # 3. 仅拉取在职员工（用于补充新人）
+            active_emps = all_emps[all_emps['status'] == '在职']
+            dept_dict = dict(zip(pd.read_sql_query("SELECT dept_id, dept_name FROM departments", conn).itertuples(index=False)))
             conn.close()
 
             if not base_df.empty:
+                # ======================================================
+                # [核心修正] 离职人员“幽灵账目”滚动清理器
+                # ======================================================
+                emp_status_dict = dict(zip(all_emps['emp_id'], all_emps['status']))
+                keep_mask = []
+                for _, row in base_df.iterrows():
+                    eid = str(row['emp_id'])
+                    cost = row.get('total_labor_cost', 0.0)
+                    if pd.isna(cost): cost = 0.0
+
+                    # 获取该员工在人事档案中的最新真实状态
+                    curr_status = emp_status_dict.get(eid, row.get('emp_status', '在职'))
+
+                    # 规则：如果他已离职，并且在基准月(上个月)已经没有产生任何人工成本，果断抛弃！
+                    if '离职' in curr_status and cost == 0.0:
+                        keep_mask.append(False)
+                    else:
+                        keep_mask.append(True)
+
+                # 执行过滤
+                base_df = base_df[keep_mask]
+                # ======================================================
+
                 base_df['cost_month'] = target_month
                 base_emp_ids = set(base_df['emp_id'].tolist())
                 new_emps = active_emps[~active_emps['emp_id'].isin(base_emp_ids)]
