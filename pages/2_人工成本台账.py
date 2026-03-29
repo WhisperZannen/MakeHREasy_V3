@@ -6,6 +6,7 @@
 #   2. [看板口径] 严格剔除离退休人员，确保前端指标卡片与报表“实际成本总计”分毫不差。
 #   3. [底层清洗] 加入静默 DB 脏数据清洗与导入时的时间戳截断器，永久告别时分秒。
 #   4. [精准拦截] 修复智能清洗引擎的“过度防卫”，只拦截标准汇总行，放行带特殊符号的正常数据。
+#   5. [自动生吃] 彻底打通与 ss_monthly_records 的经络，新月底表自动抓取社保数据。
 # ==============================================================================
 
 import streamlit as st
@@ -24,10 +25,12 @@ st.set_page_config(page_title="人工成本台账", layout="wide")
 # 数据库与字段映射中枢
 # ==============================================================================
 def _get_db_connection():
+    # 获取数据库的绝对安全路径，防止跨层级调用找不到文件
     current_dir = os.path.dirname(os.path.abspath(__file__))
     project_root = os.path.dirname(current_dir)
     db_path = os.path.join(project_root, 'database', 'hr_core.db')
     conn = sqlite3.connect(db_path)
+    # 强制开启外键约束，保证数据完整性
     conn.execute("PRAGMA foreign_keys = ON;")
     conn.row_factory = sqlite3.Row
     return conn
@@ -37,6 +40,7 @@ def _cleanse_db_timestamps():
     conn = _get_db_connection()
     cursor = conn.cursor()
     try:
+        # 直接在底层砍掉多余的时分秒，只保留 YYYY-MM
         cursor.execute("UPDATE labor_cost_ledger SET cost_month = substr(cost_month, 1, 7) WHERE length(cost_month) > 7")
         conn.commit()
     except Exception:
@@ -46,6 +50,7 @@ def _cleanse_db_timestamps():
 
 _cleanse_db_timestamps()
 
+# 核心字典：负责前端中文表头与底层英文列名的双向翻译
 LEDGER_MAP = {
     '核算月份': 'cost_month', '工号': 'emp_id', '姓名': 'emp_name', '归属部门': 'dept_name', '人员状态': 'emp_status',
     '岗位工资': 'base_salary', '工龄工资': 'seniority_pay', '综合补贴': 'comp_subsidy', '岗位绩效浮动补贴': 'perf_float_subsidy',
@@ -64,6 +69,7 @@ LEDGER_MAP = {
     '其他人工成本合计': 'other_cost_total', '人工成本合计': 'total_labor_cost'
 }
 DB_TO_CN_MAP = {v: k for k, v in LEDGER_MAP.items()}
+# 提取所有属于“金额”类型的列，方便统一赋零或格式化
 NUMERIC_COLS = list(LEDGER_MAP.keys())[5:]
 
 # ==============================================================================
@@ -73,10 +79,13 @@ def sort_flat_ledger_df(df):
     if df.empty: return df
     conn = _get_db_connection()
     try:
+        # 抓取部门排序权重
         dept_df = pd.read_sql_query("SELECT dept_name, sort_order FROM departments", conn)
         dept_weights = dict(zip(dept_df['dept_name'], dept_df['sort_order']))
+        # 抓取岗位排序权重
         pos_df = pd.read_sql_query("SELECT pos_id, sort_order FROM positions", conn)
         pos_weights = dict(zip(pos_df['pos_id'], pos_df['sort_order']))
+        # 抓取员工自身技术等级排序权重
         emp_df = pd.read_sql_query("SELECT emp_id, post_rank FROM employees", conn)
         ep_df = pd.read_sql_query("SELECT emp_id, pos_id FROM employee_profiles", conn)
 
@@ -93,24 +102,26 @@ def sort_flat_ledger_df(df):
         conn.close()
 
     def get_combined_sorter(row):
-        # 兼容中文表头和数据库原英文字段
+        # 兼容中文表头和数据库原英文字段，防止 KeyError
         emp_id = str(row.get('工号', row.get('emp_id', '')))
         emp_status = str(row.get('人员状态', row.get('emp_status', '')))
         dept_name = str(row.get('归属部门', row.get('dept_name', '')))
 
+        # 特殊群体的权重降级：离退休垫底，统筹账号倒数第二
         if emp_status == '退休' or '离退休' in dept_name: dept_block_weight = 9999
         elif emp_status == '公共账目' or '统筹' in dept_name or '公共' in dept_name: dept_block_weight = 9998
         else: dept_block_weight = dept_weights.get(dept_name, 999)
         meta = personnel_meta.get(emp_id, {})
         return (dept_block_weight, meta.get('pos_weight', 9999), meta.get('rank_order', 9999.0), emp_id)
 
+    # 将多维排序元组附着在数据框上，执行硬排序后抹除痕迹
     df['__sort_tuple__'] = df.apply(get_combined_sorter, axis=1)
     df[['__dw__', '__pw__', '__rw__', '__id__']] = pd.DataFrame(df['__sort_tuple__'].tolist(), index=df.index)
     df = df.sort_values(by=['__dw__', '__pw__', '__rw__', '__id__'], ascending=[True, True, True, True])
     return df.drop(columns=['__sort_tuple__', '__dw__', '__pw__', '__rw__', '__id__'])
 
 # ==============================================================================
-# 财务级报表引擎：绝对排序、隔离与汇总
+# 财务级报表引擎：绝对排序、隔离与汇总 (支持 Excel 分组小计)
 # ==============================================================================
 def add_subtotals_and_totals(df, numeric_cols):
     if df.empty: return df
@@ -156,11 +167,13 @@ def add_subtotals_and_totals(df, numeric_cols):
     df = df.sort_values(by=['__dept_block__', '__pos_base__', '__pers_rank__', '__fallback_id__'], ascending=[True, True, True, True])
 
     final_rows = []
+    # 物理隔离在职大盘与离退休独立账目
     active_mask = df['__dept_block__'] < 9999
     active_df = df[active_mask]
     retired_df = df[~active_mask]
     temp_cols = ['__sort_tuple__', '__dept_block__', '__pos_base__', '__pers_rank__', '__fallback_id__']
 
+    # 渲染在职人员区块并自动计算部门小计
     if not active_df.empty:
         for dept_name, group in active_df.groupby('归属部门', sort=False):
             final_rows.append(group.drop(columns=temp_cols))
@@ -178,6 +191,7 @@ def add_subtotals_and_totals(df, numeric_cols):
             if col in active_df.columns: grand_total[col] = active_df[col].sum()
         final_rows.append(pd.DataFrame([grand_total.drop(labels=temp_cols)]))
 
+    # 渲染离退休区块，并插入空行进行视觉隔断
     if not retired_df.empty:
         empty_row = pd.Series(index=df.columns.drop(temp_cols), dtype='object')
         final_rows.extend([pd.DataFrame([empty_row])] * 3)
@@ -193,6 +207,7 @@ def add_subtotals_and_totals(df, numeric_cols):
 
     final_df = pd.concat(final_rows, ignore_index=True)
 
+    # 为实体人员重新编号，跳过所有小计与总计行
     seq_list = []
     current_seq = 1
     for _, row in final_df.iterrows():
@@ -303,7 +318,6 @@ with tab1:
     available_depts = pd.read_sql_query("SELECT DISTINCT dept_name FROM labor_cost_ledger", conn)['dept_name'].tolist()
     conn.close()
 
-    # [核心升级] 注入姓名/工号多维检索
     sc1, sc2, sc3 = st.columns([1, 1, 1])
     with sc1: f_month = st.selectbox("📅 核算月份筛选", ["全部月份"] + available_months)
     with sc2: f_dept = st.multiselect("🏢 归属部门筛选", options=available_depts)
@@ -312,7 +326,6 @@ with tab1:
     raw_df = get_ledger_data(month_filter=None if f_month == "全部月份" else f_month, dept_filter=f_dept if f_dept else None)
 
     if not raw_df.empty:
-        # 执行文本检索过滤
         if q_search:
             raw_df = raw_df[raw_df['emp_name'].str.contains(q_search, na=False) | raw_df['emp_id'].str.contains(q_search, na=False)]
 
@@ -333,9 +346,7 @@ with tab1:
         disp_df = raw_df.rename(columns=DB_TO_CN_MAP)
         disp_cols = [col for col in LEDGER_MAP.keys() if col in disp_df.columns]
 
-        # [核心修复] 对前端展示的表格执行绝对排序！
         disp_final = sort_flat_ledger_df(disp_df[disp_cols].copy())
-
         disp_final.insert(0, '序号', range(1, len(disp_final) + 1))
         st.dataframe(disp_final, use_container_width=True, hide_index=True)
     else:
@@ -402,18 +413,18 @@ with tab2:
                 st.warning("所选范围内无数据。")
 
     # ==========================================================================
-    # [核心补充] 下月数据初始化引擎 (纯净底表繁衍)
+    # [核心补充] 下月数据初始化引擎 (纯净底表繁衍 + 自动抓取当月社保固化数据)
     # ==========================================================================
     st.divider()
-    st.subheader("🆕 生成新月份初始化底表 (纯净录入版)")
-    st.info("💡 痛点解决：系统将提取【基准月】人员（含已离职但有账目的人），自动追加【档案里新入职】但在基准月没发过钱的新人。生成的 Excel 只有 1 个纯净 Sheet，无小计/总计。")
+    st.subheader("🆕 生成新月份初始化底表 (融合社保版)")
+    st.info("💡 痛点解决：系统将提取【基准月】人员架构，追加新入职员工。同时，系统会自动去社保模块抓取【目标生成月】已固化的五险两金真实扣款数据，强行注入到底表中！")
 
     col_t1, col_t2, col_t3 = st.columns(3)
     with col_t1: base_month = st.selectbox("参照基准月 (提取其人员框架)", options=available_months)
     with col_t2: target_month = st.text_input("目标生成月 (格式 YYYY-MM)", value="2026-02" if base_month == "2026-01" else "")
-    with col_t3: st.write(""); clear_nums = st.checkbox("清空所有变动金额 (仅保留人员与上月固薪)", value=False)
+    with col_t3: st.write(""); clear_nums = st.checkbox("清空薪酬类变动金额 (但保留自动抓取的社保公积金)", value=True)
 
-    if st.button("🚀 生成新月度录入底表", type="primary"):
+    if st.button("🚀 生成融合社保的录入底表", type="primary"):
         if not target_month:
             st.warning("请填写目标月份！")
         else:
@@ -424,20 +435,31 @@ with tab2:
             all_emps = pd.read_sql_query("SELECT emp_id, name, dept_id, status FROM employees", conn)
             # 3. 仅拉取在职员工（用于补充新人）
             active_emps = all_emps[all_emps['status'] == '在职']
-            # ==============================================================================
-            # [Bug 修复] 替换报错的 dept_dict 生成逻辑
-            # 修复原因：原写法会导致 pandas 迭代器解包失败，现改为提取两个 Series 直接拉链合并。
-            # 不管是新增、修改还是替换，只要是执行逻辑，必须保证极简与绝对稳定。
-            # ==============================================================================
-            # 1. 先用 pandas 读取数据库中的部门表
+
+            # ==========================================================
+            # [Bug 彻底修复] 绝对稳定的字典组装法：直接提取两列生成字典
+            # ==========================================================
             dept_df = pd.read_sql_query("SELECT dept_id, dept_name FROM departments", conn)
-            # 2. 将 dept_id 列作为 Key，dept_name 列作为 Value，安全地组合成字典
             dept_dict = dict(zip(dept_df['dept_id'], dept_df['dept_name']))
+
+            # ==========================================================
+            # [核心保留] 4. 拉取目标月的社保公积金固化数据
+            # ==========================================================
+            ss_query = """
+                SELECT 
+                    emp_id, 
+                    pension_comp, medical_comp, unemp_comp, injury_comp, maternity_comp, fund_comp, annuity_comp,
+                    pension_pers, medical_pers, medical_serious_pers, unemp_pers, fund_pers, annuity_pers
+                FROM ss_monthly_records
+                WHERE cost_month = ?
+            """
+            ss_df = pd.read_sql_query(ss_query, conn, params=[target_month])
+
             conn.close()
 
             if not base_df.empty:
                 # ======================================================
-                # [核心修正] 离职人员“幽灵账目”滚动清理器
+                # 离职人员“幽灵账目”滚动清理器
                 # ======================================================
                 emp_status_dict = dict(zip(all_emps['emp_id'], all_emps['status']))
                 keep_mask = []
@@ -446,26 +468,21 @@ with tab2:
                     cost = row.get('total_labor_cost', 0.0)
                     if pd.isna(cost): cost = 0.0
 
-                    # 获取该员工在人事档案中的最新真实状态
                     curr_status = emp_status_dict.get(eid, row.get('emp_status', '在职'))
-
-                    # 规则：如果他已离职，并且在基准月(上个月)已经没有产生任何人工成本，果断抛弃！
                     if '离职' in curr_status and cost == 0.0:
                         keep_mask.append(False)
                     else:
                         keep_mask.append(True)
 
-                # 执行过滤
                 base_df = base_df[keep_mask]
-                # ======================================================
-
                 base_df['cost_month'] = target_month
                 base_emp_ids = set(base_df['emp_id'].tolist())
                 new_emps = active_emps[~active_emps['emp_id'].isin(base_emp_ids)]
 
                 new_rows = []
                 for _, r in new_emps.iterrows():
-                    new_row = {col: 0.0 if col in NUMERIC_COLS else None for col in base_df.columns}
+                    # 【核心修复】精确判定数字列，防止插入 None 值导致后续计算和匹配崩溃
+                    new_row = {col: 0.0 if DB_TO_CN_MAP.get(col) in NUMERIC_COLS else None for col in base_df.columns}
                     new_row['cost_month'] = target_month
                     new_row['emp_id'] = r['emp_id']
                     new_row['emp_name'] = r['name']
@@ -478,9 +495,49 @@ with tab2:
 
                 export_cn = base_df.rename(columns=DB_TO_CN_MAP)
 
+                # 清空非社保类的旧账变动金额
                 if clear_nums:
                     for cn_col in NUMERIC_COLS:
                         if cn_col in export_cn.columns: export_cn[cn_col] = 0.0
+
+                # ======================================================
+                # [致命Bug终极修复]：将拉取到的社保数据，强制精准贴合到底表！
+                # ======================================================
+                if not ss_df.empty:
+                    # 【核心修正】彻底抹除 Pandas 自作聪明读取数据库时附带的浮点数 ".0" 后缀
+                    # 只有两边的工号字符串长得一模一样，对撞引擎才能成功合体！
+                    ss_df['emp_id'] = ss_df['emp_id'].astype(str).str.replace(r'\.0$', '', regex=True).str.strip()
+                    ss_index_df = ss_df.set_index('emp_id')
+
+                    for idx, row in export_cn.iterrows():
+                        # 当前底表中的工号（同样去除可能的 .0）
+                        eid = str(row.get('工号', '')).replace('.0', '').strip()
+
+                        # 只有两边匹配成功，才执行注入逻辑
+                        if eid in ss_index_df.index:
+                            ss_rec = ss_index_df.loc[eid]
+                            if isinstance(ss_rec, pd.DataFrame):
+                                ss_rec = ss_rec.iloc[0]
+
+                            # 注入企业成本，并附带 pd.isna 防御网，拦截数据库底层 NULL 变异为 NaN 的风险
+                            export_cn.at[idx, '养老保险-企业'] = ss_rec.get('pension_comp', 0.0) if pd.notna(ss_rec.get('pension_comp')) else 0.0
+                            export_cn.at[idx, '医疗保险-企业'] = ss_rec.get('medical_comp', 0.0) if pd.notna(ss_rec.get('medical_comp')) else 0.0
+                            export_cn.at[idx, '失业保险-企业'] = ss_rec.get('unemp_comp', 0.0) if pd.notna(ss_rec.get('unemp_comp')) else 0.0
+                            export_cn.at[idx, '工伤保险-企业'] = ss_rec.get('injury_comp', 0.0) if pd.notna(ss_rec.get('injury_comp')) else 0.0
+                            export_cn.at[idx, '生育保险-企业'] = ss_rec.get('maternity_comp', 0.0) if pd.notna(ss_rec.get('maternity_comp')) else 0.0
+                            export_cn.at[idx, '住房公积金-企业'] = ss_rec.get('fund_comp', 0.0) if pd.notna(ss_rec.get('fund_comp')) else 0.0
+                            export_cn.at[idx, '企业年金-企业'] = ss_rec.get('annuity_comp', 0.0) if pd.notna(ss_rec.get('annuity_comp')) else 0.0
+
+                            # 注入个人扣款（智能合并大病医疗扣款）
+                            m_pers = ss_rec.get('medical_pers', 0.0) if pd.notna(ss_rec.get('medical_pers')) else 0.0
+                            m_ser = ss_rec.get('medical_serious_pers', 0.0) if pd.notna(ss_rec.get('medical_serious_pers')) else 0.0
+
+                            export_cn.at[idx, '养老保险-个人'] = ss_rec.get('pension_pers', 0.0) if pd.notna(ss_rec.get('pension_pers')) else 0.0
+                            export_cn.at[idx, '医疗保险-个人'] = m_pers + m_ser
+                            export_cn.at[idx, '失业保险-个人'] = ss_rec.get('unemp_pers', 0.0) if pd.notna(ss_rec.get('unemp_pers')) else 0.0
+                            export_cn.at[idx, '住房公积金-个人'] = ss_rec.get('fund_pers', 0.0) if pd.notna(ss_rec.get('fund_pers')) else 0.0
+                            export_cn.at[idx, '企业年金-个人'] = ss_rec.get('annuity_pers', 0.0) if pd.notna(ss_rec.get('annuity_pers')) else 0.0
+                # ======================================================
 
                 ordered_cols = [c for c in LEDGER_MAP.keys() if c in export_cn.columns]
                 export_cn = export_cn[ordered_cols]
@@ -488,13 +545,14 @@ with tab2:
 
                 ob_clean = io.BytesIO()
                 with pd.ExcelWriter(ob_clean, engine='openpyxl') as w:
-                    export_cn.to_excel(w, index=False, sheet_name=f"{target_month}明细_纯净版")
-                    ws = w.sheets[f"{target_month}明细_纯净版"]
+                    export_cn.to_excel(w, index=False, sheet_name=f"{target_month}融合明细")
+                    ws = w.sheets[f"{target_month}融合明细"]
                     ws.freeze_panes = 'A2'
                     for col_idx in range(1, ws.max_column + 1):
                         ws.column_dimensions[get_column_letter(col_idx)].width = 13
 
-                st.download_button(f"📥 下载 {target_month} 纯净底表", data=ob_clean.getvalue(), file_name=f"台账初始化_{target_month}.xlsx", type="secondary")
+                st.success(f"✅ 底表生成成功！已成功从社保模块抓取 {target_month} 的真实社保扣款并注入。")
+                st.download_button(f"📥 下载 {target_month} 融合社保底表", data=ob_clean.getvalue(), file_name=f"台账初始化_{target_month}.xlsx", type="secondary")
             else:
                 st.error("基准月没有数据，无法繁衍！")
 
@@ -539,10 +597,8 @@ with tab3:
                     if pd.isna(raw_id):
                         e_id = ""
                     elif isinstance(raw_id, float):
-                        # 如果是浮点数，先转 int 去掉 .0，再转 str
                         e_id = str(int(raw_id))
                     else:
-                        # 如果已经是字符串，去掉可能的 .0 后缀并修剪空格
                         e_id = str(raw_id).replace('.0', '').strip()
 
                     if not raw_month or not e_id or raw_month == 'nan' or e_id == 'nan': continue
