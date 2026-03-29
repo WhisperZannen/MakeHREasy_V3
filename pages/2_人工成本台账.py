@@ -424,7 +424,15 @@ with tab2:
             all_emps = pd.read_sql_query("SELECT emp_id, name, dept_id, status FROM employees", conn)
             # 3. 仅拉取在职员工（用于补充新人）
             active_emps = all_emps[all_emps['status'] == '在职']
-            dept_dict = dict(zip(pd.read_sql_query("SELECT dept_id, dept_name FROM departments", conn).itertuples(index=False)))
+            # ==============================================================================
+            # [Bug 修复] 替换报错的 dept_dict 生成逻辑
+            # 修复原因：原写法会导致 pandas 迭代器解包失败，现改为提取两个 Series 直接拉链合并。
+            # 不管是新增、修改还是替换，只要是执行逻辑，必须保证极简与绝对稳定。
+            # ==============================================================================
+            # 1. 先用 pandas 读取数据库中的部门表
+            dept_df = pd.read_sql_query("SELECT dept_id, dept_name FROM departments", conn)
+            # 2. 将 dept_id 列作为 Key，dept_name 列作为 Value，安全地组合成字典
+            dept_dict = dict(zip(dept_df['dept_id'], dept_df['dept_name']))
             conn.close()
 
             if not base_df.empty:
