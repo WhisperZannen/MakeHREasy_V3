@@ -1,10 +1,9 @@
 # ==============================================================================
 # 文件路径: modules/core_social_security.py
-# 功能描述: 社保与福利结算模块底层中枢 (V4.3 终极实战交付版)
+# 功能描述: 社保与福利结算模块底层中枢 (V4.4 彻底绞杀大病双轨制Bug)
 # 核心修正说明:
-#   1. 彻底消灭了内存缓存 (_RULES_CACHE)，强制实时查库，修改即刻生效。
-#   2. 修正了抹零逻辑，强制作用于“基数”而非“结果”，彻底符合中国财务准则。
-#   3. 入库逻辑 (save_monthly_ss_records) 已满血扩容，完整保存 7 大险种的路由主体。
+#   1. 彻底斩断大病医疗的双重计费，199 与 7 绝对物理隔离。
+#   2. 斩断入库时的 7.0 强行硬编码，严格根据前置开关动态入库。
 # ==============================================================================
 
 import sqlite3
@@ -13,18 +12,25 @@ import pandas as pd
 import math
 
 # ------------------------------------------------------------------------------
+# 核心防御机制：空值清洗器 (必须在底层也配备一把，防止入库时遇到脏数据崩溃)
+# ------------------------------------------------------------------------------
+def safe_float(val, default=0.0):
+    try:
+        if pd.notna(val) and val is not None and str(val).strip() != '':
+            return float(val)
+        return default
+    except Exception:
+        return default
+
+# ------------------------------------------------------------------------------
 # 数据库连接池初始化
 # ------------------------------------------------------------------------------
 def _get_db_connection():
-    # 获取当前文件的绝对路径，向上推一层找到 database 目录，防止相对路径报错
     current_dir = os.path.dirname(os.path.abspath(__file__))
     project_root = os.path.dirname(current_dir)
     db_path = os.path.join(project_root, 'database', 'hr_core.db')
-    # 连接 SQLite 数据库
     conn = sqlite3.connect(db_path)
-    # 强制开启外键约束验证，防止产生孤立数据
     conn.execute("PRAGMA foreign_keys = ON;")
-    # 将查询结果配置为字典模式，方便按列名取值
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -38,7 +44,6 @@ def _ensure_multi_entity_schema():
         cursor.execute("PRAGMA table_info(ss_policy_rules)")
         columns = [col['name'] for col in cursor.fetchall()]
         if 'manage_entity' not in columns:
-            # 如果是老古董表，直接重建
             cursor.execute("DROP TABLE IF EXISTS ss_policy_rules")
             cursor.execute('''
             CREATE TABLE ss_policy_rules (
@@ -59,7 +64,6 @@ def _ensure_multi_entity_schema():
             )
             ''')
         else:
-            # [热更新] 如果表已经在运行了，强行追加两个国企特色字段，不影响旧数据
             if 'fund_soe_upper' not in columns:
                 cursor.execute("ALTER TABLE ss_policy_rules ADD COLUMN fund_soe_upper REAL DEFAULT 0.0")
             if 'fund_soe_lower' not in columns:
@@ -73,16 +77,13 @@ def _ensure_multi_entity_schema():
 _ensure_multi_entity_schema()
 
 # ------------------------------------------------------------------------------
-# 业务接口 1: 规则读取引擎 (已彻底废除缓存，每次调用直接读底层库)
+# 业务接口 1: 规则读取引擎
 # ------------------------------------------------------------------------------
 def get_policy_rules(year: str, entity: str) -> dict:
-    """根据年份和主体名称，从数据库中提取社保费率与上下限规则"""
     conn = _get_db_connection()
     try:
-        # 严格执行 SQL 参数化查询，防止注入
         query = "SELECT * FROM ss_policy_rules WHERE rule_year = ? AND manage_entity = ?"
         df = pd.read_sql_query(query, conn, params=[year, entity])
-        # 如果查到数据，将其转换为字典格式返回；否则返回空字典
         if not df.empty:
             return df.iloc[0].to_dict()
         else:
@@ -94,14 +95,13 @@ def get_policy_rules(year: str, entity: str) -> dict:
         conn.close()
 
 # ------------------------------------------------------------------------------
-# 业务接口 2: 规则写入引擎 (支持全量同步与单主体特例配置)
+# 业务接口 2: 规则写入引擎
 # ------------------------------------------------------------------------------
 def upsert_policy_rules(params_tuple: tuple, is_all_entities: bool = False) -> tuple:
     entities = ["省公众", "中电数智", "省公司"] if is_all_entities else [params_tuple[1]]
     conn = _get_db_connection()
     cursor = conn.cursor()
     try:
-        # SQL 扩容为 31 个参数
         sql = """
             INSERT INTO ss_policy_rules (
                 rule_year, manage_entity, rounding_mode, fund_calc_method, medical_serious_fix,
@@ -137,30 +137,24 @@ def upsert_policy_rules(params_tuple: tuple, is_all_entities: bool = False) -> t
         conn.close()
 
 # ------------------------------------------------------------------------------
-# 业务接口 3: 人员参保状态与基数批量灌库引擎 (极度精简版)
+# 业务接口 3: 人员参保状态与基数批量灌库引擎
 # ------------------------------------------------------------------------------
 def batch_update_emp_matrix(df: pd.DataFrame) -> tuple:
-    """接收 Excel 数据，解析并 UPSERT 写入社保人员基因矩阵表"""
-    # 前置安全校验，缺失这两列直接驳回
     if '工号' not in df.columns or '已录入原始基数' not in df.columns:
         return False, "❌ Excel 模板错误：必须包含【工号】和【已录入原始基数】两列！"
 
-    # 清除没有工号或没有基数的空行脏数据
     df_clean = df.dropna(subset=['工号', '已录入原始基数']).copy()
 
-    # 内部辅助函数：安全提取列数据，如果缺失则填入默认值
     def safe_get(col_name, default_val, is_num=False):
         if col_name in df_clean.columns:
             return pd.to_numeric(df_clean[col_name], errors='coerce').fillna(default_val) if is_num else df_clean[col_name].fillna(default_val)
         return [default_val] * len(df_clean)
 
-    # 批量提取各类字段并转换为列表
     emp_ids = df_clean['工号'].tolist()
     c_center = safe_get('财务归属', '本级').tolist()
     base_avg = safe_get('已录入原始基数', 0.0, True).tolist()
     fund_avg = safe_get('独立公积金基数(选填)', 0.0, True).tolist()
 
-    # 提取 5 险 2 金的参保开关与路由账户设定
     p_en = safe_get('养老参保(1是0否)', 1, True).tolist()
     p_acc = safe_get('养老缴纳主体', '省公众').tolist()
     m_en = safe_get('医疗参保(1是0否)', 1, True).tolist()
@@ -180,7 +174,6 @@ def batch_update_emp_matrix(df: pd.DataFrame) -> tuple:
     cursor = conn.cursor()
 
     try:
-        # 使用 SQLite 特有的 UPSERT 进行强力写入，完美兼容新员工和老员工
         upsert_sql = """
             INSERT INTO ss_emp_matrix (
                 emp_id, cost_center, base_salary_avg, fund_base_avg,
@@ -211,7 +204,6 @@ def batch_update_emp_matrix(df: pd.DataFrame) -> tuple:
                 annuity_enabled=excluded.annuity_enabled,
                 annuity_account=excluded.annuity_account
         """
-        # 利用 zip 打包生成可供批量执行的数据矩阵
         data_to_update = list(zip(
             emp_ids, c_center, base_avg, fund_avg,
             p_en, p_acc, m_en, m_acc, u_en, u_acc, i_en, i_acc, mat_en, mat_acc, f_en, f_acc, a_en, a_acc
@@ -226,11 +218,7 @@ def batch_update_emp_matrix(df: pd.DataFrame) -> tuple:
     finally:
         conn.close()
 
-# ------------------------------------------------------------------------------
-# 核心算子 1: 绝对精度控制（抹零辅助函数）
-# ------------------------------------------------------------------------------
 def apply_rounding(value: float, mode: str) -> float:
-    """根据财务规则，对小数进行处理"""
     if mode == 'exact':
         return round(value, 2)
     elif mode == 'round_to_yuan':
@@ -241,23 +229,19 @@ def apply_rounding(value: float, mode: str) -> float:
         return float(math.floor(value / 10.0) * 10)
     return round(value, 2)
 
-# ------------------------------------------------------------------------------
-# 核心算子 2: 单险种推演公式 (引入公积金双轨制与“封顶豁免”特例)
-# ------------------------------------------------------------------------------
 def calc_insurance_item(item_type: str, raw_base: float, upper: float, lower: float,
                         comp_rate: float, pers_rate: float, round_mode: str,
                         fund_method: str = 'independent', soe_upper: float = 0.0, soe_lower: float = 0.0):
 
-    # [核心隔离区]：如果当前算是公积金，且配置了国企特色执行线，优先截断使用企业线！
     effective_upper = soe_upper if (item_type == 'fund' and soe_upper > 0) else upper
     effective_lower = soe_lower if (item_type == 'fund' and soe_lower > 0) else lower
 
     actual_base = raw_base
-    is_capped = False  # [新增探针] 记录这个人是否触碰了封顶线
+    is_capped = False
 
     if effective_upper > 0 and raw_base >= effective_upper:
         actual_base = effective_upper
-        is_capped = True  # 打上触顶标记！
+        is_capped = True
     elif effective_lower > 0 and raw_base <= effective_lower:
         actual_base = effective_lower
 
@@ -266,22 +250,19 @@ def calc_insurance_item(item_type: str, raw_base: float, upper: float, lower: fl
         comp_amount = round(actual_base * comp_rate, 2)
         pers_amount = round(actual_base * pers_rate, 2)
     else:
-        # 【神级业务逻辑】如果这个人触碰了封顶线，强制豁免“倒推法”，直接精准直算防违规！
         if fund_method == 'reverse_from_ss' and not is_capped:
-            # 没触顶的普通员工，继续倒推（取十位整数）
             raw_comp = actual_base * comp_rate
             raw_pers = actual_base * pers_rate
             comp_amount = float(round(raw_comp / 10.0) * 10)
             pers_amount = float(round(raw_pers / 10.0) * 10)
         else:
-            # 触顶人员（或选了独立核算的人）：直接 34550 * 费率，四舍五入到元（完美避开 4150）
             comp_amount = float(round(actual_base * comp_rate))
             pers_amount = float(round(actual_base * pers_rate))
 
     return actual_base, comp_amount, pers_amount
 
 # ------------------------------------------------------------------------------
-# 核心算子 3: 五险两金全量计算引擎
+# 核心算子 3: 五险两金全量计算引擎 (终极拨乱反正版)
 # ------------------------------------------------------------------------------
 def calculate_complete_bill(emp_row: dict, target_year: str) -> dict:
     res = {'工号': emp_row['工号'], '姓名': emp_row['姓名'], '财务归属': emp_row['财务归属']}
@@ -298,7 +279,11 @@ def calculate_complete_bill(emp_row: dict, target_year: str) -> dict:
 
     total_comp, total_pers = 0.0, 0.0
 
+    # [核心防护] 提前初始化大病医疗字段，防止后端报 KeyError
+    res['medical_serious_个'] = 0.0
+
     for item, (base_col, en_col, acc_col) in items_config.items():
+        # 如果个人未开启参保开关，强制全部归零
         if int(emp_row.get(en_col, 0)) == 0:
             res[f'{item}_企'] = res[f'{item}_个'] = 0.0
             res[f'{item}_route'] = '不参保'
@@ -315,19 +300,21 @@ def calculate_complete_bill(emp_row: dict, target_year: str) -> dict:
         if item == 'fund' and raw_base == 0:
             raw_base = emp_row['已录入原始基数']
 
-        # 将企业内部执行线传给底层核心算子
         _, c_amt, p_amt = calc_insurance_item(
             item, raw_base,
             rules.get(f'{item}_upper', 0), rules.get(f'{item}_lower', 0),
             rules.get(f'{item}_comp_rate', 0), rules.get(f'{item}_pers_rate', 0),
             rules.get('rounding_mode', 'round_to_yuan'),
             rules.get('fund_calc_method', 'independent'),
-            rules.get('fund_soe_upper', 0), # 传递国企执行封顶
-            rules.get('fund_soe_lower', 0)  # 传递国企执行保底
+            rules.get('fund_soe_upper', 0),
+            rules.get('fund_soe_lower', 0)
         )
 
+        # [核心解毒] 大病医疗 7 块钱绝对独立出来，绝不再塞进基本医疗里！
         if item == 'medical':
-            p_amt += rules.get('medical_serious_fix', 7.0)
+            serious_fix = rules.get('medical_serious_fix', 7.0)
+            res['medical_serious_个'] = serious_fix
+            total_pers += serious_fix  # 单独加到合计中，保证底账平齐
 
         res[f'{item}_企'] = c_amt
         res[f'{item}_个'] = p_amt
@@ -339,22 +326,17 @@ def calculate_complete_bill(emp_row: dict, target_year: str) -> dict:
     return res
 
 # ------------------------------------------------------------------------------
-# 业务接口 4: 月度核算账单持久化引擎 (包含 24 项维度的极度严谨防爆入库)
+# 业务接口 4: 月度核算账单持久化引擎 (斩断硬编码毒瘤)
 # ------------------------------------------------------------------------------
 def save_monthly_ss_records(df: pd.DataFrame, month: str) -> tuple:
-    """
-    负责将内存中经过前端清洗展示的 temp_bills 数据，以 SQL 级别物理持久化。
-    """
     if df.empty:
         return False, "❌ 没有可保存的数据！"
 
     conn = _get_db_connection()
     cursor = conn.cursor()
     try:
-        # 第一道防线：清空该月该系统的所有历史旧账，保障可无限次重复计算核对
         cursor.execute("DELETE FROM ss_monthly_records WHERE cost_month = ?", (month,))
 
-        # 核心持久化 SQL。此处不仅存金额，更是加入了 route（多主体去向路由）的全面落盘！
         sql = """
             INSERT INTO ss_monthly_records (
                 record_id, cost_month, emp_id, cost_center,
@@ -367,18 +349,25 @@ def save_monthly_ss_records(df: pd.DataFrame, month: str) -> tuple:
         insert_data = []
         for _, row in df.iterrows():
             eid = row['工号']
-            # 将 DataFrame 的中文属性提取并映射到底层 SQL 字段
+
+            # [核心解毒] 动态抓取前置计算出来的大病金额，不参保的人这里就是 0.0，彻底告别强行写死 7.0
+            serious_pers_val = safe_float(row.get('medical_serious_个', 0.0))
+
             insert_data.append((
-                f"{month}_{eid}", month, eid, row['财务归属'],
-                row['pension_个'], row['medical_个'], 7.0, row['unemp_个'], row['fund_个'], row['annuity_个'],
-                row['pension_企'], row['medical_企'], row['unemp_企'], row['injury_企'], row['maternity_企'], row['fund_企'], row['annuity_企'],
+                f"{month}_{eid}", month, eid, row.get('财务归属', '本级'),
+                safe_float(row.get('pension_个')), safe_float(row.get('medical_个')), serious_pers_val,
+                safe_float(row.get('unemp_个')), safe_float(row.get('fund_个')), safe_float(row.get('annuity_个')),
+
+                safe_float(row.get('pension_企')), safe_float(row.get('medical_企')), safe_float(row.get('unemp_企')),
+                safe_float(row.get('injury_企')), safe_float(row.get('maternity_企')), safe_float(row.get('fund_企')), safe_float(row.get('annuity_企')),
+
                 row.get('pension_route', ''), row.get('medical_route', ''), row.get('unemp_route', ''),
                 row.get('injury_route', ''), row.get('maternity_route', ''), row.get('fund_route', ''), row.get('annuity_route', '')
             ))
 
         cursor.executemany(sql, insert_data)
         conn.commit()
-        return True, f"✅ {month} 月份共 {len(insert_data)} 条核算记录（含多主体拆分路由）已成功固化入库！"
+        return True, f"✅ {month} 月份共 {len(insert_data)} 条核算记录（彻底斩断双重计费）已成功固化入库！"
     except Exception as e:
         conn.rollback()
         return False, f"❌ 保存失败: {e}"

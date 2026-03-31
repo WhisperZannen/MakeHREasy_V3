@@ -1,10 +1,10 @@
 # ==============================================================================
 # 文件路径: pages/3_社保与福利结算.py
-# 功能描述: 多主体社保与福利结算中枢 (MVC 架构前端 UI 层 - 终极业务对齐版)
+# 功能描述: 多主体社保与福利结算中枢 (MVC 架构前端 UI 层 - 财务隔离终极版)
 # 核心改造:
-#   1. Tab 1: 彻底修复医疗大病字典映射 Bug，完美分离 199 与 7。
-#   2. Tab 2: 财务输出中心 (对内单月 5 通道流水账 + 对外地市公对公跨期结算函)。
-#   3. 彻底废弃伪需求分支表，全量依赖 cost_center (财务归属) 作为公对公结算锚点。
+#   1. Tab 1: 完美分离 199 与 7。
+#   2. Tab 2: 彻底修复 Grouper 1D 崩溃。实装 5 大独立财务提取单引擎（总览与月度拆分）。
+#   3. Tab 4: 历史补录支持时间感知倒推（智能寻轨引擎）。
 # ==============================================================================
 
 import streamlit as st
@@ -26,7 +26,6 @@ except ImportError:
     st.error("🚨 缺少 Word 生成引擎！请在终端运行：pip install python-docx")
     st.stop()
 
-# 导入底层接口
 from modules.core_social_security import (
     get_policy_rules,
     upsert_policy_rules,
@@ -35,7 +34,6 @@ from modules.core_social_security import (
 )
 
 st.set_page_config(page_title="社保与福利结算", layout="wide")
-
 
 # ==============================================================================
 # [配置中枢] Settings.json 动态热加载与自愈引擎
@@ -81,15 +79,9 @@ def safe_float(val, default=0.0):
     except Exception:
         return default
 
-# ==============================================================================
-# [状态机初始化]
-# ==============================================================================
 if 'show_confirm' not in st.session_state: st.session_state['show_confirm'] = False
 if 'pending_params' not in st.session_state: st.session_state['pending_params'] = None
 
-# ==============================================================================
-# 页面主框架与导航
-# ==============================================================================
 st.title("🛡️ 社保与福利结算中心")
 st.caption("核心业务流向：当月基数备料 ➡️ 理论核算与补缴对账 ➡️ 跨主体结算与公对公要款 ➡️ 引擎底座配置")
 
@@ -103,9 +95,6 @@ with tab1:
 
     calc_month = st.text_input("📅 输入当前核算工作月份 (格式: YYYY-MM，如 2026-03)", value="2026-03", max_chars=7)
 
-    # ==========================================
-    # 第一步：基数极速抢救与特例通道
-    # ==========================================
     st.subheader("🛠️ 第一步：基数初始化与特例抢救")
     conn = _get_db_connection()
     try:
@@ -116,7 +105,7 @@ with tab1:
                 IFNULL(m.fund_base_avg, 0.0) AS '独立公积金基数(选填)',
                 IFNULL(m.pension_enabled, 1) AS '养老参保(1是0否)', IFNULL(m.pension_account, '省公众') AS '养老缴纳主体',
                 IFNULL(m.medical_enabled, 1) AS '医疗参保(1是0否)', IFNULL(m.medical_account, '省公司') AS '医疗缴纳主体',
-                7.0 AS '大病统筹(个人固定)', -- [核心补漏] 强行无中生有，让 HR 在基数名单里清晰看到
+                7.0 AS '大病统筹(个人固定)',
                 IFNULL(m.unemp_enabled, 1) AS '失业参保(1是0否)', IFNULL(m.unemp_account, '省公众') AS '失业缴纳主体',
                 IFNULL(m.injury_enabled, 1) AS '工伤参保(1是0否)', IFNULL(m.injury_account, '省公众') AS '工伤缴纳主体',
                 IFNULL(m.maternity_enabled, 1) AS '生育参保(1是0否)', IFNULL(m.maternity_account, '省公司') AS '生育缴纳主体',
@@ -153,9 +142,6 @@ with tab1:
 
     st.divider()
 
-    # ==========================================
-    # 第二步：正常算力引擎与当期对账
-    # ==========================================
     st.subheader("🧮 第二步：本月正常参保核算")
     rule_year_to_use = st.selectbox("⚙️ 选择本次套用的【规则年度】(如次年6月前沿用上年规则)", ["2024", "2025", "2026", "2027", "2028"], index=1)
 
@@ -177,11 +163,10 @@ with tab1:
         cols_to_drop = ['injury_个', 'maternity_个']
         export_df = export_df.drop(columns=[c for c in cols_to_drop if c in export_df.columns])
 
-        # [核心补漏] 广撒网捕获大病键名，实现医疗和大病的绝对汉化隔离
         audit_rename_map = {
             'pension_企': '养老(企业)', 'pension_个': '养老(个人)', 'pension_route': '养老缴纳主体',
             'medical_企': '医疗(企业)', 'medical_个': '医疗(个人)', 'medical_route': '医疗缴纳主体',
-            'medical_serious_个': '大病(个人)', 'medical_serious_pers': '大病(个人)', '大病_个': '大病(个人)', # 捕获引擎所有可能吐出的大病英文键名
+            'medical_serious_个': '大病(个人)', 'medical_serious_pers': '大病(个人)', '大病_个': '大病(个人)',
             'unemp_企': '失业(企业)', 'unemp_个': '失业(个人)', 'unemp_route': '失业缴纳主体',
             'injury_企': '工伤(企业)', 'injury_route': '工伤缴纳主体',
             'maternity_企': '生育(企业)', 'maternity_route': '生育缴纳主体',
@@ -190,7 +175,6 @@ with tab1:
         }
         export_df = export_df.rename(columns=audit_rename_map)
 
-        # [绝对兜底] 如果底层引擎没吐出大病列，强行补齐 0.0 列，确保 Excel 模板里绝对有“大病(个人)”这一列！
         if '大病(个人)' not in export_df.columns:
             export_df['大病(个人)'] = 0.0
 
@@ -234,9 +218,6 @@ with tab1:
                 else:
                     st.error(msg)
 
-    # ==========================================
-    # 第三步：官方补缴与滞纳金手工入库通道
-    # ==========================================
     st.subheader("📥 第三步：补缴与滞纳金手工入账 (对齐官方核定单)")
     st.write("🔧 遇到历史跨月补缴、滞纳金等系统无法自动推演的账目，请在此按社保局单据直接填报写入。")
 
@@ -249,7 +230,6 @@ with tab1:
             retro_template.to_excel(writer, index=False, sheet_name='补缴模板')
             workbook  = writer.book
             worksheet = writer.sheets['补缴模板']
-            # [核心补漏] 在补缴下拉框中强行加入“大病医疗”
             worksheet.data_validation('E2:E1048576', {
                 'validate': 'list',
                 'source': ['养老保险', '医疗保险', '大病医疗', '失业保险', '工伤保险', '生育保险', '住房公积金', '企业年金']
@@ -296,8 +276,8 @@ with tab1:
 # Tab 2: 财务输出中心 (对内账单与公对公 Word 结算函)
 # ------------------------------------------------------------------------------
 with tab2:
-    st.subheader("📤 第一部分：对内审批提款单 (单月精准切割)")
-    st.info("💡 财务内部走账专用。系统直接从数据库拉取【已固化入库】的数据，并严格按照缴费通道劈成 5 张干净明细表。")
+    st.subheader("📤 第一部分：对内审批提款单 (跨期多表智能打包)")
+    st.info("💡 财务走账专用。严格按【缴费主体+险种】物理隔离出 5 个独立的 Excel。多月提取时自动生成【总览】与月度明细 Sheet。")
 
     conn = _get_db_connection()
     try:
@@ -307,31 +287,48 @@ with tab2:
     finally:
         conn.close()
 
-    internal_month = st.selectbox("📅 选择要出具对内账单的月份", options=available_months if available_months else ["无数据"])
+    ic1, ic2 = st.columns(2)
+    with ic1:
+        int_start_month = st.selectbox("📅 对内请款起始月", options=available_months if available_months else ["无数据"], key='int_start', index=len(available_months)-1 if available_months else 0)
+    with ic2:
+        int_end_month = st.selectbox("📅 对内请款结束月", options=available_months if available_months else ["无数据"], key='int_end', index=0 if available_months else 0)
 
-    if st.button("🚀 生成对内 6 大请款与审计明细表", type="primary") and internal_month != "无数据":
+    if st.button("🚀 极速生成并打包对内提款单 (ZIP)", type="primary") and int_start_month != "无数据":
+        s_m, e_m = min(int_start_month, int_end_month), max(int_start_month, int_end_month)
+        selected_months = [m for m in available_months if s_m <= m <= e_m]
+        selected_months.sort()
+
         conn = _get_db_connection()
+
+        # [彻底消除 1D Grouper 崩溃核心]
+        # SQL 查询中，坚决不给 m.cost_center 起中文别名，严格保持英文供后续 pandas 进行二维判定
+        # [终极修复：杜绝双重列名对撞] r.* 里面已经自带了 cost_center，绝对不能再 JOIN 并 AS 'cost_center'，否则会引发 Pandas 维度崩溃！
         query = """
-            SELECT r.*, e.name AS '姓名' 
+            SELECT r.*, e.name AS '姓名'
             FROM ss_monthly_records r 
             LEFT JOIN employees e ON r.emp_id = e.emp_id 
-            WHERE r.cost_month = ?
+            WHERE r.cost_month >= ? AND r.cost_month <= ?
         """
-        raw_df = pd.read_sql_query(query, conn, params=[internal_month])
+        # 这行执行代码保持原样不动
+        raw_df = pd.read_sql_query(query, conn, params=[s_m, e_m])
 
+        # 补缴表 (ss_retroactive_records) 原生没有 cost_center，所以这里必须用 AS 'cost_center' 强行抓取
         retro_query = """
-            SELECT r.*, e.name AS '姓名', IFNULL(m.cost_center, '本级') AS '财务归属'
+            SELECT r.*, e.name AS '姓名', IFNULL(m.cost_center, '本级') AS 'cost_center'
             FROM ss_retroactive_records r
             LEFT JOIN employees e ON r.emp_id = e.emp_id
             LEFT JOIN ss_emp_matrix m ON r.emp_id = m.emp_id
-            WHERE r.process_month = ?
+            WHERE r.process_month >= ? AND r.process_month <= ?
         """
-        retro_df = pd.read_sql_query(retro_query, conn, params=[internal_month])
+        # 这行执行代码也保持原样不动
+        retro_df = pd.read_sql_query(retro_query, conn, params=[s_m, e_m])
         conn.close()
 
         if not raw_df.empty or not retro_df.empty:
-            buffer_internal = io.BytesIO()
-            with pd.ExcelWriter(buffer_internal, engine='xlsxwriter') as writer:
+            zip_buffer = io.BytesIO()
+            with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+
+                # 直到最终写入 Excel 的前一秒，才调用此字典对英文键名进行安全渲染
                 rename_map = {
                     'emp_id': '工号', 'cost_center': '财务归属',
                     'pension_comp': '养老(企业)', 'pension_pers': '养老(个人)',
@@ -342,60 +339,86 @@ with tab2:
                     'annuity_comp': '年金(企业)', 'annuity_pers': '年金(个人)'
                 }
 
-                def export_channel_sheet(sheet_name, channel, items):
-                    df_sub = raw_df.copy()
-                    if df_sub.empty: return
-                    has_amt = pd.Series([False] * len(df_sub))
-                    cols = ['emp_id', '姓名', 'cost_center']
-                    for it in items:
-                        mask = df_sub[f'{it}_route'] == channel
-                        if f'{it}_comp' in df_sub.columns:
-                            df_sub.loc[~mask, f'{it}_comp'] = 0.0
-                            has_amt = has_amt | (df_sub[f'{it}_comp'] > 0)
-                            cols.append(f'{it}_comp')
-                        if f'{it}_pers' in df_sub.columns:
-                            df_sub.loc[~mask, f'{it}_pers'] = 0.0
-                            has_amt = has_amt | (df_sub[f'{it}_pers'] > 0)
-                            cols.append(f'{it}_pers')
+                # 5 大账目的物理通道与险种强制隔离规则表
+                channel_configs = [
+                    {'name': '1.中电数智(五险两金综合)', 'route': '中电数智', 'items': ['pension', 'medical', 'unemp', 'injury', 'maternity', 'fund', 'annuity']},
+                    {'name': '2.省公司(年金)', 'route': '省公司', 'items': ['annuity']},
+                    {'name': '3.省公司(医疗_生育_工伤)', 'route': '省公司', 'items': ['medical', 'maternity', 'injury']},
+                    {'name': '4.省公众(公积金)', 'route': '省公众', 'items': ['fund']},
+                    {'name': '5.省公众(养老_失业_工伤)', 'route': '省公众', 'items': ['pension', 'unemp', 'injury']}
+                ]
 
-                        if it == 'medical' and 'medical_serious_pers' in df_sub.columns:
-                            df_sub.loc[~mask, 'medical_serious_pers'] = 0.0
-                            has_amt = has_amt | (df_sub['medical_serious_pers'] > 0)
-                            cols.append('medical_serious_pers')
+                all_insurance_items = ['pension', 'medical', 'unemp', 'injury', 'maternity', 'fund', 'annuity']
 
-                    df_sub = df_sub[has_amt]
-                    if not df_sub.empty:
-                        df_sub[cols].rename(columns=rename_map).to_excel(writer, index=False, sheet_name=sheet_name)
+                if not raw_df.empty:
+                    for config in channel_configs:
+                        df_channel = raw_df.copy()
 
-                export_channel_sheet('1.中电数智(养_失_工)', '中电数智', ['pension', 'unemp', 'injury'])
-                export_channel_sheet('2.省公司(年金专表)', '省公司', ['annuity'])
-                export_channel_sheet('3.省公司(医_生_工)', '省公司', ['medical', 'maternity', 'injury'])
-                export_channel_sheet('4.省公众(养_失_工)', '省公众', ['pension', 'unemp', 'injury'])
+                        # 遍历全险种，切断不属于该配置表的内容
+                        for it in all_insurance_items:
+                            if it not in config['items']:
+                                if f'{it}_comp' in df_channel.columns: df_channel[f'{it}_comp'] = 0.0
+                                if f'{it}_pers' in df_channel.columns: df_channel[f'{it}_pers'] = 0.0
+                                if it == 'medical' and 'medical_serious_pers' in df_channel.columns: df_channel['medical_serious_pers'] = 0.0
+                            else:
+                                mask = df_channel[f'{it}_route'] == config['route']
+                                if f'{it}_comp' in df_channel.columns: df_channel.loc[~mask, f'{it}_comp'] = 0.0
+                                if f'{it}_pers' in df_channel.columns: df_channel.loc[~mask, f'{it}_pers'] = 0.0
+                                if it == 'medical' and 'medical_serious_pers' in df_channel.columns: df_channel.loc[~mask, 'medical_serious_pers'] = 0.0
 
-                df_gjj = raw_df.copy()
-                if not df_gjj.empty:
-                    df_gjj = df_gjj[(df_gjj['fund_comp'] > 0) | (df_gjj['fund_pers'] > 0)]
-                    if not df_gjj.empty:
-                        cols_gjj = ['emp_id', '姓名', 'cost_center', 'fund_comp', 'fund_pers', 'fund_route']
-                        df_gjj[cols_gjj].rename(columns=rename_map).rename(columns={'fund_route': '公积金缴纳主体'}).to_excel(writer, index=False, sheet_name='5.公积金(专表)')
+                        # 删除没有任何发生额的空人员
+                        money_cols = [c for c in df_channel.columns if c.endswith('_comp') or c.endswith('_pers')]
+                        df_channel['__row_sum__'] = df_channel[money_cols].sum(axis=1)
+                        df_channel = df_channel[df_channel['__row_sum__'] > 0].drop(columns=['__row_sum__'])
 
+                        if not df_channel.empty:
+                            excel_io = io.BytesIO()
+                            with pd.ExcelWriter(excel_io, engine='xlsxwriter') as writer:
+                                group_cols = ['emp_id', '姓名', 'cost_center']
+                                active_sum_cols = [c for c in money_cols if df_channel[c].sum() > 0]
+
+                                # === 三维排版：Sheet 1 (跨期总览累加) ===
+                                if active_sum_cols:
+                                    df_sum = df_channel.groupby(group_cols)[active_sum_cols].sum().reset_index()
+                                    export_cols = group_cols + active_sum_cols
+                                    df_export = df_sum[export_cols].rename(columns=rename_map)
+                                    df_export.to_excel(writer, index=False, sheet_name="总览")
+
+                                # === 三维排版：Sheet N (单月孤立明细) ===
+                                for month in selected_months:
+                                    df_month = df_channel[df_channel['cost_month'] == month]
+                                    if not df_month.empty:
+                                        m_active_cols = [c for c in money_cols if df_month[c].sum() > 0]
+                                        if m_active_cols:
+                                            export_cols = group_cols + m_active_cols
+                                            df_export = df_month[export_cols].rename(columns=rename_map)
+                                            df_export.to_excel(writer, index=False, sheet_name=month)
+
+                            zf.writestr(f"{config['name']}_{s_m}至{e_m}.xlsx", excel_io.getvalue())
+
+                # 处理并打包第 6 张表：异常款项（补缴与死账）
                 if not retro_df.empty:
                     retro_map = {
-                        'emp_id': '工号', 'retro_type': '补缴险种', 'target_start_month': '补缴起始月',
-                        'target_end_month': '补缴结束月', 'total_comp_retro': '企业本金',
-                        'total_pers_retro': '个人本金', 'late_fee': '滞纳金(异常支出)', 'remarks': '产生原因(备注)'
+                        'process_month': '处理月份', 'emp_id': '工号', 'retro_type': '补缴险种',
+                        'target_start_month': '补缴起始月', 'target_end_month': '补缴结束月',
+                        'total_comp_retro': '企业本金', 'total_pers_retro': '个人本金',
+                        'late_fee': '滞纳金(异常支出)', 'remarks': '产生原因(备注)', 'cost_center': '财务归属'
                     }
-                    retro_cols = ['工号', '姓名', '财务归属', '补缴险种', '补缴起始月', '补缴结束月', '企业本金', '个人本金', '滞纳金(异常支出)', '产生原因(备注)']
+                    retro_cols = ['处理月份', '工号', '姓名', '财务归属', '补缴险种', '补缴起始月', '补缴结束月', '企业本金', '个人本金', '滞纳金(异常支出)', '产生原因(备注)']
                     df_retro_export = retro_df.rename(columns=retro_map)[retro_cols]
-                    df_retro_export.to_excel(writer, index=False, sheet_name='6.异常款项专项审批')
 
-                    workbook = writer.book
-                    worksheet = writer.sheets['6.异常款项专项审批']
-                    alert_format = workbook.add_format({'bg_color': '#FFC7CE', 'font_color': '#9C0006', 'bold': True})
-                    worksheet.set_column('I:I', 16, alert_format)
-                    worksheet.set_column('J:J', 35)
+                    excel_io = io.BytesIO()
+                    with pd.ExcelWriter(excel_io, engine='xlsxwriter') as writer:
+                        df_retro_export.to_excel(writer, index=False, sheet_name="异常款项专项审批")
+                        workbook = writer.book
+                        worksheet = writer.sheets['异常款项专项审批']
+                        alert_format = workbook.add_format({'bg_color': '#FFC7CE', 'font_color': '#9C0006', 'bold': True})
+                        worksheet.set_column('J:J', 16, alert_format)
+                        worksheet.set_column('K:K', 35)
 
-            st.download_button(f"📥 下载 {internal_month} 内部提款与审计对账单", data=buffer_internal.getvalue(), file_name=f"对内提款明细_{internal_month}.xlsx", type="secondary")
+                    zf.writestr(f"6.异常款项专项审批_{s_m}至{e_m}.xlsx", excel_io.getvalue())
+
+            st.download_button(f"📥 点击下载对内提款单大包 (ZIP)", data=zip_buffer.getvalue(), file_name=f"对内审计提款单合集_{s_m}至{e_m}.zip", type="primary")
 
     st.divider()
 
@@ -406,12 +429,13 @@ with tab2:
     st.write("🔧 动态侦测全险种特例，自适应伸缩表格。彻底融合【跨月补缴与滞纳金】，精准追溯每一分财务死账。")
 
     ec1, ec2 = st.columns(2)
-    with ec1: start_month = st.selectbox("⏳ 结算起始月", options=available_months if available_months else ["无数据"], key='s_month')
-    with ec2: end_month = st.selectbox("⏳ 结算结束月", options=available_months if available_months else ["无数据"], key='e_month')
+    with ec1: start_month = st.selectbox("⏳ 结算起始月", options=available_months if available_months else ["无数据"], key='s_month', index=len(available_months)-1 if available_months else 0)
+    with ec2: end_month = st.selectbox("⏳ 结算结束月", options=available_months if available_months else ["无数据"], key='e_month', index=0 if available_months else 0)
 
     conn = _get_db_connection()
+    s_m, e_m = min(start_month, end_month), max(start_month, end_month)
     branch_query = "SELECT DISTINCT cost_center FROM ss_monthly_records WHERE cost_month >= ? AND cost_month <= ? AND cost_center != '本级'"
-    avail_branches_df = pd.read_sql_query(branch_query, conn, params=[start_month, end_month])
+    avail_branches_df = pd.read_sql_query(branch_query, conn, params=[s_m, e_m])
     conn.close()
     avail_branches = avail_branches_df['cost_center'].dropna().tolist()
 
@@ -421,7 +445,7 @@ with tab2:
         sys_settings = load_settings()
         conn = _get_db_connection()
         placeholders = ",".join(["?"] * len(selected_branches))
-        ext_params = [start_month, end_month] + selected_branches
+        ext_params = [s_m, e_m] + selected_branches
 
         ext_query = f"""
             SELECT r.*, e.name AS '姓名', 
@@ -449,9 +473,7 @@ with tab2:
         retro_df = pd.read_sql_query(retro_query, conn, params=ext_params)
         conn.close()
 
-        # [核心补漏] 补缴字典同步追加大病医疗的英文前缀映射
-        retro_map = {'养老保险': 'pension', '医疗保险': 'medical', '大病医疗': 'medical_serious', '失业保险': 'unemp',
-                     '工伤保险': 'injury', '生育保险': 'maternity', '住房公积金': 'fund', '企业年金': 'annuity'}
+        retro_map = {'养老保险':'pension', '医疗保险':'medical', '大病医疗':'medical_serious', '失业保险':'unemp', '工伤保险':'injury', '生育保险':'maternity', '住房公积金':'fund', '企业年金':'annuity'}
         normalized_retro = []
         for _, row in retro_df.iterrows():
             prefix = retro_map.get(row.get('retro_type', ''))
@@ -557,7 +579,7 @@ with tab2:
 
                         ins_str = "、".join([ac['name'] for ac in active_cols])
                         p_body1 = doc.add_paragraph(f"    因业务开展需要，{cc}{emp_names}社保（{ins_str}）暂由{account_name}代缴，代缴金额据实结算。")
-                        p_body2 = doc.add_paragraph(f"    从{start_month[:4]}年{start_month[-2:]}月到{end_month[:4]}年{end_month[-2:]}月，代缴金额为{total_sum:.2f}元，明细如下：\n")
+                        p_body2 = doc.add_paragraph(f"    从{s_m[:4]}年{s_m[-2:]}月到{e_m[:4]}年{e_m[-2:]}月，代缴金额为{total_sum:.2f}元，明细如下：\n")
                         for p in [p_body1, p_body2]:
                             for run in p.runs:
                                 run.font.name = '宋体'; run._element.rPr.rFonts.set(qn('w:eastAsia'), '宋体'); run.font.size = Pt(12)
@@ -659,7 +681,7 @@ with tab2:
 
                         st.success(f"✅ 生成完毕：**{cc} - {route_name}** 专属请款说明函 (.docx)")
 
-            st.download_button(f"📥 下载选中地市的公对公结算函 (ZIP)", data=zip_buffer.getvalue(), file_name=f"公对公结算函合集_{start_month}至{end_month}.zip", type="primary")
+            st.download_button(f"📥 下载选中地市的公对公结算函 (ZIP)", data=zip_buffer.getvalue(), file_name=f"公对公结算函合集_{s_m}至{e_m}.zip", type="primary")
 
 # ------------------------------------------------------------------------------
 # Tab 3: 全局规则与参数配置
@@ -762,12 +784,23 @@ with tab4:
     hc1, hc2 = st.columns(2)
     with hc1:
         target_hist_month = st.text_input("📅 1. 设定你要补录的目标月份 (如: 2026-02)", value="2026-02")
-        ref_month = archived_months[0] if archived_months else None
+
+        # [核心逻辑重构：智能寻轨] 计算绝对时间差，寻找“最近”的月份作为底稿母本
+        ref_month = None
+        if archived_months:
+            try:
+                def ym_to_int(ym_str):
+                    y, m = map(int, str(ym_str).split('-'))
+                    return y * 12 + m
+                target_val = ym_to_int(target_hist_month)
+                ref_month = min(archived_months, key=lambda x: abs(ym_to_int(x) - target_val))
+            except Exception:
+                ref_month = archived_months[0]
 
         if st.button("🚀 2. 生成带姓名与金额的【智能预填底稿】", type="primary"):
             conn = _get_db_connection()
             if ref_month:
-                st.info(f"💡 探针已激活：系统侦测到最近的归档账单为 {ref_month}，正在为您完美克隆该月数据作为底稿...")
+                st.info(f"💡 探针已激活：系统侦测到最近的关联账单为 {ref_month}，正在为您完美克隆该月数据作为底稿...")
                 clone_query = """
                     SELECT r.*, e.name AS '姓名'
                     FROM ss_monthly_records r
@@ -836,7 +869,6 @@ with tab4:
                 writer.sheets['Sheet1'].set_column('A:X', 18)
 
             st.download_button("📥 3. 下载已预填好的历史账单底稿", data=hist_buffer.getvalue(), file_name=f"{target_hist_month}_历史社保智能补录底稿.xlsx", type="secondary")
-            st.caption("提示：表格已自动填好所有人姓名与工号（及最近一月的全套金额），你只需微调金额有差异的人员即可！")
 
     with hc2:
         hist_file = st.file_uploader("📤 4. 上传核对完毕的历史账单明细", type=["xlsx", "csv"])
