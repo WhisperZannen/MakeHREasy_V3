@@ -4,7 +4,8 @@
 # 核心改造:
 #   1. Tab 1: 完美分离 199 与 7。
 #   2. Tab 2: 彻底修复 Grouper 1D 崩溃。实装 5 大独立财务提取单引擎（总览与月度拆分）。
-#   3. Tab 4: 历史补录支持时间感知倒推（智能寻轨引擎）。
+#   3. Tab 2 第二部分：[核心重构] 将零散的 ZIP 下载彻底替换为“一键生成全量合并 Word”。
+#   4. Tab 4: 历史补录支持时间感知倒推（智能寻轨引擎）。
 # ==============================================================================
 
 import streamlit as st
@@ -300,19 +301,14 @@ with tab2:
 
         conn = _get_db_connection()
 
-        # [彻底消除 1D Grouper 崩溃核心]
-        # SQL 查询中，坚决不给 m.cost_center 起中文别名，严格保持英文供后续 pandas 进行二维判定
-        # [终极修复：杜绝双重列名对撞] r.* 里面已经自带了 cost_center，绝对不能再 JOIN 并 AS 'cost_center'，否则会引发 Pandas 维度崩溃！
         query = """
             SELECT r.*, e.name AS '姓名'
             FROM ss_monthly_records r 
             LEFT JOIN employees e ON r.emp_id = e.emp_id 
             WHERE r.cost_month >= ? AND r.cost_month <= ?
         """
-        # 这行执行代码保持原样不动
         raw_df = pd.read_sql_query(query, conn, params=[s_m, e_m])
 
-        # 补缴表 (ss_retroactive_records) 原生没有 cost_center，所以这里必须用 AS 'cost_center' 强行抓取
         retro_query = """
             SELECT r.*, e.name AS '姓名', IFNULL(m.cost_center, '本级') AS 'cost_center'
             FROM ss_retroactive_records r
@@ -320,7 +316,6 @@ with tab2:
             LEFT JOIN ss_emp_matrix m ON r.emp_id = m.emp_id
             WHERE r.process_month >= ? AND r.process_month <= ?
         """
-        # 这行执行代码也保持原样不动
         retro_df = pd.read_sql_query(retro_query, conn, params=[s_m, e_m])
         conn.close()
 
@@ -328,7 +323,6 @@ with tab2:
             zip_buffer = io.BytesIO()
             with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
 
-                # 直到最终写入 Excel 的前一秒，才调用此字典对英文键名进行安全渲染
                 rename_map = {
                     'emp_id': '工号', 'cost_center': '财务归属',
                     'pension_comp': '养老(企业)', 'pension_pers': '养老(个人)',
@@ -339,7 +333,6 @@ with tab2:
                     'annuity_comp': '年金(企业)', 'annuity_pers': '年金(个人)'
                 }
 
-                # 5 大账目的物理通道与险种强制隔离规则表
                 channel_configs = [
                     {'name': '1.中电数智(五险两金综合)', 'route': '中电数智', 'items': ['pension', 'medical', 'unemp', 'injury', 'maternity', 'fund', 'annuity']},
                     {'name': '2.省公司(年金)', 'route': '省公司', 'items': ['annuity']},
@@ -354,7 +347,6 @@ with tab2:
                     for config in channel_configs:
                         df_channel = raw_df.copy()
 
-                        # 遍历全险种，切断不属于该配置表的内容
                         for it in all_insurance_items:
                             if it not in config['items']:
                                 if f'{it}_comp' in df_channel.columns: df_channel[f'{it}_comp'] = 0.0
@@ -366,7 +358,6 @@ with tab2:
                                 if f'{it}_pers' in df_channel.columns: df_channel.loc[~mask, f'{it}_pers'] = 0.0
                                 if it == 'medical' and 'medical_serious_pers' in df_channel.columns: df_channel.loc[~mask, 'medical_serious_pers'] = 0.0
 
-                        # 删除没有任何发生额的空人员
                         money_cols = [c for c in df_channel.columns if c.endswith('_comp') or c.endswith('_pers')]
                         df_channel['__row_sum__'] = df_channel[money_cols].sum(axis=1)
                         df_channel = df_channel[df_channel['__row_sum__'] > 0].drop(columns=['__row_sum__'])
@@ -377,14 +368,12 @@ with tab2:
                                 group_cols = ['emp_id', '姓名', 'cost_center']
                                 active_sum_cols = [c for c in money_cols if df_channel[c].sum() > 0]
 
-                                # === 三维排版：Sheet 1 (跨期总览累加) ===
                                 if active_sum_cols:
                                     df_sum = df_channel.groupby(group_cols)[active_sum_cols].sum().reset_index()
                                     export_cols = group_cols + active_sum_cols
                                     df_export = df_sum[export_cols].rename(columns=rename_map)
                                     df_export.to_excel(writer, index=False, sheet_name="总览")
 
-                                # === 三维排版：Sheet N (单月孤立明细) ===
                                 for month in selected_months:
                                     df_month = df_channel[df_channel['cost_month'] == month]
                                     if not df_month.empty:
@@ -396,7 +385,6 @@ with tab2:
 
                             zf.writestr(f"{config['name']}_{s_m}至{e_m}.xlsx", excel_io.getvalue())
 
-                # 处理并打包第 6 张表：异常款项（补缴与死账）
                 if not retro_df.empty:
                     retro_map = {
                         'process_month': '处理月份', 'emp_id': '工号', 'retro_type': '补缴险种',
@@ -423,7 +411,7 @@ with tab2:
     st.divider()
 
     # ==========================================
-    # 第二部分：对外公对公结算函生成引擎 (动态防死账版)
+    # 第二部分：对外公对公结算函生成引擎 (一键合并打印版)
     # ==========================================
     st.subheader("📜 第二部分：跨期公对公结算函 (Word 动态打包引擎)")
     st.write("🔧 动态侦测全险种特例，自适应伸缩表格。彻底融合【跨月补缴与滞纳金】，精准追溯每一分财务死账。")
@@ -441,7 +429,8 @@ with tab2:
 
     selected_branches = st.multiselect("🏢 勾选需要生成结算函的地市分公司 (默认全选)", options=avail_branches, default=avail_branches)
 
-    if st.button("🚀 极速生成并打包选中地市结算函 (ZIP)", type="primary") and start_month != "无数据" and selected_branches:
+    # [核心体验升级] 输出单个全量 Word，完全摒弃 ZIP，所有公对公结算单排在一个文件里，点击一次全部打印
+    if st.button("🚀 一键生成【合并版】地市结算函 (全量 Word)", type="primary") and start_month != "无数据" and selected_branches:
         sys_settings = load_settings()
         conn = _get_db_connection()
         placeholders = ",".join(["?"] * len(selected_branches))
@@ -497,191 +486,192 @@ with tab2:
         if combined_df.empty:
             st.warning("该时间段内所选分公司没有产生任何费用记录。")
         else:
-            zip_buffer = io.BytesIO()
-            with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+            merged_doc = Document()
+            first_letter = True
 
-                for cc, group in combined_df.groupby('cost_center'):
-                    routes_used = set()
-                    for r_col in ['pension_route', 'medical_route', 'unemp_route', 'injury_route', 'maternity_route', 'fund_route', 'annuity_route']:
-                        if r_col in group.columns: routes_used.update(group[r_col].astype(str).dropna().unique())
-                    routes_used.discard(''); routes_used.discard('None'); routes_used.discard('0.0')
+            for cc, group in combined_df.groupby('cost_center'):
+                routes_used = set()
+                for r_col in ['pension_route', 'medical_route', 'unemp_route', 'injury_route', 'maternity_route', 'fund_route', 'annuity_route']:
+                    if r_col in group.columns: routes_used.update(group[r_col].astype(str).dropna().unique())
+                routes_used.discard(''); routes_used.discard('None'); routes_used.discard('0.0')
 
-                    for route_name in routes_used:
-                        df_cc_route = group.copy()
-                        has_amt = pd.Series([False] * len(df_cc_route))
+                for route_name in routes_used:
+                    df_cc_route = group.copy()
+                    has_amt = pd.Series([False] * len(df_cc_route))
 
-                        for it in ['pension', 'medical', 'unemp', 'injury', 'maternity', 'fund', 'annuity']:
-                            c_col, p_col, r_col = f'{it}_comp', f'{it}_pers', f'{it}_route'
-                            if r_col in df_cc_route.columns:
-                                mask = df_cc_route[r_col].astype(str) == route_name
-                                if c_col in df_cc_route.columns:
-                                    df_cc_route.loc[~mask, c_col] = 0.0
-                                    has_amt = has_amt | (df_cc_route[c_col] > 0)
-                                if p_col in df_cc_route.columns:
-                                    df_cc_route.loc[~mask, p_col] = 0.0
-                                    has_amt = has_amt | (df_cc_route[p_col] > 0)
-
-                                if it == 'medical' and 'medical_serious_pers' in df_cc_route.columns:
-                                    df_cc_route.loc[~mask, 'medical_serious_pers'] = 0.0
-                                    has_amt = has_amt | (df_cc_route['medical_serious_pers'] > 0)
-
-                        if 'late_fee' in df_cc_route.columns:
-                            df_cc_route.loc[~has_amt, 'late_fee'] = 0.0
-                            has_amt = has_amt | (df_cc_route['late_fee'] > 0)
-
-                        df_cc_route = df_cc_route[has_amt]
-                        if df_cc_route.empty: continue
-
-                        active_cols = []
-                        ins_names = {'pension':'养老', 'medical':'医疗', 'medical_serious':'大病', 'unemp':'失业', 'injury':'工伤', 'maternity':'生育', 'fund':'公积金', 'annuity':'年金'}
-
-                        for it in ['pension', 'medical', 'unemp', 'injury', 'maternity', 'fund', 'annuity']:
-                            c_sum = df_cc_route[f'{it}_comp'].sum() if f'{it}_comp' in df_cc_route.columns else 0
-                            p_sum = df_cc_route[f'{it}_pers'].sum() if f'{it}_pers' in df_cc_route.columns else 0
-                            if c_sum > 0 and p_sum > 0: active_cols.append({'id':it, 'name':ins_names[it], 'has_c':True, 'has_p':True})
-                            elif c_sum > 0: active_cols.append({'id':it, 'name':ins_names[it], 'has_c':True, 'has_p':False})
-                            elif p_sum > 0: active_cols.append({'id':it, 'name':ins_names[it], 'has_c':False, 'has_p':True})
-
+                    for it in ['pension', 'medical', 'unemp', 'injury', 'maternity', 'fund', 'annuity']:
+                        r_col = f'{it}_route'
+                        if r_col in df_cc_route.columns:
+                            mask = df_cc_route[r_col].astype(str) == route_name
+                            df_cc_route.loc[~mask, f'{it}_comp'] = 0.0
+                            df_cc_route.loc[~mask, f'{it}_pers'] = 0.0
                             if it == 'medical' and 'medical_serious_pers' in df_cc_route.columns:
-                                if df_cc_route['medical_serious_pers'].sum() > 0:
-                                    active_cols.append({'id':'medical_serious', 'name':'大病', 'has_c':False, 'has_p':True})
+                                df_cc_route.loc[~mask, 'medical_serious_pers'] = 0.0
 
-                        has_late_fee = df_cc_route['late_fee'].sum() > 0 if 'late_fee' in df_cc_route.columns else False
+                            c_col_val = df_cc_route[f'{it}_comp'] if f'{it}_comp' in df_cc_route.columns else 0.0
+                            p_col_val = df_cc_route[f'{it}_pers'] if f'{it}_pers' in df_cc_route.columns else 0.0
+                            has_amt = has_amt | (c_col_val > 0) | (p_col_val > 0)
 
-                        row_totals = []
-                        for _, r_data in df_cc_route.iterrows():
-                            r_tot = 0.0
-                            for ac in active_cols:
-                                if ac['has_c']: r_tot += r_data.get(f"{ac['id']}_comp", 0.0)
-                                if ac['has_p']: r_tot += r_data.get(f"{ac['id']}_pers", 0.0)
-                            if has_late_fee: r_tot += r_data.get('late_fee', 0.0)
-                            row_totals.append(r_tot)
-                        df_cc_route['当行合计'] = row_totals
-                        total_sum = sum(row_totals)
+                    if 'late_fee' in df_cc_route.columns:
+                        df_cc_route.loc[~has_amt, 'late_fee'] = 0.0
+                        has_amt = has_amt | (df_cc_route['late_fee'] > 0)
 
-                        doc = Document()
+                    df_cc_route = df_cc_route[has_amt]
+                    if df_cc_route.empty: continue
 
-                        p_title = doc.add_paragraph()
-                        p_title.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                        r_title = p_title.add_run("关于社保代缴的季度结算的说明函")
-                        r_title.font.size = Pt(16); r_title.font.bold = True; r_title.font.name = '黑体'
-                        r_title._element.rPr.rFonts.set(qn('w:eastAsia'), '黑体')
+                    active_cols = []
+                    ins_names = {'pension':'养老', 'medical':'医疗', 'medical_serious':'大病', 'unemp':'失业', 'injury':'工伤', 'maternity':'生育', 'fund':'公积金', 'annuity':'年金'}
 
-                        p_salut = doc.add_paragraph()
-                        r_salut = p_salut.add_run(f"{cc}：")
-                        r_salut.font.name = '宋体'; r_salut._element.rPr.rFonts.set(qn('w:eastAsia'), '宋体')
+                    for it in ['pension', 'medical', 'unemp', 'injury', 'maternity', 'fund', 'annuity']:
+                        c_sum = df_cc_route[f'{it}_comp'].sum() if f'{it}_comp' in df_cc_route.columns else 0
+                        p_sum = df_cc_route[f'{it}_pers'].sum() if f'{it}_pers' in df_cc_route.columns else 0
+                        if c_sum > 0 and p_sum > 0: active_cols.append({'id':it, 'name':ins_names[it], 'has_c':True, 'has_p':True})
+                        elif c_sum > 0: active_cols.append({'id':it, 'name':ins_names[it], 'has_c':True, 'has_p':False})
+                        elif p_sum > 0: active_cols.append({'id':it, 'name':ins_names[it], 'has_c':False, 'has_p':True})
 
-                        emp_names = "、".join(df_cc_route['姓名'].unique())
-                        if len(emp_names) > 15: emp_names = emp_names[:15] + "等"
+                        if it == 'medical' and 'medical_serious_pers' in df_cc_route.columns:
+                            if df_cc_route['medical_serious_pers'].sum() > 0:
+                                active_cols.append({'id':'medical_serious', 'name':'大病', 'has_c':False, 'has_p':True})
 
-                        bank_info = sys_settings.get("bank_accounts", {}).get(route_name, {})
-                        account_name = bank_info.get("名称", route_name)
+                    has_late_fee = df_cc_route['late_fee'].sum() > 0 if 'late_fee' in df_cc_route.columns else False
 
-                        ins_str = "、".join([ac['name'] for ac in active_cols])
-                        p_body1 = doc.add_paragraph(f"    因业务开展需要，{cc}{emp_names}社保（{ins_str}）暂由{account_name}代缴，代缴金额据实结算。")
-                        p_body2 = doc.add_paragraph(f"    从{s_m[:4]}年{s_m[-2:]}月到{e_m[:4]}年{e_m[-2:]}月，代缴金额为{total_sum:.2f}元，明细如下：\n")
-                        for p in [p_body1, p_body2]:
-                            for run in p.runs:
-                                run.font.name = '宋体'; run._element.rPr.rFonts.set(qn('w:eastAsia'), '宋体'); run.font.size = Pt(12)
-
-                        base_headers = ["月份", "公司", "员工姓名", "基数"]
-                        num_cols = len(base_headers)
+                    row_totals = []
+                    for _, r_data in df_cc_route.iterrows():
+                        r_tot = 0.0
                         for ac in active_cols:
-                            if ac['has_c'] and ac['has_p']: num_cols += 2
-                            else: num_cols += 1
-                        if has_late_fee: num_cols += 1
-                        num_cols += 1
+                            if ac['has_c']: r_tot += r_data.get(f"{ac['id']}_comp", 0.0)
+                            if ac['has_p']: r_tot += r_data.get(f"{ac['id']}_pers", 0.0)
+                        if has_late_fee: r_tot += r_data.get('late_fee', 0.0)
+                        row_totals.append(r_tot)
+                    df_cc_route['当行合计'] = row_totals
+                    total_sum = sum(row_totals)
 
-                        table = doc.add_table(rows=2 + len(df_cc_route) + 1, cols=num_cols)
-                        table.style = 'Table Grid'
+                    # [打印分页逻辑] 非首张结算单，强制插入硬分页符，保证每家公司单占一页
+                    if not first_letter: merged_doc.add_page_break()
+                    first_letter = False
 
-                        for i, h in enumerate(base_headers):
-                            table.cell(0, i).merge(table.cell(1, i)).text = h
+                    # [全量渲染引擎] 将画表代码全部无缝内嵌
+                    p_title = merged_doc.add_paragraph()
+                    p_title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                    r_title = p_title.add_run("关于社保代缴的结算说明函")
+                    r_title.font.size = Pt(16); r_title.font.bold = True; r_title.font.name = '黑体'
+                    r_title._element.rPr.rFonts.set(qn('w:eastAsia'), '黑体')
 
-                        col_idx = len(base_headers)
-                        for ac in active_cols:
-                            if ac['has_c'] and ac['has_p']:
-                                table.cell(0, col_idx).merge(table.cell(0, col_idx+1)).text = ac['name']
-                                table.cell(1, col_idx).text = "企业"
-                                table.cell(1, col_idx+1).text = "个人"
-                                ac['c_idx'] = col_idx; ac['p_idx'] = col_idx + 1
-                                col_idx += 2
-                            elif ac['has_c']:
-                                table.cell(0, col_idx).merge(table.cell(1, col_idx)).text = ac['name'] + "(企)"
-                                ac['c_idx'] = col_idx; ac['p_idx'] = -1
-                                col_idx += 1
-                            elif ac['has_p']:
-                                table.cell(0, col_idx).merge(table.cell(1, col_idx)).text = ac['name'] + "(个)"
-                                ac['c_idx'] = -1; ac['p_idx'] = col_idx
-                                col_idx += 1
+                    p_salut = merged_doc.add_paragraph()
+                    r_salut = p_salut.add_run(f"{cc}：")
+                    r_salut.font.name = '宋体'; r_salut._element.rPr.rFonts.set(qn('w:eastAsia'), '宋体')
 
-                        if has_late_fee:
-                            table.cell(0, col_idx).merge(table.cell(1, col_idx)).text = "滞纳金"
-                            lf_idx = col_idx
+                    emp_names = "、".join(df_cc_route['姓名'].unique())
+                    if len(emp_names) > 15: emp_names = emp_names[:15] + "等"
+
+                    bank_info = sys_settings.get("bank_accounts", {}).get(route_name, {})
+                    account_name = bank_info.get("名称", route_name)
+
+                    ins_str = "、".join([ac['name'] for ac in active_cols])
+                    p_body1 = merged_doc.add_paragraph(f"    因业务开展需要，{cc}{emp_names}社保（{ins_str}）暂由{account_name}代缴，代缴金额据实结算。")
+                    p_body2 = merged_doc.add_paragraph(f"    从{s_m[:4]}年{s_m[-2:]}月到{e_m[:4]}年{e_m[-2:]}月，代缴金额为{total_sum:.2f}元，明细如下：\n")
+                    for p in [p_body1, p_body2]:
+                        for run in p.runs:
+                            run.font.name = '宋体'; run._element.rPr.rFonts.set(qn('w:eastAsia'), '宋体'); run.font.size = Pt(12)
+
+                    base_headers = ["月份", "公司", "员工姓名", "基数"]
+                    num_cols = len(base_headers)
+                    for ac in active_cols:
+                        if ac['has_c'] and ac['has_p']: num_cols += 2
+                        else: num_cols += 1
+                    if has_late_fee: num_cols += 1
+                    num_cols += 1
+
+                    table = merged_doc.add_table(rows=2 + len(df_cc_route) + 1, cols=num_cols)
+                    table.style = 'Table Grid'
+
+                    for i, h in enumerate(base_headers):
+                        table.cell(0, i).merge(table.cell(1, i)).text = h
+
+                    col_idx = len(base_headers)
+                    for ac in active_cols:
+                        if ac['has_c'] and ac['has_p']:
+                            table.cell(0, col_idx).merge(table.cell(0, col_idx+1)).text = ac['name']
+                            table.cell(1, col_idx).text = "企业"
+                            table.cell(1, col_idx+1).text = "个人"
+                            ac['c_idx'] = col_idx; ac['p_idx'] = col_idx + 1
+                            col_idx += 2
+                        elif ac['has_c']:
+                            table.cell(0, col_idx).merge(table.cell(1, col_idx)).text = ac['name'] + "(企)"
+                            ac['c_idx'] = col_idx; ac['p_idx'] = -1
+                            col_idx += 1
+                        elif ac['has_p']:
+                            table.cell(0, col_idx).merge(table.cell(1, col_idx)).text = ac['name'] + "(个)"
+                            ac['c_idx'] = -1; ac['p_idx'] = col_idx
                             col_idx += 1
 
-                        table.cell(0, col_idx).merge(table.cell(1, col_idx)).text = "合计"
-                        total_idx = col_idx
+                    if has_late_fee:
+                        table.cell(0, col_idx).merge(table.cell(1, col_idx)).text = "滞纳金"
+                        lf_idx = col_idx
+                        col_idx += 1
 
-                        row_idx = 2
-                        for _, r_data in df_cc_route.iterrows():
-                            month_str = str(r_data['cost_month']).replace('补缴(', '').replace(')', '')
-                            if '-' in month_str: month_str = month_str.split('-')[-1] + "月"
+                    table.cell(0, col_idx).merge(table.cell(1, col_idx)).text = "合计"
+                    total_idx = col_idx
 
-                            table.cell(row_idx, 0).text = month_str
-                            table.cell(row_idx, 1).text = cc
-                            table.cell(row_idx, 2).text = str(r_data['姓名'])
-                            table.cell(row_idx, 3).text = str(r_data['基数'])
+                    row_idx = 2
+                    for _, r_data in df_cc_route.iterrows():
+                        month_str = str(r_data['cost_month']).replace('补缴(', '').replace(')', '')
+                        if '-' in month_str: month_str = month_str.split('-')[-1] + "月"
 
-                            for ac in active_cols:
-                                if ac['has_c']: table.cell(row_idx, ac['c_idx']).text = f"{r_data.get(ac['id']+'_comp', 0.0):.2f}"
-                                if ac['has_p']: table.cell(row_idx, ac['p_idx']).text = f"{r_data.get(ac['id']+'_pers', 0.0):.2f}"
+                        table.cell(row_idx, 0).text = month_str
+                        table.cell(row_idx, 1).text = cc
+                        table.cell(row_idx, 2).text = str(r_data['姓名'])
+                        table.cell(row_idx, 3).text = str(r_data['基数'])
 
-                            if has_late_fee: table.cell(row_idx, lf_idx).text = f"{r_data.get('late_fee', 0.0):.2f}"
-                            table.cell(row_idx, total_idx).text = f"{r_data['当行合计']:.2f}"
-                            row_idx += 1
+                        for ac in active_cols:
+                            if ac['has_c']: table.cell(row_idx, ac['c_idx']).text = f"{r_data.get(ac['id']+'_comp', 0.0):.2f}"
+                            if ac['has_p']: table.cell(row_idx, ac['p_idx']).text = f"{r_data.get(ac['id']+'_pers', 0.0):.2f}"
 
-                        table.cell(row_idx, 0).merge(table.cell(row_idx, total_idx - 1)).text = "合计"
-                        table.cell(row_idx, total_idx).text = f"{total_sum:.2f}"
+                        if has_late_fee: table.cell(row_idx, lf_idx).text = f"{r_data.get('late_fee', 0.0):.2f}"
+                        table.cell(row_idx, total_idx).text = f"{r_data['当行合计']:.2f}"
+                        row_idx += 1
 
-                        for row in table.rows:
-                            for cell in row.cells:
-                                for paragraph in cell.paragraphs:
-                                    paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                                    for run in paragraph.runs:
-                                        run.font.name = '宋体'; run._element.rPr.rFonts.set(qn('w:eastAsia'), '宋体'); run.font.size = Pt(10)
+                    table.cell(row_idx, 0).merge(table.cell(row_idx, total_idx - 1)).text = "合计"
+                    table.cell(row_idx, total_idx).text = f"{total_sum:.2f}"
 
-                        doc.add_paragraph("\n支付银行账户信息如下：")
-                        binfo = [
-                            ("名称", bank_info.get("名称", "未配置")),
-                            ("银行类别", bank_info.get("银行类别", "未配置")),
-                            ("开户银行名称", bank_info.get("开户银行名称", "未配置")),
-                            ("银行账号", bank_info.get("银行账号", "未配置"))
-                        ]
-                        for k, v in binfo:
-                            p_bank = doc.add_paragraph(f"{k}：{v}" if k != "名称" else f"{k}，{v}")
-                            for run in p_bank.runs:
-                                run.font.name = '宋体'; run._element.rPr.rFonts.set(qn('w:eastAsia'), '宋体')
+                    for row in table.rows:
+                        for cell in row.cells:
+                            for paragraph in cell.paragraphs:
+                                paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                                for run in paragraph.runs:
+                                    run.font.name = '宋体'; run._element.rPr.rFonts.set(qn('w:eastAsia'), '宋体'); run.font.size = Pt(10)
 
-                        doc.add_paragraph("\n")
-                        sig_name = sys_settings.get("company_signature", "省公众人力部")
-                        p_sig = doc.add_paragraph(sig_name)
-                        p_sig.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-                        p_date = doc.add_paragraph(datetime.datetime.now().strftime("%Y年%m月%d日"))
-                        p_date.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-                        for p in [p_sig, p_date]:
-                            for run in p.runs:
-                                run.font.name = '宋体'; run._element.rPr.rFonts.set(qn('w:eastAsia'), '宋体'); run.font.size = Pt(12)
+                    merged_doc.add_paragraph("\n支付银行账户信息如下：")
+                    binfo = [
+                        ("名称", bank_info.get("名称", "未配置")),
+                        ("银行类别", bank_info.get("银行类别", "未配置")),
+                        ("开户银行名称", bank_info.get("开户银行名称", "未配置")),
+                        ("银行账号", bank_info.get("银行账号", "未配置"))
+                    ]
+                    for k, v in binfo:
+                        p_bank = merged_doc.add_paragraph(f"{k}：{v}" if k != "名称" else f"{k}，{v}")
+                        for run in p_bank.runs:
+                            run.font.name = '宋体'; run._element.rPr.rFonts.set(qn('w:eastAsia'), '宋体')
 
-                        doc_io = io.BytesIO()
-                        doc.save(doc_io)
-                        safe_cc = str(cc).replace("/", "_").replace("\\", "_")
-                        safe_rn = str(route_name).replace("/", "_").replace("\\", "_")
-                        zf.writestr(f"{safe_cc}_{safe_rn}_结算函.docx", doc_io.getvalue())
+                    merged_doc.add_paragraph("\n")
+                    sig_name = sys_settings.get("company_signature", "省公众人力部")
+                    p_sig = merged_doc.add_paragraph(sig_name)
+                    p_sig.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+                    p_date = merged_doc.add_paragraph(datetime.datetime.now().strftime("%Y年%m月%d日"))
+                    p_date.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+                    for p in [p_sig, p_date]:
+                        for run in p.runs:
+                            run.font.name = '宋体'; run._element.rPr.rFonts.set(qn('w:eastAsia'), '宋体'); run.font.size = Pt(12)
 
-                        st.success(f"✅ 生成完毕：**{cc} - {route_name}** 专属请款说明函 (.docx)")
-
-            st.download_button(f"📥 下载选中地市的公对公结算函 (ZIP)", data=zip_buffer.getvalue(), file_name=f"公对公结算函合集_{s_m}至{e_m}.zip", type="primary")
+            # [终极安全输出] 生成并抛出唯一的 Word 合集大包
+            doc_io = io.BytesIO()
+            merged_doc.save(doc_io)
+            st.download_button(
+                f"📥 点击下载【合并打印版】结算函 ({s_m}至{e_m})",
+                data=doc_io.getvalue(),
+                file_name=f"全量地市结算函_合并打印版_{s_m}至{e_m}.docx",
+                type="primary"
+            )
 
 # ------------------------------------------------------------------------------
 # Tab 3: 全局规则与参数配置
