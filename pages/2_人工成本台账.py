@@ -227,109 +227,158 @@ with tab2:
         if not target_month:
             st.warning("请填写目标月份！")
         else:
-            conn = _get_db_connection()
-            base_df = pd.read_sql_query("SELECT * FROM labor_cost_ledger WHERE cost_month = ?", conn, params=[base_month])
-            all_emps = pd.read_sql_query("SELECT emp_id, name, dept_id, status FROM employees", conn)
-            active_emps = all_emps[all_emps['status'] == '在职']
+            conn = _get_db_connection() # 开启数据库物理连接
+            try: # 开启安全保护域，无论中间是否报错，最后必须走 finally 关闭连接
+                # 1. 抓取基准月台账底表
+                base_df = pd.read_sql_query("SELECT * FROM labor_cost_ledger WHERE cost_month = ?", conn, params=[base_month])
+                # 2. 抓取当前全量在职人员名单
+                all_emps = pd.read_sql_query("SELECT emp_id, name, dept_id, status FROM employees", conn)
+                active_emps = all_emps[all_emps['status'] == '在职']
 
-            dept_df = pd.read_sql_query("SELECT dept_id, dept_name FROM departments", conn)
-            dept_dict = dict(zip(dept_df['dept_id'], dept_df['dept_name']))
+                # 3. 抓取部门字典用于汉化
+                dept_df = pd.read_sql_query("SELECT dept_id, dept_name FROM departments", conn)
+                dept_dict = dict(zip(dept_df['dept_id'], dept_df['dept_name']))
 
-            ss_query = """
-                SELECT 
-                    emp_id, 
-                    pension_comp, medical_comp, unemp_comp, injury_comp, maternity_comp, fund_comp, annuity_comp,
-                    pension_pers, medical_pers, medical_serious_pers, unemp_pers, fund_pers, annuity_pers
-                FROM ss_monthly_records
-                WHERE cost_month = ?
-            """
-            ss_df = pd.read_sql_query(ss_query, conn, params=[target_month])
-            conn.close()
+                # 4. 抓取目标月份的固化社保数据
+                ss_query = """
+                    SELECT 
+                        emp_id, 
+                        pension_comp, medical_comp, unemp_comp, injury_comp, maternity_comp, fund_comp, annuity_comp,
+                        pension_pers, medical_pers, medical_serious_pers, unemp_pers, fund_pers, annuity_pers
+                    FROM ss_monthly_records
+                    WHERE cost_month = ?
+                """
+                ss_df = pd.read_sql_query(ss_query, conn, params=[target_month])
 
-            if not base_df.empty:
-                emp_status_dict = dict(zip(all_emps['emp_id'], all_emps['status']))
-                keep_mask = []
-                for _, row in base_df.iterrows():
-                    eid = str(row['emp_id'])
-                    cost = row.get('total_labor_cost', 0.0)
-                    if pd.isna(cost): cost = 0.0
+                # [核心排障：已抹除此处的 conn.close()，防止后续查询断联]
 
-                    curr_status = emp_status_dict.get(eid, row.get('emp_status', '在职'))
-                    if '离职' in curr_status and cost == 0.0:
-                        keep_mask.append(False)
-                    else:
-                        keep_mask.append(True)
+                if not base_df.empty:
+                    # 建立当前最新的人事状态映射
+                    emp_status_dict = dict(zip(all_emps['emp_id'], all_emps['status']))
 
-                base_df = base_df[keep_mask]
-                base_df['cost_month'] = target_month
-                base_emp_ids = set(base_df['emp_id'].tolist())
-                new_emps = active_emps[~active_emps['emp_id'].isin(base_emp_ids)]
+                    # =================================================================
+                    # [核心重构：15号生死线回溯引擎]
+                    # =================================================================
+                    target_deadline = f"{target_month}-15 23:59:59"
 
-                new_rows = []
-                for _, r in new_emps.iterrows():
-                    new_row = {col: 0.0 if DB_TO_CN_MAP.get(col) in NUMERIC_COLS else None for col in base_df.columns}
-                    new_row['cost_month'] = target_month
-                    new_row['emp_id'] = r['emp_id']
-                    new_row['emp_name'] = r['name']
-                    new_row['dept_name'] = dept_dict.get(r['dept_id'], '未分配部门')
-                    new_row['emp_status'] = r['status']
-                    new_rows.append(new_row)
+                    # 5. 抓取15号之后发生的调动记录（此时 conn 依然存活，完美执行！）
+                    rollback_query = """
+                        SELECT emp_id, old_dept_id, new_dept_id, change_date
+                        FROM personnel_changes
+                        WHERE change_date > ? AND old_dept_id IS NOT NULL AND new_dept_id IS NOT NULL
+                        ORDER BY change_date DESC
+                    """
+                    rollback_df = pd.read_sql_query(rollback_query, conn, params=[target_deadline])
 
-                if new_rows:
-                    base_df = pd.concat([base_df, pd.DataFrame(new_rows)], ignore_index=True)
+                    effective_dept_dict = dict(zip(all_emps['emp_id'], all_emps['dept_id']))
 
-                export_cn = base_df.rename(columns=DB_TO_CN_MAP)
+                    # 时光倒流：将15号以后调动的人拽回老部门
+                    for _, rb_row in rollback_df.iterrows():
+                        eid_rb = rb_row['emp_id']
+                        if eid_rb in effective_dept_dict:
+                            effective_dept_dict[eid_rb] = rb_row['old_dept_id']
+                    # =================================================================
 
-                if clear_nums:
-                    for cn_col in NUMERIC_COLS:
-                        if cn_col in export_cn.columns: export_cn[cn_col] = 0.0
+                    keep_mask = []
+                    for idx, row in base_df.iterrows():
+                        eid = str(row['emp_id'])
+                        cost = row.get('total_labor_cost', 0.0)
+                        if pd.isna(cost): cost = 0.0
 
-                if not ss_df.empty:
-                    ss_df['emp_id'] = ss_df['emp_id'].astype(str).str.replace(r'\.0$', '', regex=True).str.strip()
-                    ss_index_df = ss_df.set_index('emp_id')
+                        curr_status = emp_status_dict.get(eid, row.get('emp_status', '在职'))
 
-                    for idx, row in export_cn.iterrows():
-                        eid = str(row.get('工号', '')).replace('.0', '').strip()
-                        if eid in ss_index_df.index:
-                            ss_rec = ss_index_df.loc[eid]
-                            if isinstance(ss_rec, pd.DataFrame):
-                                ss_rec = ss_rec.iloc[0]
+                        # 注入经过15号分水岭判定后的合法部门
+                        if eid in effective_dept_dict:
+                            valid_dept_id = effective_dept_dict[eid]
+                            base_df.at[idx, 'dept_name'] = dept_dict.get(valid_dept_id, '未分配部门')
 
-                            export_cn.at[idx, '养老保险-企业'] = ss_rec.get('pension_comp', 0.0) if pd.notna(ss_rec.get('pension_comp')) else 0.0
-                            export_cn.at[idx, '医疗保险-企业'] = ss_rec.get('medical_comp', 0.0) if pd.notna(ss_rec.get('medical_comp')) else 0.0
-                            export_cn.at[idx, '失业保险-企业'] = ss_rec.get('unemp_comp', 0.0) if pd.notna(ss_rec.get('unemp_comp')) else 0.0
-                            export_cn.at[idx, '工伤保险-企业'] = ss_rec.get('injury_comp', 0.0) if pd.notna(ss_rec.get('injury_comp')) else 0.0
-                            export_cn.at[idx, '生育保险-企业'] = ss_rec.get('maternity_comp', 0.0) if pd.notna(ss_rec.get('maternity_comp')) else 0.0
-                            export_cn.at[idx, '住房公积金-企业'] = ss_rec.get('fund_comp', 0.0) if pd.notna(ss_rec.get('fund_comp')) else 0.0
-                            export_cn.at[idx, '企业年金-企业'] = ss_rec.get('annuity_comp', 0.0) if pd.notna(ss_rec.get('annuity_comp')) else 0.0
+                        base_df.at[idx, 'emp_status'] = curr_status
 
-                            export_cn.at[idx, '养老保险-个人'] = ss_rec.get('pension_pers', 0.0) if pd.notna(ss_rec.get('pension_pers')) else 0.0
+                        # 强行驱逐离职且无成本残余的人员
+                        if '离职' in curr_status and cost == 0.0:
+                            keep_mask.append(False)
+                        else:
+                            keep_mask.append(True)
 
-                            # [终极缝合区] 将底层的基本医疗 199 与大病 7 块钱在内存中强行相加合成 206
-                            m_pers = ss_rec.get('medical_pers', 0.0) if pd.notna(ss_rec.get('medical_pers')) else 0.0
-                            m_ser = ss_rec.get('medical_serious_pers', 0.0) if pd.notna(ss_rec.get('medical_serious_pers')) else 0.0
-                            export_cn.at[idx, '医疗保险-个人(含大病)'] = m_pers + m_ser
+                    base_df = base_df[keep_mask]
+                    base_df['cost_month'] = target_month
+                    base_emp_ids = set(base_df['emp_id'].tolist())
 
-                            export_cn.at[idx, '失业保险-个人'] = ss_rec.get('unemp_pers', 0.0) if pd.notna(ss_rec.get('unemp_pers')) else 0.0
-                            export_cn.at[idx, '住房公积金-个人'] = ss_rec.get('fund_pers', 0.0) if pd.notna(ss_rec.get('fund_pers')) else 0.0
-                            export_cn.at[idx, '企业年金-个人'] = ss_rec.get('annuity_pers', 0.0) if pd.notna(ss_rec.get('annuity_pers')) else 0.0
+                    # 追加基准月不存在的全新入职员工
+                    new_emps = active_emps[~active_emps['emp_id'].isin(base_emp_ids)]
+                    new_rows = []
+                    for _, r in new_emps.iterrows():
+                        new_row = {col: 0.0 if DB_TO_CN_MAP.get(col) in NUMERIC_COLS else None for col in base_df.columns}
+                        new_row['cost_month'] = target_month
+                        new_row['emp_id'] = r['emp_id']
+                        new_row['emp_name'] = r['name']
+                        new_row['dept_name'] = dept_dict.get(r['dept_id'], '未分配部门')
+                        new_row['emp_status'] = r['status']
+                        new_rows.append(new_row)
 
-                ordered_cols = [c for c in LEDGER_MAP.keys() if c in export_cn.columns]
-                export_cn = export_cn[ordered_cols]
-                export_cn = sort_flat_ledger_df(export_cn)
+                    if new_rows:
+                        base_df = pd.concat([base_df, pd.DataFrame(new_rows)], ignore_index=True)
 
-                ob_clean = io.BytesIO()
-                with pd.ExcelWriter(ob_clean, engine='openpyxl') as w:
-                    export_cn.to_excel(w, index=False, sheet_name=f"{target_month}融合明细")
-                    ws = w.sheets[f"{target_month}融合明细"]
-                    ws.freeze_panes = 'A2'
-                    for col_idx in range(1, ws.max_column + 1):
-                        ws.column_dimensions[get_column_letter(col_idx)].width = 15
+                    export_cn = base_df.rename(columns=DB_TO_CN_MAP)
 
-                st.success(f"✅ 底表生成成功！已成功从社保模块抓取 {target_month} 的数据，(基本医疗+大病)已完美合并注入底表。")
-                st.download_button(f"📥 下载 {target_month} 融合社保底表", data=ob_clean.getvalue(), file_name=f"台账初始化_{target_month}.xlsx", type="secondary")
-            else:
-                st.error("基准月没有数据，无法繁衍！")
+                    # 选填：清空变动的人工成本数字
+                    if clear_nums:
+                        for cn_col in NUMERIC_COLS:
+                            if cn_col in export_cn.columns: export_cn[cn_col] = 0.0
+
+                    # 智能吸入社保模块的数据
+                    if not ss_df.empty:
+                        ss_df['emp_id'] = ss_df['emp_id'].astype(str).str.replace(r'\.0$', '', regex=True).str.strip()
+                        ss_index_df = ss_df.set_index('emp_id')
+
+                        for idx, row in export_cn.iterrows():
+                            eid = str(row.get('工号', '')).replace('.0', '').strip()
+                            if eid in ss_index_df.index:
+                                ss_rec = ss_index_df.loc[eid]
+                                if isinstance(ss_rec, pd.DataFrame):
+                                    ss_rec = ss_rec.iloc[0]
+
+                                export_cn.at[idx, '养老保险-企业'] = ss_rec.get('pension_comp', 0.0) if pd.notna(ss_rec.get('pension_comp')) else 0.0
+                                export_cn.at[idx, '医疗保险-企业'] = ss_rec.get('medical_comp', 0.0) if pd.notna(ss_rec.get('medical_comp')) else 0.0
+                                export_cn.at[idx, '失业保险-企业'] = ss_rec.get('unemp_comp', 0.0) if pd.notna(ss_rec.get('unemp_comp')) else 0.0
+                                export_cn.at[idx, '工伤保险-企业'] = ss_rec.get('injury_comp', 0.0) if pd.notna(ss_rec.get('injury_comp')) else 0.0
+                                export_cn.at[idx, '生育保险-企业'] = ss_rec.get('maternity_comp', 0.0) if pd.notna(ss_rec.get('maternity_comp')) else 0.0
+                                export_cn.at[idx, '住房公积金-企业'] = ss_rec.get('fund_comp', 0.0) if pd.notna(ss_rec.get('fund_comp')) else 0.0
+                                export_cn.at[idx, '企业年金-企业'] = ss_rec.get('annuity_comp', 0.0) if pd.notna(ss_rec.get('annuity_comp')) else 0.0
+
+                                export_cn.at[idx, '养老保险-个人'] = ss_rec.get('pension_pers', 0.0) if pd.notna(ss_rec.get('pension_pers')) else 0.0
+
+                                # [核心缝合区] 基本医疗与大病统筹强制在内存中相加
+                                m_pers = ss_rec.get('medical_pers', 0.0) if pd.notna(ss_rec.get('medical_pers')) else 0.0
+                                m_ser = ss_rec.get('medical_serious_pers', 0.0) if pd.notna(ss_rec.get('medical_serious_pers')) else 0.0
+                                export_cn.at[idx, '医疗保险-个人(含大病)'] = m_pers + m_ser
+
+                                export_cn.at[idx, '失业保险-个人'] = ss_rec.get('unemp_pers', 0.0) if pd.notna(ss_rec.get('unemp_pers')) else 0.0
+                                export_cn.at[idx, '住房公积金-个人'] = ss_rec.get('fund_pers', 0.0) if pd.notna(ss_rec.get('fund_pers')) else 0.0
+                                export_cn.at[idx, '企业年金-个人'] = ss_rec.get('annuity_pers', 0.0) if pd.notna(ss_rec.get('annuity_pers')) else 0.0
+
+                    ordered_cols = [c for c in LEDGER_MAP.keys() if c in export_cn.columns]
+                    export_cn = export_cn[ordered_cols]
+                    export_cn = sort_flat_ledger_df(export_cn)
+
+                    ob_clean = io.BytesIO()
+                    with pd.ExcelWriter(ob_clean, engine='openpyxl') as w:
+                        export_cn.to_excel(w, index=False, sheet_name=f"{target_month}融合明细")
+                        ws = w.sheets[f"{target_month}融合明细"]
+                        ws.freeze_panes = 'A2'
+                        for col_idx in range(1, ws.max_column + 1):
+                            ws.column_dimensions[get_column_letter(col_idx)].width = 15
+
+                    st.success(f"✅ 底表生成成功！已成功从社保模块抓取 {target_month} 的数据，(基本医疗+大病)已完美合并注入底表。")
+                    st.download_button(f"📥 下载 {target_month} 融合社保底表", data=ob_clean.getvalue(), file_name=f"台账初始化_{target_month}.xlsx", type="secondary")
+                else:
+                    st.error("基准月没有数据，无法繁衍！")
+            except Exception as e:
+                # 捕获运行时可能出现的其他底层异常
+                st.error(f"生成底表崩溃: {e}")
+            finally:
+                # [核心排障归宿] 无论上方的所有查询、聚合、生成是否成功，绝对在最后关门拔锁！
+                if 'conn' in locals(): conn.close()
 
 # ------------------------------------------------------------------------------
 # Tab 3: 财务底表导入引擎
