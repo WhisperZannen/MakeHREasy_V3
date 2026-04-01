@@ -1,16 +1,19 @@
 # ==============================================================================
 # 文件路径: pages/2_人工成本台账.py
-# 功能描述: 人工成本台账管理中心 (UI 呈现层)
+# 功能描述: 人工成本台账管理中心 (财务合规与领导审阅终极版)
 # 核心修正说明:
-#   1. 彻底解耦，底层逻辑导入自 modules.core_labor_cost，保持页面纯净。
-#   2. Tab 2 导出模块修改为“选择起始至结束月份”的范围判定逻辑。
+#   1. 彻底解决社保模块与薪酬模块的“边界隔离”冲突。
+#   2. [核心缝合] 对公(社保)保持物理分离，对私(台账)保持物理合并。
+#   3. 从社保抓取数据时，自动执行 (基本医疗199 + 大病统筹7 = 206) 的智能加法，彻底吻合历史记录。
 # ==============================================================================
 
 import streamlit as st
 import pandas as pd
+import sqlite3
+import os
 import io
 
-# 导入 Excel 报表精装修模块
+# 用于 Excel 报表精装修
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
@@ -23,7 +26,6 @@ from modules.core_labor_cost import (
 
 st.set_page_config(page_title="人工成本台账", layout="wide")
 
-# 每次刷新页面静默执行时间戳解毒
 cleanse_db_timestamps()
 
 # ==============================================================================
@@ -40,7 +42,7 @@ def set_msg(msg, type='success'):
     st.rerun()
 
 # ==============================================================================
-# Excel 财务级排版渲染引擎 (3D 高亮视觉版)
+# Excel 财务级排版渲染引擎
 # ==============================================================================
 def format_excel_sheet(worksheet, df_columns):
     worksheet.freeze_panes = 'A2'
@@ -67,21 +69,18 @@ def format_excel_sheet(worksheet, df_columns):
             cell = worksheet[f"{col_letter}{row_idx}"]
             cell.border = thin_border
 
-            # 表头渲染
             if row_idx == 1:
                 worksheet.column_dimensions[col_letter].width = 8 if col_name == '序号' else (15 if col_name in NUMERIC_COLS else 12)
                 cell.font = Font(bold=True)
                 cell.fill = header_fill
                 cell.alignment = Alignment(horizontal='center', vertical='center')
             else:
-                # 动态数字列千分位格式化
                 if col_name in NUMERIC_COLS:
                     cell.number_format = '#,##0.00'
                     cell.alignment = Alignment(horizontal='right', vertical='center')
                 else:
                     cell.alignment = Alignment(horizontal='center', vertical='center')
 
-                # 汇总行底色高亮隔离
                 if is_total:
                     cell.fill = total_fill
                     cell.font = Font(bold=True, color="000000")
@@ -121,7 +120,6 @@ with tab1:
             raw_df = raw_df[raw_df['emp_name'].str.contains(q_search, na=False) | raw_df['emp_id'].str.contains(q_search, na=False)]
 
     if not raw_df.empty:
-        # 指标看板：严格剔除退休人员，还原企业真实的实际运营人工成本
         active_metric_df = raw_df[~( (raw_df['emp_status'] == '退休') | (raw_df['dept_name'].str.contains('离退休', na=False)) )]
 
         total_cost = active_metric_df['total_labor_cost'].sum()
@@ -145,16 +143,14 @@ with tab1:
         st.info("💡 当前筛选条件下暂无台账数据。")
 
 # ------------------------------------------------------------------------------
-# Tab 2: 领导审阅导出 (跨期范围框选引擎)
+# Tab 2: 领导审阅导出 (范围框选与智能汇集)
 # ------------------------------------------------------------------------------
 with tab2:
     st.subheader("📤 生成向领导汇报的标准台账")
-
     st.info("💡 操作提示：请选择导出的【起始】和【结束】月份，系统会自动提取该时间段内的所有明细，并可生成累计总账。")
 
     tc1, tc2 = st.columns(2)
     with tc1:
-        # [核心修改] 替换为单选框划定范围，不再让用户痛苦地多选打勾
         start_month = st.selectbox("📅 导出起始月份", options=available_months if available_months else ["无数据"], index=len(available_months)-1 if available_months else 0)
     with tc2:
         end_month = st.selectbox("📅 导出结束月份", options=available_months if available_months else ["无数据"], index=0 if available_months else 0)
@@ -165,9 +161,7 @@ with tab2:
         if start_month == "无数据" or end_month == "无数据":
             st.warning("⚠️ 暂无可导出的数据！")
         else:
-            # 智能对撞，防止操作失误将起止时间选反
             s_m, e_m = min(start_month, end_month), max(start_month, end_month)
-            # 根据划定区间，自动补全该范围内的所有月份列表
             selected_months = [m for m in available_months if s_m <= m <= e_m]
             selected_months.sort()
 
@@ -205,7 +199,6 @@ with tab2:
                             month_cn = month_cn[month_cols]
 
                             month_final = add_subtotals_and_totals(month_cn, NUMERIC_COLS)
-                            # 清洗工作表名称中的非法符号
                             safe_month = str(month).replace(':', '-').replace('/', '-').replace('\\', '-').replace('?', '').replace('*', '')
                             safe_sheet_name = f"{safe_month[:28]}明细"
 
@@ -220,10 +213,10 @@ with tab2:
     st.divider()
 
     # ==========================================================================
-    # 下月数据初始化引擎 (纯净底表繁衍 + 自动抓取当月社保固化数据)
+    # 下月数据初始化引擎 (纯净底表繁衍)
     # ==========================================================================
     st.subheader("🆕 生成新月份初始化底表 (融合社保版)")
-    st.info("💡 痛点解决：系统将提取【基准月】人员架构，追加新入职员工。同时，系统会自动去社保模块抓取【目标生成月】已固化的五险两金真实扣款数据，强行注入到底表中！")
+    st.info("💡 痛点解决：系统将提取【基准月】人员架构，追加新入职员工。系统去社保模块抓取【目标生成月】扣款数据时，会自动将(基本医疗+大病)完美合并，并填入本表的“医疗保险-个人(含大病)”中！")
 
     col_t1, col_t2, col_t3 = st.columns(3)
     with col_t1: base_month = st.selectbox("参照基准月 (提取其人员框架)", options=available_months)
@@ -262,7 +255,6 @@ with tab2:
                     if pd.isna(cost): cost = 0.0
 
                     curr_status = emp_status_dict.get(eid, row.get('emp_status', '在职'))
-                    # 强行驱逐离职且无残余成本的幽灵账目
                     if '离职' in curr_status and cost == 0.0:
                         keep_mask.append(False)
                     else:
@@ -292,7 +284,6 @@ with tab2:
                     for cn_col in NUMERIC_COLS:
                         if cn_col in export_cn.columns: export_cn[cn_col] = 0.0
 
-                # 执行底层社保金额贴合注入
                 if not ss_df.empty:
                     ss_df['emp_id'] = ss_df['emp_id'].astype(str).str.replace(r'\.0$', '', regex=True).str.strip()
                     ss_index_df = ss_df.set_index('emp_id')
@@ -312,11 +303,13 @@ with tab2:
                             export_cn.at[idx, '住房公积金-企业'] = ss_rec.get('fund_comp', 0.0) if pd.notna(ss_rec.get('fund_comp')) else 0.0
                             export_cn.at[idx, '企业年金-企业'] = ss_rec.get('annuity_comp', 0.0) if pd.notna(ss_rec.get('annuity_comp')) else 0.0
 
+                            export_cn.at[idx, '养老保险-个人'] = ss_rec.get('pension_pers', 0.0) if pd.notna(ss_rec.get('pension_pers')) else 0.0
+
+                            # [终极缝合区] 将底层的基本医疗 199 与大病 7 块钱在内存中强行相加合成 206
                             m_pers = ss_rec.get('medical_pers', 0.0) if pd.notna(ss_rec.get('medical_pers')) else 0.0
                             m_ser = ss_rec.get('medical_serious_pers', 0.0) if pd.notna(ss_rec.get('medical_serious_pers')) else 0.0
+                            export_cn.at[idx, '医疗保险-个人(含大病)'] = m_pers + m_ser
 
-                            export_cn.at[idx, '养老保险-个人'] = ss_rec.get('pension_pers', 0.0) if pd.notna(ss_rec.get('pension_pers')) else 0.0
-                            export_cn.at[idx, '医疗保险-个人'] = m_pers + m_ser
                             export_cn.at[idx, '失业保险-个人'] = ss_rec.get('unemp_pers', 0.0) if pd.notna(ss_rec.get('unemp_pers')) else 0.0
                             export_cn.at[idx, '住房公积金-个人'] = ss_rec.get('fund_pers', 0.0) if pd.notna(ss_rec.get('fund_pers')) else 0.0
                             export_cn.at[idx, '企业年金-个人'] = ss_rec.get('annuity_pers', 0.0) if pd.notna(ss_rec.get('annuity_pers')) else 0.0
@@ -331,9 +324,9 @@ with tab2:
                     ws = w.sheets[f"{target_month}融合明细"]
                     ws.freeze_panes = 'A2'
                     for col_idx in range(1, ws.max_column + 1):
-                        ws.column_dimensions[get_column_letter(col_idx)].width = 13
+                        ws.column_dimensions[get_column_letter(col_idx)].width = 15
 
-                st.success(f"✅ 底表生成成功！已成功从社保模块抓取 {target_month} 的真实社保扣款并注入。")
+                st.success(f"✅ 底表生成成功！已成功从社保模块抓取 {target_month} 的数据，(基本医疗+大病)已完美合并注入底表。")
                 st.download_button(f"📥 下载 {target_month} 融合社保底表", data=ob_clean.getvalue(), file_name=f"台账初始化_{target_month}.xlsx", type="secondary")
             else:
                 st.error("基准月没有数据，无法繁衍！")
@@ -369,18 +362,14 @@ with tab3:
                 for idx, row in in_df.iterrows():
                     e_name = str(row.get('姓名', '')).strip()
                     d_name = str(row.get('归属部门', '')).strip()
-                    # 防止导入包含汇总行的脏数据
                     if e_name in ['【小计】', '【实际成本总计】'] or d_name in ['【在职及统筹部分】']:
                         continue
 
                     raw_month = str(row.get('核算月份', '')).strip()
                     raw_id = row.get('工号', '')
-                    if pd.isna(raw_id):
-                        e_id = ""
-                    elif isinstance(raw_id, float):
-                        e_id = str(int(raw_id))
-                    else:
-                        e_id = str(raw_id).replace('.0', '').strip()
+                    if pd.isna(raw_id): e_id = ""
+                    elif isinstance(raw_id, float): e_id = str(int(raw_id))
+                    else: e_id = str(raw_id).replace('.0', '').strip()
 
                     if not raw_month or not e_id or raw_month == 'nan' or e_id == 'nan': continue
                     c_month = raw_month[:7].replace('/', '-') if len(raw_month) >= 7 else raw_month
@@ -401,10 +390,10 @@ with tab3:
                         else:
                             db_data[db_col] = str(val).strip() if pd.notna(val) else ""
 
-                    # 后端强制自动重新核算各项合计，防止前端 Excel 公式断裂导致入库错误
                     gross_cols = ['base_salary', 'seniority_pay', 'comp_subsidy', 'perf_float_subsidy', 'telecom_subsidy', 'other_base_pay', 'intern_subsidy', 'grad_allowance', 'eval_perf_pay', 'commission_pay', 'other_month_perf', 'special_award', 'year_end_bonus', 'other_special_award']
                     db_data['gross_salary_total'] = sum(db_data.get(col, 0.0) for col in gross_cols)
 
+                    # [核心缝合] 扣除项严格保持只有 medical_personal（因为UI层已经是 206 了）
                     deduct_cols = ['pension_personal', 'medical_personal', 'unemployment_personal', 'provident_fund_personal', 'annuity_personal', 'tax_personal_month', 'tax_personal_bonus']
                     db_data['net_salary'] = db_data['gross_salary_total'] - sum(db_data.get(col, 0.0) for col in deduct_cols)
 
