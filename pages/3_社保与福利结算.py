@@ -4,8 +4,9 @@
 # 核心改造:
 #   1. Tab 1: 完美分离 199 与 7。
 #   2. Tab 2: 彻底修复 Grouper 1D 崩溃。实装 5 大独立财务提取单引擎（总览与月度拆分）。
-#   3. Tab 2 第二部分：[核心重构] 将零散的 ZIP 下载彻底替换为“一键生成全量合并 Word”。
+#   3. Tab 2 第二部分：将零散的 ZIP 下载彻底替换为“一键生成全量合并 Word”。
 #   4. Tab 4: 历史补录支持时间感知倒推（智能寻轨引擎）。
+#   5. [终极封箱] 修复嵌套按钮导致的状态流失 Bug；补齐 Tab 3 参数配置的中文翻译。
 # ==============================================================================
 
 import streamlit as st
@@ -294,7 +295,8 @@ with tab2:
     with ic2:
         int_end_month = st.selectbox("📅 对内请款结束月", options=available_months if available_months else ["无数据"], key='int_end', index=0 if available_months else 0)
 
-    if st.button("🚀 极速生成并打包对内提款单 (ZIP)", type="primary") and int_start_month != "无数据":
+    # [修复点：防跳跃] 生成与下载分离
+    if st.button("🚀 1. 极速分析并打包对内提款单 (ZIP)", type="primary") and int_start_month != "无数据":
         s_m, e_m = min(int_start_month, int_end_month), max(int_start_month, int_end_month)
         selected_months = [m for m in available_months if s_m <= m <= e_m]
         selected_months.sort()
@@ -406,7 +408,19 @@ with tab2:
 
                     zf.writestr(f"6.异常款项专项审批_{s_m}至{e_m}.xlsx", excel_io.getvalue())
 
-            st.download_button(f"📥 点击下载对内提款单大包 (ZIP)", data=zip_buffer.getvalue(), file_name=f"对内审计提款单合集_{s_m}至{e_m}.zip", type="primary")
+            # 将 ZIP 存入缓存记忆
+            st.session_state['ss_zip_data'] = zip_buffer.getvalue()
+            st.session_state['ss_zip_filename'] = f"对内审计提款单合集_{s_m}至{e_m}.zip"
+            st.success("✅ 对内提款单已分析打包完毕，请点击下方按钮安全下载！")
+
+    # 外置的下载按钮，随便点都不会跳回 Tab1
+    if 'ss_zip_data' in st.session_state:
+        st.download_button(
+            label="📥 2. 点击下载对内提款单大包 (ZIP)",
+            data=st.session_state['ss_zip_data'],
+            file_name=st.session_state['ss_zip_filename'],
+            type="secondary"
+        )
 
     st.divider()
 
@@ -429,8 +443,8 @@ with tab2:
 
     selected_branches = st.multiselect("🏢 勾选需要生成结算函的地市分公司 (默认全选)", options=avail_branches, default=avail_branches)
 
-    # [核心体验升级] 输出单个全量 Word，完全摒弃 ZIP，所有公对公结算单排在一个文件里，点击一次全部打印
-    if st.button("🚀 一键生成【合并版】地市结算函 (全量 Word)", type="primary") and start_month != "无数据" and selected_branches:
+    # [修复点：防跳跃] 生成与下载分离
+    if st.button("🚀 1. 一键排版【合并版】地市结算函 (全量 Word)", type="primary") and start_month != "无数据" and selected_branches:
         sys_settings = load_settings()
         conn = _get_db_connection()
         placeholders = ",".join(["?"] * len(selected_branches))
@@ -546,11 +560,9 @@ with tab2:
                     df_cc_route['当行合计'] = row_totals
                     total_sum = sum(row_totals)
 
-                    # [打印分页逻辑] 非首张结算单，强制插入硬分页符，保证每家公司单占一页
                     if not first_letter: merged_doc.add_page_break()
                     first_letter = False
 
-                    # [全量渲染引擎] 将画表代码全部无缝内嵌
                     p_title = merged_doc.add_paragraph()
                     p_title.alignment = WD_ALIGN_PARAGRAPH.CENTER
                     r_title = p_title.add_run("关于社保代缴的结算说明函")
@@ -663,15 +675,21 @@ with tab2:
                         for run in p.runs:
                             run.font.name = '宋体'; run._element.rPr.rFonts.set(qn('w:eastAsia'), '宋体'); run.font.size = Pt(12)
 
-            # [终极安全输出] 生成并抛出唯一的 Word 合集大包
+            # 将 Word 文件流锁死在本地缓存中
             doc_io = io.BytesIO()
             merged_doc.save(doc_io)
-            st.download_button(
-                f"📥 点击下载【合并打印版】结算函 ({s_m}至{e_m})",
-                data=doc_io.getvalue(),
-                file_name=f"全量地市结算函_合并打印版_{s_m}至{e_m}.docx",
-                type="primary"
-            )
+            st.session_state['ss_word_data'] = doc_io.getvalue()
+            st.session_state['ss_word_filename'] = f"全量地市结算函_合并打印版_{s_m}至{e_m}.docx"
+            st.success("✅ 公对公结算函排版完毕，请点击下方按钮安全下载！")
+
+    # 独立暴露的外层下载按钮
+    if 'ss_word_data' in st.session_state:
+        st.download_button(
+            label=f"📥 2. 点击下载【合并打印版】结算函",
+            data=st.session_state['ss_word_data'],
+            file_name=st.session_state['ss_word_filename'],
+            type="secondary"
+        )
 
 # ------------------------------------------------------------------------------
 # Tab 3: 全局规则与参数配置
@@ -710,13 +728,28 @@ with tab3:
         st.write(f"**【{target_year} 年度】算法控制总开关**")
         c_mode, c_fund, c_med = st.columns(3)
         with c_mode:
+            # [核心修复3] 补充中文翻译映射字典，彻底告别底层代码暴露
             r_keys = ['exact', 'round_to_yuan', 'round_to_ten', 'floor_to_ten']
+            r_map = {
+                'exact': '精确到分 (不取整)',
+                'round_to_yuan': '四舍五入到元',
+                'round_to_ten': '四舍五入到十元',
+                'floor_to_ten': '向下取整到十元 (见角进元等)'
+            }
             cur_round = curr.get('rounding_mode', 'round_to_yuan')
-            sel_round = st.selectbox("社保取整规则", options=r_keys, index=r_keys.index(cur_round) if cur_round in r_keys else 1)
+            # 引入 format_func 让界面显示中文，底层仍传英文
+            sel_round = st.selectbox("社保取整规则", options=r_keys, format_func=lambda x: r_map[x], index=r_keys.index(cur_round) if cur_round in r_keys else 1)
+
         with c_fund:
+            # [核心修复4] 公积金算法的中文翻译字典
             f_keys = ['independent', 'reverse_from_ss']
+            f_map = {
+                'independent': '独立计算 (基数×比例)',
+                'reverse_from_ss': '反推法 (企个相加逢元进十等)'
+            }
             cur_fund = curr.get('fund_calc_method', 'reverse_from_ss')
-            sel_fund = st.selectbox("公积金特殊算法", options=f_keys, index=f_keys.index(cur_fund) if cur_fund in f_keys else 1)
+            sel_fund = st.selectbox("公积金特殊算法", options=f_keys, format_func=lambda x: f_map[x], index=f_keys.index(cur_fund) if cur_fund in f_keys else 1)
+
         with c_med:
             med_serious = st.number_input("大病医疗个人固定扣款", value=safe_float(curr.get('medical_serious_fix', 7.0)), step=1.0)
 
@@ -775,7 +808,6 @@ with tab4:
     with hc1:
         target_hist_month = st.text_input("📅 1. 设定你要补录的目标月份 (如: 2026-02)", value="2026-02")
 
-        # [核心逻辑重构：智能寻轨] 计算绝对时间差，寻找“最近”的月份作为底稿母本
         ref_month = None
         if archived_months:
             try:
@@ -787,7 +819,8 @@ with tab4:
             except Exception:
                 ref_month = archived_months[0]
 
-        if st.button("🚀 2. 生成带姓名与金额的【智能预填底稿】", type="primary"):
+        # [修复点：防跳跃] 历史底稿的生成与下载分离
+        if st.button("🚀 2. 提取历史框架 (生成预填底稿)", type="primary"):
             conn = _get_db_connection()
             if ref_month:
                 st.info(f"💡 探针已激活：系统侦测到最近的关联账单为 {ref_month}，正在为您完美克隆该月数据作为底稿...")
@@ -858,7 +891,18 @@ with tab4:
                 hist_template.to_excel(writer, index=False)
                 writer.sheets['Sheet1'].set_column('A:X', 18)
 
-            st.download_button("📥 3. 下载已预填好的历史账单底稿", data=hist_buffer.getvalue(), file_name=f"{target_hist_month}_历史社保智能补录底稿.xlsx", type="secondary")
+            st.session_state['ss_hist_data'] = hist_buffer.getvalue()
+            st.session_state['ss_hist_filename'] = f"{target_hist_month}_历史社保智能补录底稿.xlsx"
+            st.success("✅ 底稿结构已提取完毕，请点击下方按钮安全下载！")
+
+        # 悬挂在外部的隔离下载按钮
+        if 'ss_hist_data' in st.session_state:
+            st.download_button(
+                label="📥 3. 点击下载已预填好的历史账单底稿",
+                data=st.session_state['ss_hist_data'],
+                file_name=st.session_state['ss_hist_filename'],
+                type="secondary"
+            )
 
     with hc2:
         hist_file = st.file_uploader("📤 4. 上传核对完毕的历史账单明细", type=["xlsx", "csv"])

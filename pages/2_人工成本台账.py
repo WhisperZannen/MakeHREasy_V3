@@ -2,9 +2,8 @@
 # 文件路径: pages/2_人工成本台账.py
 # 功能描述: 人工成本台账管理中心 (财务合规与领导审阅终极版)
 # 核心修正说明:
-#   1. 彻底解决社保模块与薪酬模块的“边界隔离”冲突。
-#   2. [核心缝合] 对公(社保)保持物理分离，对私(台账)保持物理合并。
-#   3. 从社保抓取数据时，自动执行 (基本医疗199 + 大病统筹7 = 206) 的智能加法，彻底吻合历史记录。
+#   1. [业务逻辑] 修复多月汇总表漏洞，跨部门人员将按不同部门独立成行，绝不合并混淆。
+#   2. [前端交互] 修复 Tab 跳跃 Bug，将数据存入 Session State，解除按钮嵌套导致的状态流失。
 # ==============================================================================
 
 import streamlit as st
@@ -157,7 +156,10 @@ with tab2:
 
     need_summary = st.checkbox("📊 同时生成【选中范围的累计汇总】Sheet (勾选后，系统会自动把这几个月加起来算个总账)", value=True)
 
-    if st.button("🚀 一键生成并下载 Excel 报表", type="primary"):
+    # ==========================================================================
+    # [核心修复区] 拆分生成与下载，打破按钮嵌套魔咒
+    # ==========================================================================
+    if st.button("🚀 1. 分析数据并生成 Excel 报表", type="primary"):
         if start_month == "无数据" or end_month == "无数据":
             st.warning("⚠️ 暂无可导出的数据！")
         else:
@@ -169,7 +171,24 @@ with tab2:
             placeholders = ",".join(["?"] * len(selected_months))
             query = f"SELECT * FROM labor_cost_ledger WHERE cost_month IN ({placeholders}) ORDER BY dept_name ASC"
             raw_export_df = pd.read_sql_query(query, conn, params=selected_months)
+
+            # [新增] 抓取全员最新实时状态与部门，建立“护目镜”字典
+            realtime_emps = pd.read_sql_query("SELECT e.emp_id, e.status, d.dept_name FROM employees e LEFT JOIN departments d ON e.dept_id = d.dept_id", conn)
             conn.close()
+            real_dict = realtime_emps.set_index('emp_id').to_dict('index')
+
+            # [新增] 状态动态翻译函数 (只改显示字眼，不碰底层数字)
+            def enhance_status(row):
+                eid = str(row.get('工号', ''))
+                row_dept = str(row.get('归属部门', ''))
+                if eid in real_dict:
+                    r_status = str(real_dict[eid]['status'])
+                    r_dept = str(real_dict[eid]['dept_name'])
+                    if '离职' in r_status:
+                        return '已离职'
+                    elif r_status == '在职' and row_dept != r_dept:
+                        return '已调离本部门'
+                return row.get('人员状态', '')
 
             if not raw_export_df.empty:
                 ob = io.BytesIO()
@@ -178,13 +197,17 @@ with tab2:
                     if need_summary:
                         db_num_cols = [LEDGER_MAP[c] for c in NUMERIC_COLS if c in LEDGER_MAP]
                         agg_dict = {col: 'sum' for col in db_num_cols}
-                        agg_dict.update({'emp_name': 'first', 'dept_name': 'first', 'emp_status': 'last'})
 
-                        summary_df = raw_export_df.groupby('emp_id').agg(agg_dict).reset_index()
+                        # [财务口径修复] 拿掉 'dept_name': 'first'，强制按人员和部门双重维度分组
+                        agg_dict.update({'emp_name': 'first', 'emp_status': 'last'})
+
+                        # 跨期异动人员（如吴婷），会在此处被物理劈成两行，成本精确归属到对应的部门
+                        summary_df = raw_export_df.groupby(['emp_id', 'dept_name']).agg(agg_dict).reset_index()
+
                         summary_cn = summary_df.rename(columns=DB_TO_CN_MAP)
                         report_cols = [c for c in LEDGER_MAP.keys() if c in summary_cn.columns and c != '核算月份']
                         summary_cn = summary_cn[report_cols]
-
+                        summary_cn['人员状态'] = summary_cn.apply(enhance_status, axis=1)
                         summary_final = add_subtotals_and_totals(summary_cn, NUMERIC_COLS)
 
                         sum_sheet_name = f"{len(selected_months)}个月累计汇总"
@@ -197,7 +220,7 @@ with tab2:
                             month_cn = month_df.rename(columns=DB_TO_CN_MAP)
                             month_cols = [c for c in LEDGER_MAP.keys() if c in month_cn.columns]
                             month_cn = month_cn[month_cols]
-
+                            month_cn['人员状态'] = month_cn.apply(enhance_status, axis=1)
                             month_final = add_subtotals_and_totals(month_cn, NUMERIC_COLS)
                             safe_month = str(month).replace(':', '-').replace('/', '-').replace('\\', '-').replace('?', '').replace('*', '')
                             safe_sheet_name = f"{safe_month[:28]}明细"
@@ -205,10 +228,21 @@ with tab2:
                             month_final.to_excel(writer, index=False, sheet_name=safe_sheet_name)
                             format_excel_sheet(writer.sheets[safe_sheet_name], month_final.columns)
 
-                file_name = f"人工成本台账汇报_{len(selected_months)}个月数据.xlsx"
-                st.download_button("📥 点击下载财务报表", data=ob.getvalue(), file_name=file_name, type="secondary")
+                # 将生成好的成品塞进缓存记忆，防止页面一刷新就人间蒸发
+                st.session_state['ledger_export_data'] = ob.getvalue()
+                st.session_state['ledger_export_filename'] = f"人工成本台账汇报_{len(selected_months)}个月数据.xlsx"
+                st.success("✅ 报表已生成完毕，请点击下方按钮下载！")
             else:
                 st.warning("所选范围内无数据。")
+
+    # 独立暴露在外的下载按钮，随时点击都不会触发 Tab 弹飞
+    if 'ledger_export_data' in st.session_state:
+        st.download_button(
+            label="📥 2. 点击下载财务报表",
+            data=st.session_state['ledger_export_data'],
+            file_name=st.session_state['ledger_export_filename'],
+            type="secondary"
+        )
 
     st.divider()
 
@@ -227,19 +261,15 @@ with tab2:
         if not target_month:
             st.warning("请填写目标月份！")
         else:
-            conn = _get_db_connection() # 开启数据库物理连接
-            try: # 开启安全保护域，无论中间是否报错，最后必须走 finally 关闭连接
-                # 1. 抓取基准月台账底表
+            conn = _get_db_connection()
+            try:
                 base_df = pd.read_sql_query("SELECT * FROM labor_cost_ledger WHERE cost_month = ?", conn, params=[base_month])
-                # 2. 抓取当前全量在职人员名单
                 all_emps = pd.read_sql_query("SELECT emp_id, name, dept_id, status FROM employees", conn)
                 active_emps = all_emps[all_emps['status'] == '在职']
 
-                # 3. 抓取部门字典用于汉化
                 dept_df = pd.read_sql_query("SELECT dept_id, dept_name FROM departments", conn)
                 dept_dict = dict(zip(dept_df['dept_id'], dept_df['dept_name']))
 
-                # 4. 抓取目标月份的固化社保数据
                 ss_query = """
                     SELECT 
                         emp_id, 
@@ -250,18 +280,11 @@ with tab2:
                 """
                 ss_df = pd.read_sql_query(ss_query, conn, params=[target_month])
 
-                # [核心排障：已抹除此处的 conn.close()，防止后续查询断联]
-
                 if not base_df.empty:
-                    # 建立当前最新的人事状态映射
                     emp_status_dict = dict(zip(all_emps['emp_id'], all_emps['status']))
 
-                    # =================================================================
-                    # [核心重构：15号生死线回溯引擎]
-                    # =================================================================
                     target_deadline = f"{target_month}-15 23:59:59"
 
-                    # 5. 抓取15号之后发生的调动记录（此时 conn 依然存活，完美执行！）
                     rollback_query = """
                         SELECT emp_id, old_dept_id, new_dept_id, change_date
                         FROM personnel_changes
@@ -272,12 +295,10 @@ with tab2:
 
                     effective_dept_dict = dict(zip(all_emps['emp_id'], all_emps['dept_id']))
 
-                    # 时光倒流：将15号以后调动的人拽回老部门
                     for _, rb_row in rollback_df.iterrows():
                         eid_rb = rb_row['emp_id']
                         if eid_rb in effective_dept_dict:
                             effective_dept_dict[eid_rb] = rb_row['old_dept_id']
-                    # =================================================================
 
                     keep_mask = []
                     for idx, row in base_df.iterrows():
@@ -287,14 +308,12 @@ with tab2:
 
                         curr_status = emp_status_dict.get(eid, row.get('emp_status', '在职'))
 
-                        # 注入经过15号分水岭判定后的合法部门
                         if eid in effective_dept_dict:
                             valid_dept_id = effective_dept_dict[eid]
                             base_df.at[idx, 'dept_name'] = dept_dict.get(valid_dept_id, '未分配部门')
 
                         base_df.at[idx, 'emp_status'] = curr_status
 
-                        # 强行驱逐离职且无成本残余的人员
                         if '离职' in curr_status and cost == 0.0:
                             keep_mask.append(False)
                         else:
@@ -304,7 +323,6 @@ with tab2:
                     base_df['cost_month'] = target_month
                     base_emp_ids = set(base_df['emp_id'].tolist())
 
-                    # 追加基准月不存在的全新入职员工
                     new_emps = active_emps[~active_emps['emp_id'].isin(base_emp_ids)]
                     new_rows = []
                     for _, r in new_emps.iterrows():
@@ -321,12 +339,10 @@ with tab2:
 
                     export_cn = base_df.rename(columns=DB_TO_CN_MAP)
 
-                    # 选填：清空变动的人工成本数字
                     if clear_nums:
                         for cn_col in NUMERIC_COLS:
                             if cn_col in export_cn.columns: export_cn[cn_col] = 0.0
 
-                    # 智能吸入社保模块的数据
                     if not ss_df.empty:
                         ss_df['emp_id'] = ss_df['emp_id'].astype(str).str.replace(r'\.0$', '', regex=True).str.strip()
                         ss_index_df = ss_df.set_index('emp_id')
@@ -348,7 +364,6 @@ with tab2:
 
                                 export_cn.at[idx, '养老保险-个人'] = ss_rec.get('pension_pers', 0.0) if pd.notna(ss_rec.get('pension_pers')) else 0.0
 
-                                # [核心缝合区] 基本医疗与大病统筹强制在内存中相加
                                 m_pers = ss_rec.get('medical_pers', 0.0) if pd.notna(ss_rec.get('medical_pers')) else 0.0
                                 m_ser = ss_rec.get('medical_serious_pers', 0.0) if pd.notna(ss_rec.get('medical_serious_pers')) else 0.0
                                 export_cn.at[idx, '医疗保险-个人(含大病)'] = m_pers + m_ser
@@ -369,16 +384,24 @@ with tab2:
                         for col_idx in range(1, ws.max_column + 1):
                             ws.column_dimensions[get_column_letter(col_idx)].width = 15
 
-                    st.success(f"✅ 底表生成成功！已成功从社保模块抓取 {target_month} 的数据，(基本医疗+大病)已完美合并注入底表。")
-                    st.download_button(f"📥 下载 {target_month} 融合社保底表", data=ob_clean.getvalue(), file_name=f"台账初始化_{target_month}.xlsx", type="secondary")
+                    # 将繁衍好的底表也放入 Session State 防止状态丢失
+                    st.session_state['ledger_init_data'] = ob_clean.getvalue()
+                    st.session_state['ledger_init_filename'] = f"台账初始化_{target_month}.xlsx"
+                    st.success(f"✅ 底表生成成功！已成功从社保模块抓取 {target_month} 的数据，请点击下方按钮下载。")
                 else:
                     st.error("基准月没有数据，无法繁衍！")
             except Exception as e:
-                # 捕获运行时可能出现的其他底层异常
                 st.error(f"生成底表崩溃: {e}")
             finally:
-                # [核心排障归宿] 无论上方的所有查询、聚合、生成是否成功，绝对在最后关门拔锁！
                 if 'conn' in locals(): conn.close()
+
+    if 'ledger_init_data' in st.session_state:
+        st.download_button(
+            label=f"📥 3. 下载融合社保底表",
+            data=st.session_state['ledger_init_data'],
+            file_name=st.session_state['ledger_init_filename'],
+            type="secondary"
+        )
 
 # ------------------------------------------------------------------------------
 # Tab 3: 财务底表导入引擎
@@ -442,7 +465,6 @@ with tab3:
                     gross_cols = ['base_salary', 'seniority_pay', 'comp_subsidy', 'perf_float_subsidy', 'telecom_subsidy', 'other_base_pay', 'intern_subsidy', 'grad_allowance', 'eval_perf_pay', 'commission_pay', 'other_month_perf', 'special_award', 'year_end_bonus', 'other_special_award']
                     db_data['gross_salary_total'] = sum(db_data.get(col, 0.0) for col in gross_cols)
 
-                    # [核心缝合] 扣除项严格保持只有 medical_personal（因为UI层已经是 206 了）
                     deduct_cols = ['pension_personal', 'medical_personal', 'unemployment_personal', 'provident_fund_personal', 'annuity_personal', 'tax_personal_month', 'tax_personal_bonus']
                     db_data['net_salary'] = db_data['gross_salary_total'] - sum(db_data.get(col, 0.0) for col in deduct_cols)
 
