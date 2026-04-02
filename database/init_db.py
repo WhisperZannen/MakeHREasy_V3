@@ -384,6 +384,89 @@ def init_database():
         )
         ''')
 
+        # ==========================================================================
+        # [新增] 薪酬模块底层数据表结构
+        # ==========================================================================
+
+        # 1. 薪酬月度主流水表 (核心收网账本)
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS payroll_monthly_records (
+                record_id TEXT PRIMARY KEY,                 -- 记录唯一标识 (格式: 核算月_工号)
+                cost_month TEXT NOT NULL,                   -- 核算月份 (YYYY-MM)
+                emp_id TEXT NOT NULL,                       -- 员工工号
+                dept_name TEXT,                             -- 固化部门快照 (经过15号生死线判定后的最终归属)
+                
+                -- [第一部分：静态基座]
+                base_salary REAL DEFAULT 0.0,               -- 岗位工资 (映射基础档案)
+                seniority_pay REAL DEFAULT 0.0,             -- 工龄工资
+                comp_subsidy REAL DEFAULT 0.0,              -- 综合补贴
+                telecom_subsidy REAL DEFAULT 0.0,           -- 通讯补贴
+                position_adj REAL DEFAULT 0.0,              -- 岗位补/扣 (包含行一/行二非领导人员的固定差额等)
+                expert_allowance REAL DEFAULT 0.0,          -- 专家津贴/高校毕业生津贴 (从生命周期规则抓取)
+                
+                -- [第二部分：绩效算力层]
+                perf_base REAL DEFAULT 0.0,                 -- 绩效基准盘 (原绩效 + 激励包基数)
+                perf_kpi_score REAL DEFAULT 100.0,          -- 当月 KPI 评分 (默认100，HR导入)
+                perf_pack_coef REAL DEFAULT 1.0,            -- 激励包系数 (默认1.0)
+                perf_leader_coef REAL DEFAULT 1.0,          -- 负责人激励系数 (默认1.0，防拍脑袋补丁)
+                perf_excel_coef REAL DEFAULT 1.0,           -- 优才政策倍数 (默认1.0)
+                perf_salary_calc REAL DEFAULT 0.0,          -- 最终算出的理论绩效工资
+                perf_adj REAL DEFAULT 0.0,                  -- 绩效补发/扣发 (跨期流程滞后产生的手工补扣)
+                
+                -- [第三部分：混沌挂载层 (反脆弱核心)]
+                dynamic_additions TEXT DEFAULT '{}',        -- 动态加项背包 (JSON格式，无限收纳临时名目)
+                dynamic_deductions TEXT DEFAULT '{}',       -- 动态减项背包 (JSON格式，无限收纳临时扣款)
+                special_bonus_total REAL DEFAULT 0.0,       -- 专项奖金合计 (从专项奖池自动打包倒吸)
+                
+                -- [第四部分：汇总与扣除层]
+                gross_salary_total REAL DEFAULT 0.0,        -- 当月应发工资合计 (一二三部分的大一统总和)
+                
+                ss_pension_pers REAL DEFAULT 0.0,           -- 养老个人代扣 (从社保模块倒吸)
+                ss_medical_mix REAL DEFAULT 0.0,            -- 医保合并代扣 (核心对私合并：基本医疗199 + 大病7)
+                ss_unemp_pers REAL DEFAULT 0.0,             -- 失业个人代扣
+                ss_fund_pers REAL DEFAULT 0.0,              -- 公积金个人代扣
+                ss_annuity_pers REAL DEFAULT 0.0,           -- 企业年金个人代扣
+                
+                tax_deduction REAL DEFAULT 0.0,             -- 当期个税扣款 (财务线下算完后导回)
+                net_salary REAL DEFAULT 0.0,                -- 最终实发工资 (应发 - 社保合并 - 个税)
+                
+                -- [状态与审计锚点]
+                audit_status TEXT DEFAULT '草稿',            -- 单据状态 (草稿 / 待算税 / 已封账)
+                oa_clearing_no TEXT,                        -- 电信OA清册号 (与OA系统握手的唯一凭证)
+                update_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP, -- 最后更新时间
+                FOREIGN KEY (emp_id) REFERENCES employees(emp_id)
+            )
+        ''')
+
+        # 2. 专项奖金明细池 (解决临时项目提成和独立奖金的挂载)
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS payroll_special_bonus (
+                bonus_id TEXT PRIMARY KEY,                  -- 奖金记录唯一ID
+                cost_month TEXT NOT NULL,                   -- 计划发放的核算月份
+                emp_id TEXT NOT NULL,                       -- 员工工号
+                project_name TEXT NOT NULL,                 -- 奖金名目/项目名称 (如: 一季度开门红)
+                amount REAL DEFAULT 0.0,                    -- 发放金额
+                import_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP, -- 导入时间
+                FOREIGN KEY (emp_id) REFERENCES employees(emp_id)
+            )
+        ''')
+
+        # 3. 动态发条规则表 (解决大学生3年衰减与专家的长效津贴发放)
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS payroll_allowance_rules (
+                rule_id INTEGER PRIMARY KEY AUTOINCREMENT,  -- 规则自增ID
+                emp_id TEXT NOT NULL,                       -- 员工工号
+                allowance_type TEXT NOT NULL,               -- 津贴类别 (如: 大学生补贴, 专家津贴)
+                monthly_amount REAL NOT NULL,               -- 每月固定发放金额 (如算出的专家配平金 860)
+                start_month TEXT NOT NULL,                  -- 规则起算月份 (YYYY-MM)
+                end_month TEXT,                             -- 规则失效月份 (可为空，代表永久有效)
+                is_active INTEGER DEFAULT 1,                -- 是否强制挂起/停用 (1生效, 0停用)
+                remarks TEXT,                               -- 备注说明
+                FOREIGN KEY (emp_id) REFERENCES employees(emp_id)
+            )
+        ''')
+
+
         conn.commit()
         print(f"✅ V3.5 差异快照底座与全量社保引擎初始化成功！")
     except sqlite3.Error as e:
