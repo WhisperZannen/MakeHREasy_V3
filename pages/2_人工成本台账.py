@@ -409,7 +409,7 @@ with tab3:
                             db_data[db_col] = str(val).strip() if pd.notna(val) else ""
 
                     # -------------------------------------------------------------
-                    # [修复点 1：拦截孤立统筹资金，防止计算覆盖]
+                    # [修复点 1：拦截孤立统筹资金，防止实发被覆盖，并严格捍卫总成本铁律]
                     # -------------------------------------------------------------
                     gross_cols = ['base_salary', 'seniority_pay', 'comp_subsidy', 'perf_float_subsidy', 'telecom_subsidy', 'other_base_pay', 'intern_subsidy', 'grad_allowance', 'eval_perf_pay', 'commission_pay', 'other_month_perf', 'special_award', 'year_end_bonus', 'other_special_award']
                     calc_gross = sum(db_data.get(col, 0.0) for col in gross_cols)
@@ -423,10 +423,10 @@ with tab3:
                     # 判断是否为“股票增值权/孤立公共池”发钱（只有实发有金额，所有应发项均为0）
                     if calc_gross == 0.0 and db_data.get('net_salary', 0.0) != 0.0:
                         db_data['gross_salary_total'] = 0.0
-                        # 保持 db_data['net_salary'] 不变，尊重你填的 Excel 数值！
+                        # 保持 db_data['net_salary'] 不变，绝对尊重你填的 Excel 实发数值！
                         db_data['other_cost_total'] = calc_other
-                        # 虽然这笔钱没有应发总额，但公司真金白银发出去了，人工总成本必须加上这笔实发金额
-                        db_data['total_labor_cost'] = db_data['net_salary'] + calc_other
+                        # 【绝对铁律】人工成本合计永远等于：应发合计 + 其他成本。绝不乱加实发！
+                        db_data['total_labor_cost'] = db_data['gross_salary_total'] + db_data['other_cost_total']
                     else:
                         db_data['gross_salary_total'] = calc_gross
                         db_data['net_salary'] = calc_net
