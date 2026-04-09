@@ -1,11 +1,10 @@
 # ==============================================================================
-# 文件路径: pages/1_人员与组织.py
-# 功能描述: 人员与组织架构管理中枢 (V3.19 挂靠人员兼容与工号解耦版)
+# 文件路径: pages/1_personnel.py
+# 功能描述: 人员与组织架构管理中枢 (V3.20 终极防爆与高岗级排序修复版)
 # 实现了什么具体逻辑:
-#   1. [核心防御] 彻底修复 Pandas Series 布尔判定歧义导致的 ValueError。
-#   2. [核心防御] 引入动态列名推导，根除 KeyError: ['部门'] not in index 崩溃。
-#   3. [全量复原] 满血召回“历史变动流水”的侧边栏高级多维筛选与时段 Excel 导出。
-#   4. [状态对齐] 全面接入“挂靠人员”状态，支持以社保编号作为虚拟工号录入。
+#   1. [核心防御] 修复 Pandas `NaT` 判定歧义导致的 ValueError 页面崩溃。
+#   2. [核心修复] 修正岗级倒挂：取负数强制高岗级领导排前，彻底修复领导排序失效。
+#   3. [状态对齐] 全面接入“挂靠人员”状态，支持以社保编号作为虚拟工号录入。
 # ==============================================================================
 
 import streamlit as st
@@ -99,8 +98,9 @@ def build_dept_tree(df, parent_id=None, level=0):
 # ==============================================================================
 # 侧边栏导航
 # ==============================================================================
-st.sidebar.title("🎛️ 系统架构中枢")
-current_page = st.sidebar.radio("请选择操作模块:", ["🏢 部门管理", "🎯 岗位字典", "👥 人员档案", "🕰️ 历史变动流水"])
+st.sidebar.title("🎛️ 组织人事中枢")
+# 严格按照你的要求调整了次序：人员 -> 流水 -> 部门 -> 岗位
+current_page = st.sidebar.radio("请选择操作模块:", ["👥 人员档案", "🕰️ 历史变动流水", "🏢 部门管理", "🎯 岗位字典"])
 st.title(current_page)
 
 # ==============================================================================
@@ -272,7 +272,8 @@ elif current_page == "👥 人员档案":
                 for _, intern in interns_df.iterrows():
                     start_p = intern['intern_start_date'] if pd.notna(intern['intern_start_date']) else intern['join_company_date']
                     start_d = pd.to_datetime(start_p)
-                    if start_d:
+                    # [核心防爆修复] 强制使用 pd.notna() 判断，防止出现 The truth value of a NaT is ambiguous 的致命崩溃！
+                    if pd.notna(start_d):
                         months = 3 if str(intern.get('education_level')) == '硕士' else 6
                         expected = start_d + relativedelta(months=months)
                         days_left = (expected.date() - date.today()).days
@@ -293,7 +294,7 @@ elif current_page == "👥 人员档案":
     if q_status: f_df = f_df[f_df['status'].isin(q_status)]
 
     # ==========================================================================
-    # [核心修复 1] 注入与财务台账同等级别的绝对排序基因
+    # [核心修复] 岗级倒挂 Bug 终结者！
     # ==========================================================================
     if not f_df.empty:
         # 提取部门与岗位权重
@@ -307,18 +308,21 @@ elif current_page == "👥 人员档案":
 
             # 1. 部门大权重
             if status == '退休' or '离退休' in d_name: d_weight = 9999
-            elif status == '挂靠人员': d_weight = 9000  # [新增] 挂靠人员排在在职之后，离退休之前
+            elif status == '挂靠人员': d_weight = 9000
             elif status == '公共账目' or '统筹' in d_name or '公共' in d_name: d_weight = 9998
             else: d_weight = dept_weight_map.get(d_name, 999)
 
-            # 2. 岗位大权重 (图里总经理1，副总2)
+            # 2. 岗位大权重
             p_weight = pos_weight_map.get(p_name, 999)
 
-            # 3. 个人锚点小权重 (带小数点的 21.2)
+            # 3. 个人锚点小权重
             try: r_weight = float(row.get('post_rank', 9999.0)) if pd.notna(row.get('post_rank')) else 9999.0
             except: r_weight = 9999.0
 
-            return (d_weight, p_weight, r_weight, str(row.get('emp_id', '')))
+            # [终极修复] 解决岗级倒挂：取负数让大岗级(如23)变成-23，在升序下排在-11前面。无岗级9999依然垫底！
+            final_r_weight = -r_weight if r_weight != 9999.0 else 9999.0
+
+            return (d_weight, p_weight, final_r_weight, str(row.get('emp_id', '')))
 
         # 执行强力排序
         f_df['__sort_tuple__'] = f_df.apply(get_emp_sort_keys, axis=1)
@@ -327,7 +331,7 @@ elif current_page == "👥 人员档案":
         f_df = f_df.drop(columns=['__sort_tuple__', '__dw__', '__pw__', '__rw__', '__id__'])
 
     # ==========================================================================
-    # [核心修复 2] 满血版全量美化导出引擎
+    # 满血版全量美化导出引擎
     # ==========================================================================
     with c4:
         st.write("")
@@ -342,7 +346,6 @@ elif current_page == "👥 人员档案":
                 header_fill = PatternFill(start_color="D9D9D9", end_color="D9D9D9", fill_type="solid")
                 for col_idx, col_name in enumerate(df_columns, 1):
                     col_letter = get_column_letter(col_idx)
-                    # 身份证、学校名字长一点，其它适中
                     worksheet.column_dimensions[col_letter].width = 20 if col_name in ['身份证号', '毕业院校', '专业'] else 13
                     for row_idx in range(1, worksheet.max_row + 1):
                         cell = worksheet[f"{col_letter}{row_idx}"]
@@ -367,11 +370,9 @@ elif current_page == "👥 人员档案":
                 'major': '专业', 'graduation_date': '毕业日期', 'first_job_date': '参加工作日期'
             })
 
-            # 整理老板想看的专业顺序
             eo = ['工号/编号', '姓名', '部门', '岗位', '岗级', '档次', 'T级', '状态', '入职日期', '参加工作日期', '身份证号', '学历', '学位', '毕业院校', '专业', '毕业日期']
             out_df = out_df[[c for c in eo if c in out_df.columns]]
 
-            # 执行导出与渲染
             ob = io.BytesIO()
             with pd.ExcelWriter(ob, engine='openpyxl') as w:
                 out_df.to_excel(w, index=False, sheet_name='员工花名册')
@@ -383,7 +384,6 @@ elif current_page == "👥 人员档案":
 
     # 渲染到前端界面的展示列
     disp = f_df.rename(columns=EMP_COL_MAP)
-    # [核心修复：补回防爆底线] 确保无论有没有选中人，变量都存在
     t_emp_sel = None
     if not disp.empty:
         target_cols = ['工号/编号', '姓名', '部门', '岗位', 'T级', '岗级', '档次', '状态']
@@ -396,7 +396,6 @@ elif current_page == "👥 人员档案":
         if not selected_rows.empty:
             sel_id = selected_rows.iloc[0]['工号/编号']
 
-            # 拉取完整底层数据用于回显
             import sqlite3, os
             db_path = os.path.join('database', 'hr_core.db')
             conn = sqlite3.connect(db_path)
@@ -480,7 +479,6 @@ elif current_page == "👥 人员档案":
                 if errs: st.error("部分记录异常:\n" + "\n".join(errs))
                 set_msg_and_rerun(f"完成！新增 {sc} 人, 更新 {uc} 人")
 
-    # [核心修复 2026-03-27] 极度严谨的类型推导，彻底根绝 ValueError 歧义死机
     with st.expander("📝 单条维护区", expanded=True):
         if t_emp_sel is None: st.warning("💡 新增模式。如果录入挂靠人员，工号处可直接填写其社保编号。")
         with st.form("emp_form", clear_on_submit=True):
@@ -494,7 +492,6 @@ elif current_page == "👥 人员档案":
                 def_d = t_emp_sel.get('dept_id') if t_emp_sel is not None else None
                 fdept = st.selectbox("部门*", options=list(dm.keys()), format_func=lambda x: dm[x], index=list(dm.keys()).index(def_d) if def_d in dm else 0) if dm else None
 
-                # 强行开启小数支持，步长为 0.1
                 frank = st.number_input("岗级*", 0.0, 28.0,
                                         float(t_emp_sel.get('post_rank', 11.0)) if t_emp_sel is not None and pd.notna(
                                             t_emp_sel.get('post_rank')) else 11.0, step=0.1, format="%.1f")
@@ -511,10 +508,8 @@ elif current_page == "👥 人员档案":
 
                 fjoin_val = pd.to_datetime(t_emp_sel.get('join_company_date')) if t_emp_sel is not None and pd.notna(
                     t_emp_sel.get('join_company_date')) else date.today()
-                # 强行突破 10 年限制
                 fjoin = st.date_input("入职日", value=fjoin_val, min_value=date(1950, 1, 1))
 
-                # 👇 新增：附加学籍与工作时间区 👇
                 st.write("**--- 附加学籍与工作时间 ---**")
                 fp1, fp2, fp3 = st.columns(3)
                 with fp1:
@@ -533,7 +528,6 @@ elif current_page == "👥 人员档案":
                                             value=str(t_emp_sel.get('major', "")) if t_emp_sel is not None and pd.notna(
                                                 t_emp_sel.get('major')) else "")
                 with fp3:
-                    # [核心修复 2]：强制转换为标准 date 对象，防止 Streamlit 时间轴崩溃
                     grad_raw = t_emp_sel.get('graduation_date') if t_emp_sel is not None else None
                     f_grad_date_val = pd.to_datetime(grad_raw).date() if pd.notna(grad_raw) and str(grad_raw).strip() != '' else None
                     f_grad_date = st.date_input("毕业日期", value=f_grad_date_val, min_value=date(1950, 1, 1))
@@ -541,7 +535,6 @@ elif current_page == "👥 人员档案":
                     first_work_raw = t_emp_sel.get('first_job_date') if t_emp_sel is not None else None
                     f_first_work_val = pd.to_datetime(first_work_raw).date() if pd.notna(first_work_raw) and str(first_work_raw).strip() != '' else None
                     f_first_work = st.date_input("参加工作时间*", value=f_first_work_val, min_value=date(1950, 1, 1))
-                # 👆 新增结束 👆
 
             st.write("**--- 状态与快照控制 ---**")
             cs1, cs2, cs3 = st.columns(3)
@@ -557,11 +550,9 @@ elif current_page == "👥 人员档案":
                 elif t_emp_sel is not None and not frsn: st.error("必填说明")
                 else:
                     idc_val = fidc.strip() if fidc.strip() else None
-                    # [核心修复 3]：将 int(frank) 强转改为 float(frank)，彻底保住 2.1 这种精细化锚点
                     ed = {'emp_id': fid, 'name': fname, 'id_card': idc_val, 'dept_id': int(fdept),
                           'post_rank': float(frank), 'post_grade': fgrade, 'status': fst,
                           'join_company_date': fjoin.strftime('%Y-%m-%d')}
-                    # 👇 修改：将找回的字段存入扩展表字典 👇
                     pd_i = {
                         'pos_id': int(fpos) if fpos else None,
                         'tech_grade': ftg,
@@ -573,7 +564,6 @@ elif current_page == "👥 人员档案":
                         'graduation_date': f_grad_date.strftime('%Y-%m-%d') if f_grad_date else None,
                         'first_job_date': f_first_work.strftime('%Y-%m-%d') if f_first_work else None
                     }
-                    # 👆 修改结束 👆
                     ad_str = fcd.strftime('%Y-%m-%d %H:%M:%S')
                     if t_emp_sel is not None: ok, msg = update_employee(fid, ed, pd_i, reason=frsn, change_date=ad_str)
                     else: ok, msg = add_employee(ed, pd_i, reason=frsn or "手工录入", change_date=ad_str)
@@ -590,7 +580,6 @@ elif current_page == "🕰️ 历史变动流水":
         hdf = pd.DataFrame(h_list); hdf['dt_obj'] = pd.to_datetime(hdf['change_date'])
         hdf = hdf.sort_values(by='dt_obj', ascending=False)
 
-        # [满血复原] 高级过滤与审计侧边栏
         with st.sidebar.expander("🔍 高级筛选与审计导出", expanded=True):
             hs = st.text_input("搜姓名/工号")
             ht = st.multiselect("变动类型", options=sorted(hdf['change_type'].unique().tolist()))
@@ -603,14 +592,9 @@ elif current_page == "🕰️ 历史变动流水":
         if ht: f_h = f_h[f_h['change_type'].isin(ht)]
         if hd: f_h = f_h[f_h['old_dept_name'].isin(hd)]
         if len(d_range) == 2:
-            # 1. 剔除因没填入职时间导致的空时间(NaT)，防止引擎比对时死机
             f_h = f_h.dropna(subset=['dt_obj'])
-
-            # 2. 将你选择的日期强转为 Pandas 的时间戳，并包裹一整天的时间范围
             start_dt = pd.to_datetime(d_range[0])
             end_dt = pd.to_datetime(d_range[1]) + pd.Timedelta(days=1, seconds=-1)
-
-            # 3. 同类型安全比对
             f_h = f_h[(f_h['dt_obj'] >= start_dt) & (f_h['dt_obj'] <= end_dt)]
 
         with st.sidebar:

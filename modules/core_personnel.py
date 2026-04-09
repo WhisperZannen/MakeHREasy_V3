@@ -1,9 +1,9 @@
 # ==============================================================================
 # 文件路径: modules/core_personnel.py
-# 功能描述: 人员管理数据接口 (V3.15 生命周期全量捕获版)
+# 功能描述: 人员管理数据接口 (V3.20 底层稳固版)
 # 实现了什么具体逻辑:
-#   1. [逻辑升级] 将 status (状态) 正式纳入 Delta 差异比对。
-#   2. 强化了快照生成逻辑：离职、退休、在职切换将产生与调岗调薪同等地位的流水记录。
+#   1. [防爆修复] 将 get_all_employees 中的海象运算符拆解，根除 UnboundLocalError 作用域泄漏。
+#   2. [撤销修复] 将 rollback_history 的防卫判断，扩充支持“期初建档”与“新员工入职”。
 #   3. 精准计时：继续保持 intern_start_date 的 SQL 穿透查询。
 # ==============================================================================
 
@@ -22,24 +22,17 @@ def _get_db_connection():
 
 
 def add_employee(emp_data, profile_data, reason="新员工入职", change_date=None):
-    # 以前的逻辑：初始快照时间跟着操作时间走（导致老员工导入时空错乱）
-    # actual_date = change_date if change_date else datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-
-    # 👇 [核心修改] 强行时空对齐：初始快照的时间，必须 100% 锁死在员工的“入职日期”！
     join_date = emp_data.get('join_company_date')
     if join_date:
-        # 如果有入职日期，初始快照的生效时间直接穿越回他入职的那一天
         initial_snapshot_time = f"{join_date} 00:00:00"
     else:
         initial_snapshot_time = change_date if change_date else datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
-    # 动态调整快照类型名称，消除“老员工今天入职”的违和感
     snapshot_type = "期初建档" if "导入" in reason else "新员工入职"
 
     conn = _get_db_connection()
     cursor = conn.cursor()
     try:
-        # 1. 写入主表
         cursor.execute("""
                        INSERT INTO employees (emp_id, name, id_card, dept_id, post_rank, post_grade, status,
                                               join_company_date)
@@ -47,7 +40,6 @@ def add_employee(emp_data, profile_data, reason="新员工入职", change_date=N
                        """, (emp_data['emp_id'], emp_data['name'], emp_data['id_card'], emp_data['dept_id'],
                              emp_data['post_rank'], emp_data['post_grade'], emp_data.get('status', '在职'),
                              emp_data.get('join_company_date')))
-        # 2. 写入扩展表
         cursor.execute("""
                        INSERT INTO employee_profiles (emp_id, pos_id, tech_grade, title_order, education_level, degree,
                                                       school_name, major, graduation_date, first_job_date)
@@ -56,7 +48,6 @@ def add_employee(emp_data, profile_data, reason="新员工入职", change_date=N
                              profile_data.get('title_order', 999), profile_data.get('education_level'),
                              profile_data.get('degree'), profile_data.get('school_name'), profile_data.get('major'),
                              profile_data.get('graduation_date'), profile_data.get('first_job_date')))
-        # 3. 写入快照流水表（使用对其后的 initial_snapshot_time 和 snapshot_type）
         cursor.execute("""
                        INSERT INTO personnel_changes (emp_id, change_type, new_dept_id, new_pos_id, new_tech_grade,
                                                       new_post_rank, new_post_grade, change_date, change_reason)
@@ -73,10 +64,6 @@ def add_employee(emp_data, profile_data, reason="新员工入职", change_date=N
         conn.close()
 
 def update_employee(emp_id, emp_data, profile_data, reason="档案更新", change_date=None):
-    # [增量详尽注释 2026-03-26]
-    # 为什么这么改：响应用户关于“离职/退休也算变动”的需求。
-    # 实现了什么具体逻辑：在 Delta 比对中加入了 status 字段。
-    # 只要 状态、部门、岗位、T级、岗级、档次 任一发生变化，均触发快照。
     actual_date = change_date if change_date else datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     conn = _get_db_connection()
     cursor = conn.cursor()
@@ -95,7 +82,6 @@ def update_employee(emp_id, emp_data, profile_data, reason="档案更新", chang
         if old:
             def is_diff(v1, v2): return str(v1).strip() != str(v2).strip()
 
-            # [核心新增] 状态变动捕获
             if is_diff(old['status'], emp_data.get('status')):
                 change_tags.append(f"变为{emp_data.get('status')}")
 
@@ -117,7 +103,6 @@ def update_employee(emp_id, emp_data, profile_data, reason="档案更新", chang
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (emp_id, " + ".join(change_tags), old['dept_id'], emp_data['dept_id'], old['pos_id'], profile_data.get('pos_id'), old['tech_grade'], profile_data.get('tech_grade'), old['post_rank'], emp_data['post_rank'], old['post_grade'], emp_data['post_grade'], actual_date, reason))
 
-        # 物理更新，包含状态位
         cursor.execute("""
             UPDATE employees 
             SET name=?, id_card=?, dept_id=?, post_rank=?, post_grade=?, status=?, join_company_date=? 
@@ -155,7 +140,10 @@ def get_all_employees(dept_id=None, include_resigned=False):
         if dept_id: sql += " AND a.dept_id = ?"; params.append(dept_id)
         sql += " ORDER BY c.sort_order ASC, a.post_rank DESC"
         cursor.execute(sql, params)
-        return True, [dict(row) for row in rows] if (rows := cursor.fetchall()) else []
+
+        # [核心拆弹] 去除海象运算符 := ，根绝由于作用域提升导致的 UnboundLocalError
+        rows = cursor.fetchall()
+        return True, [dict(row) for row in rows] if rows else []
     except Exception as e:
         return False, str(e)
     finally:
@@ -182,16 +170,16 @@ def get_all_history():
         conn.close()
 
 def rollback_history(change_id):
-    # [增量详尽注释 2026-03-26]
-    # 为什么这么改：回退时必须把 status 也恢复，否则无法撤销“误操作离职”。
     conn = _get_db_connection()
     cursor = conn.cursor()
     try:
         cursor.execute("SELECT * FROM personnel_changes WHERE change_id = ?", (change_id,))
         hist = cursor.fetchone()
-        if not hist or hist['change_type'] == '入职': return False, "入职记录无法撤销"
 
-        # 强制回滚状态为“在职”，并将待遇还原
+        # [核心修复] 放宽限制检测词，拦截新员工入职、期初建档等无法撤销动作
+        if not hist or any(x in hist['change_type'] for x in ['入职', '建档']):
+            return False, "期初建档或入职记录无上级节点，无法直接撤销，请通过修改人员档案处理。"
+
         cursor.execute("""
             UPDATE employees SET dept_id=?, post_rank=?, post_grade=?, status='在职' 
             WHERE emp_id=?
@@ -211,7 +199,6 @@ def rollback_history(change_id):
         conn.close()
 
 def update_employee_status(emp_id, new_status, reason="手动状态调整", change_date=None):
-    # 这一步现在被整合进了 update_employee，保留此接口作为兼容性兜底
     actual_date = change_date if change_date else datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     conn = _get_db_connection()
     cursor = conn.cursor()
