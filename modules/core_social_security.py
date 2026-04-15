@@ -229,21 +229,41 @@ def apply_rounding(value: float, mode: str) -> float:
         return float(math.floor(value / 10.0) * 10)
     return round(value, 2)
 
+# ------------------------------------------------------------------------------
+# 核心算子 2: 单个险种金额计算 (彻底废除公积金强制抹零机制)
+# ------------------------------------------------------------------------------
 def calc_insurance_item(item_type: str, raw_base: float, upper: float, lower: float,
                         comp_rate: float, pers_rate: float, round_mode: str,
                         fund_method: str = 'independent', soe_upper: float = 0.0, soe_lower: float = 0.0):
-
-    effective_upper = soe_upper if (item_type == 'fund' and soe_upper > 0) else upper
-    effective_lower = soe_lower if (item_type == 'fund' and soe_lower > 0) else lower
+    if raw_base <= 0:
+        return 0.0, 0.0, 0.0
 
     actual_base = raw_base
     is_capped = False
 
-    if effective_upper > 0 and raw_base >= effective_upper:
-        actual_base = effective_upper
-        is_capped = True
-    elif effective_lower > 0 and raw_base <= effective_lower:
-        actual_base = effective_lower
+    # 如果是公积金，且有内部执行线，优先用内部线判定封顶保底
+    if item_type == 'fund' and (soe_upper > 0 or soe_lower > 0):
+        if soe_upper > 0 and actual_base >= soe_upper:
+            actual_base = soe_upper
+            is_capped = True
+        elif soe_lower > 0 and actual_base <= soe_lower:
+            actual_base = soe_lower
+            is_capped = True
+    else:
+        if upper > 0 and actual_base >= upper:
+            actual_base = upper
+            is_capped = True
+        elif lower > 0 and actual_base <= lower:
+            actual_base = lower
+            is_capped = True
+
+    # 基数取整规则
+    def apply_rounding(val, mode):
+        if mode == 'exact': return val
+        elif mode == 'round_to_yuan': return round(val)
+        elif mode == 'round_to_ten': return round(val / 10.0) * 10
+        elif mode == 'floor_to_ten': return float(int(val / 10.0) * 10)
+        return val
 
     if item_type != 'fund':
         actual_base = apply_rounding(actual_base, round_mode)
@@ -251,18 +271,23 @@ def calc_insurance_item(item_type: str, raw_base: float, upper: float, lower: fl
         pers_amount = round(actual_base * pers_rate, 2)
     else:
         if fund_method == 'reverse_from_ss' and not is_capped:
+            # 只有在明确开启了“反推法”且没有碰触封顶线时，才执行特殊的逢元进十
             raw_comp = actual_base * comp_rate
             raw_pers = actual_base * pers_rate
             comp_amount = float(round(raw_comp / 10.0) * 10)
             pers_amount = float(round(raw_pers / 10.0) * 10)
         else:
-            comp_amount = float(round(actual_base * comp_rate))
-            pers_amount = float(round(actual_base * pers_rate))
+            # 【绝对核心修复】：剥夺公积金的强制抹零特权！
+            # 独立计算模式下，严格遵守 21977 * 0.12 = 2637.24 的数学铁律，绝不擅自取整！
+            actual_base = apply_rounding(actual_base, round_mode)
+            comp_amount = round(actual_base * comp_rate, 2)
+            pers_amount = round(actual_base * pers_rate, 2)
 
     return actual_base, comp_amount, pers_amount
 
+
 # ------------------------------------------------------------------------------
-# 核心算子 3: 五险两金全量计算引擎 (终极拨乱反正版)
+# 核心算子 3: 五险两金全量计算引擎 (终极修复：公积金独立基数绝对豁免版)
 # ------------------------------------------------------------------------------
 def calculate_complete_bill(emp_row: dict, target_year: str) -> dict:
     res = {'工号': emp_row['工号'], '姓名': emp_row['姓名'], '财务归属': emp_row['财务归属']}
@@ -296,16 +321,27 @@ def calculate_complete_bill(emp_row: dict, target_year: str) -> dict:
             res[f'{item}_企'] = res[f'{item}_个'] = 0.0
             continue
 
-        raw_base = emp_row[base_col]
-        if item == 'fund' and raw_base == 0:
-            raw_base = emp_row['已录入原始基数']
+        # ----------------------------------------------------------------------
+        # [核心解毒] 公积金基数寻址与全局算法豁免机制
+        # ----------------------------------------------------------------------
+        raw_base = emp_row.get(base_col, 0.0)
+        current_fund_method = rules.get('fund_calc_method', 'independent')
+
+        if item == 'fund':
+            if raw_base == 0:
+                # 场景 1：没有填独立基数，借用社保原始基数，并接受全局算法的支配(如：反推逢元进十)
+                raw_base = emp_row.get('已录入原始基数', 0.0)
+            else:
+                # 场景 2：[终极修复] 填了独立基数！立刻激活免死金牌，强行阻断全局“反推法/逢元进十”！
+                # 强制降级为最原始纯粹的 'independent' 算法（严格按比例计算，只四舍五入到 1 元）
+                current_fund_method = 'independent'
 
         _, c_amt, p_amt = calc_insurance_item(
             item, raw_base,
             rules.get(f'{item}_upper', 0), rules.get(f'{item}_lower', 0),
             rules.get(f'{item}_comp_rate', 0), rules.get(f'{item}_pers_rate', 0),
             rules.get('rounding_mode', 'round_to_yuan'),
-            rules.get('fund_calc_method', 'independent'),
+            current_fund_method,  # 传入刚才经过拦截器判定的算法模式
             rules.get('fund_soe_upper', 0),
             rules.get('fund_soe_lower', 0)
         )
