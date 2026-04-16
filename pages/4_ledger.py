@@ -163,18 +163,64 @@ with tab2:
                 ob = io.BytesIO()
                 with pd.ExcelWriter(ob, engine='openpyxl') as writer:
 
+                    # ==============================================================================
+                    # 修正后的 Tab 2 汇总逻辑：捍卫数据库字段 + 智能增强备注
+                    # ==============================================================================
                     if need_summary:
+                        # 1. 基础配置：依然保留 emp_status 字段
                         db_num_cols = [LEDGER_MAP[c] for c in NUMERIC_COLS if c in LEDGER_MAP]
                         agg_dict = {col: 'sum' for col in db_num_cols}
+                        agg_dict.update({'emp_name': 'first', 'emp_status': 'last'})
 
-                        # [注:此处按照你提供的副本逻辑，依然保留你的基底不动]
-                        agg_dict.update({'emp_name': 'first', 'dept_name': 'first', 'emp_status': 'last'})
+                        # 2. 执行双键联合分组（捍卫部门归属）
+                        summary_df = raw_export_df.groupby(['emp_id', 'dept_name']).agg(agg_dict).reset_index()
 
-                        summary_df = raw_export_df.groupby('emp_id').agg(agg_dict).reset_index()
+                        # 3. 【核心加固】实时探针：抓取此时此刻的档案信息
+                        conn_live = _get_db_connection()
+                        live_info = pd.read_sql_query("""
+                                                      SELECT e.emp_id, e.status as live_st, d.dept_name as live_dept
+                                                      FROM employees e
+                                                               LEFT JOIN departments d ON e.dept_id = d.dept_id
+                                                      """, conn_live).set_index('emp_id').to_dict('index')
+                        conn_live.close()
+
+
+                        # 4. 【极简状态引擎】状态列绝对纯净，变化信息全部压入备注！
+                        def process_display_info(row):
+                            eid = row['emp_id']
+                            hist_dept = row['dept_name']
+                            hist_status = row['emp_status']
+                            current = live_info.get(eid, {})
+
+                            live_st = current.get('live_st', '未知')
+                            live_dept = current.get('live_dept', '')
+
+                            # 状态列原封不动，当年怎样就怎样！
+                            final_status = hist_status
+                            remarks = []
+
+                            # A. 状态变化提醒 (比如以前在职，现在离职了，才备注)
+                            if live_st != hist_status:
+                                remarks.append(f"现已{live_st}")
+
+                            # B. 跨部门提醒 (如果现在还在职，且部门变了，才备注)
+                            if live_st not in ['离职', '退休'] and live_dept and live_dept != hist_dept:
+                                remarks.append(f"现调至[{live_dept}]")
+
+                            return final_status, " | ".join(remarks)
+
+
+                        # 5. 应用转换：同时更新状态列和备注列
+                        status_and_remarks = summary_df.apply(process_display_info, axis=1)
+                        summary_df['emp_status'] = [x[0] for x in status_and_remarks]
+                        summary_df['备注'] = [x[1] for x in status_and_remarks]
+
+                        # 6. 翻译回中文表头并排序
                         summary_cn = summary_df.rename(columns=DB_TO_CN_MAP)
                         report_cols = [c for c in LEDGER_MAP.keys() if c in summary_cn.columns and c != '核算月份']
-                        summary_cn = summary_cn[report_cols]
+                        if '备注' not in report_cols: report_cols.append('备注')
 
+                        summary_cn = summary_cn[report_cols]
                         summary_final = add_subtotals_and_totals(summary_cn, NUMERIC_COLS)
 
                         sum_sheet_name = f"{len(selected_months)}个月累计汇总"
