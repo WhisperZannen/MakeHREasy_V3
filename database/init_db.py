@@ -74,6 +74,240 @@ def ensure_payroll_schema_patch(cursor):
             f"ALTER TABLE payroll_monthly_records ADD COLUMN {column_name} {column_sql}"
         )
 
+def ensure_payroll_items_schema_patch(cursor):
+    """
+    薪酬“月度项目池”结构补丁函数。
+
+    这个函数是干什么的？
+    ------------------------------------------------------------
+    它负责保护两张薪酬新表：
+
+    1. payroll_monthly_items
+       用来保存每个月每个人的各种工资项目明细。
+
+    2. payroll_item_mapping
+       用来保存“Excel列名 -> 工资字段”的映射关系。
+
+    为什么需要这个函数？
+    ------------------------------------------------------------
+    因为项目以后肯定会继续改。
+
+    比如以后你发现：
+    - payroll_monthly_items 少了一个字段；
+    - payroll_item_mapping 少了一个字段；
+    - 旧数据库已经存在，但新代码需要新字段。
+
+    如果只改 CREATE TABLE，新数据库没问题，旧数据库还是会缺字段。
+    所以这里用 ALTER TABLE 自动补字段。
+
+    注意：
+    ------------------------------------------------------------
+    这个函数只“补字段”，不删除字段。
+    因为 SQLite 删除字段很麻烦，而且工资系统不能轻易删历史结构。
+    以后如果某个字段不用了，先保留，页面不再使用即可。
+    """
+
+    # ==========================================================
+    # 一、检查 payroll_monthly_items 表的字段
+    # ==========================================================
+
+    # PRAGMA table_info(表名) 是 SQLite 查看表结构的命令。
+    cursor.execute("PRAGMA table_info(payroll_monthly_items)")
+
+    # col[1] 是字段名。
+    # 这里把当前表已有字段全部取出来，放进集合 existing_item_columns。
+    existing_item_columns = {col[1] for col in cursor.fetchall()}
+
+    # 这里写的是 payroll_monthly_items 这张表“必须拥有”的字段。
+    # 如果旧数据库里少了某个字段，系统会自动补。
+    required_item_columns = {
+        "emp_name_snapshot": "TEXT",
+        # 姓名快照。
+        # 为什么要快照？
+        # 因为员工以后可能改名，但历史工资项目不能跟着乱变。
+
+        "item_type": "TEXT DEFAULT '其他'",
+        # 项目类别。
+        # 例如：岗位补扣、专项奖、提成、考勤扣罚、清算、专家调整。
+
+        "item_name": "TEXT DEFAULT '未命名项目'",
+        # 项目名称。
+        # 比 item_type 更细，比如“营销S2差额”“5月项目提成”“专家月度调整发放”。
+
+        "amount": "REAL DEFAULT 0.0",
+        # 金额。
+        # 正数表示加钱，负数表示扣钱。
+        # 例如考勤扣罚可以直接存 -300。
+
+        "target_field": "TEXT DEFAULT 'special_bonus_total'",
+        # 目标字段。
+        # 表示这条项目最终要汇总到 payroll_monthly_records 的哪个字段。
+        # 例如：
+        # 岗位补扣 -> position_adj
+        # 清算 -> history_clearance
+        # 专家补贴 -> expert_allowance
+        # 专项奖/提成/考勤扣罚 -> special_bonus_total
+
+        "direction": "TEXT DEFAULT '自动'",
+        # 加减方向。
+        # 这个字段主要给界面展示用。
+        # 实际计算时优先看 amount 的正负。
+
+        "source_column": "TEXT",
+        # 来源列名。
+        # 例如导入 Excel 里的“岗位补/扣”“专项奖”“提成”。
+
+        "source_sheet": "TEXT",
+        # 来源 sheet 名。
+        # 以后如果你从工资表多个 sheet 导入，可以追踪这条数据从哪个 sheet 来。
+
+        "source_file": "TEXT",
+        # 来源文件名。
+        # 方便以后查账：这笔钱到底是哪张表导进来的。
+
+        "import_batch_id": "TEXT",
+        # 导入批次号。
+        # 一次 Excel 导入可以生成同一个批次号。
+        # 以后如果导错了，可以按批次删除或回滚。
+
+        "remarks": "TEXT",
+        # 备注。
+        # 放人工说明，比如“主任口径手工调整”“营销S2差额”“财务回传”。
+
+        "is_active": "INTEGER DEFAULT 1",
+        # 是否有效。
+        # 1 有效，0 作废。
+        # 工资系统尽量不要物理删除历史记录，作废比删除安全。
+
+        "created_at": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+        # 创建时间。
+        # 记录这条项目是什么时候导入系统的。
+    }
+
+    # 遍历必须字段。
+    for column_name, column_sql in required_item_columns.items():
+
+        # 如果字段已经存在，就跳过，避免重复添加报错。
+        if column_name in existing_item_columns:
+            continue
+
+        # 如果字段不存在，就自动补上。
+        cursor.execute(
+            f"ALTER TABLE payroll_monthly_items ADD COLUMN {column_name} {column_sql}"
+        )
+
+    # ==========================================================
+    # 二、检查 payroll_item_mapping 表的字段
+    # ==========================================================
+
+    cursor.execute("PRAGMA table_info(payroll_item_mapping)")
+    existing_mapping_columns = {col[1] for col in cursor.fetchall()}
+
+    required_mapping_columns = {
+        "source_column": "TEXT",
+        # Excel 来源列名。
+        # 例如：岗位补/扣、专项奖、提成、考勤扣罚。
+
+        "item_type": "TEXT DEFAULT '其他'",
+        # 系统内部识别的项目类别。
+
+        "target_field": "TEXT DEFAULT 'special_bonus_total'",
+        # 这类项目最终汇总到 payroll_monthly_records 的哪个字段。
+
+        "item_name": "TEXT",
+        # 默认项目名称。
+        # 可以为空；为空时系统可以直接使用 Excel 列名。
+
+        "sign_rule": "TEXT DEFAULT 'signed_amount'",
+        # 符号规则。
+        # signed_amount 表示：Excel 里正数就是加钱，负数就是扣钱。
+        # 后续如果遇到特殊表，也可以扩展成 always_positive、always_negative。
+
+        "enabled": "INTEGER DEFAULT 1",
+        # 是否启用。
+        # 以后某个映射不用了，不删除，改成 0 即可。
+
+        "remarks": "TEXT",
+        # 备注。
+    }
+
+    for column_name, column_sql in required_mapping_columns.items():
+        if column_name in existing_mapping_columns:
+            continue
+
+        cursor.execute(
+            f"ALTER TABLE payroll_item_mapping ADD COLUMN {column_name} {column_sql}"
+        )
+
+
+def seed_payroll_item_mapping(cursor):
+    """
+    初始化薪酬项目导入映射。
+
+    这个函数是干什么的？
+    ------------------------------------------------------------
+    它负责给 payroll_item_mapping 表预置一些默认规则。
+
+    为什么需要默认规则？
+    ------------------------------------------------------------
+    因为你以后导入工资表时，系统要知道：
+
+    Excel 里的“岗位补/扣”应该进 position_adj；
+    Excel 里的“专项奖”应该进 special_bonus_total；
+    Excel 里的“清算”应该进 history_clearance。
+
+    为什么用 INSERT OR IGNORE？
+    ------------------------------------------------------------
+    因为这个初始化函数可能会被反复执行。
+
+    如果规则已经存在，就不要重复插入；
+    如果规则不存在，就自动补进去。
+    """
+
+    default_mappings = [
+        # source_column, item_type, target_field, item_name, sign_rule, enabled, remarks
+
+        ("岗位补/扣", "岗位补扣", "position_adj", "岗位补/扣", "signed_amount", 1,
+         "实际岗位工资与系统岗位工资不一致时使用，例如营销S序列、J档封顶补差、特殊人员待遇差额。"),
+
+        ("岗位补扣", "岗位补扣", "position_adj", "岗位补扣", "signed_amount", 1,
+         "兼容没有斜杠的列名。"),
+
+        ("专项奖", "专项奖", "special_bonus_total", "专项奖", "signed_amount", 1,
+         "专项奖合计的一部分，可正可负。"),
+
+        ("提成", "提成", "special_bonus_total", "提成", "signed_amount", 1,
+         "提成并入专项奖惩合计。"),
+
+        ("考勤扣罚", "考勤扣罚", "special_bonus_total", "考勤扣罚", "signed_amount", 1,
+         "考勤扣罚并入专项奖惩合计，通常为负数。"),
+
+        ("清算", "清算", "history_clearance", "清算", "signed_amount", 1,
+         "历史清算、绩效清算等补扣款。"),
+
+        ("历史清算", "清算", "history_clearance", "历史清算", "signed_amount", 1,
+         "兼容工资表中直接叫历史清算的列。"),
+
+        ("晋升补发", "晋升补发", "promotion_backpay", "晋升补发", "signed_amount", 1,
+         "岗级、档次、岗位晋升产生的补发。"),
+
+        ("专家补贴", "专家调整", "expert_allowance", "专家补贴", "signed_amount", 1,
+         "专家待遇调整，可能为正数，也可能为负数。"),
+
+        ("专家调整", "专家调整", "expert_allowance", "专家调整", "signed_amount", 1,
+         "兼容专家调整类列名。"),
+
+        ("绩效补/扣", "绩效补扣", "perf_adj", "绩效补/扣", "signed_amount", 1,
+         "绩效工资口径的补发或扣发。"),
+    ]
+
+    for row in default_mappings:
+        cursor.execute("""
+            INSERT OR IGNORE INTO payroll_item_mapping
+            (source_column, item_type, target_field, item_name, sign_rule, enabled, remarks)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, row)
+
 def init_database():
     # 获取当前脚本所在绝对路径，拼接数据库文件路径，防止生成的数据库文件位置错乱
     current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -660,6 +894,155 @@ def init_database():
                 FOREIGN KEY (emp_id) REFERENCES employees(emp_id)
             )
         ''')
+
+        # --- 表 13.1: 月度薪酬项目流水池 (payroll_monthly_items) ---
+        # 这张表是薪酬模块后续的“垃圾桶”和“证据池”。
+        #
+        # 为什么要有这张表？
+        # ------------------------------------------------------------
+        # 因为工资里会有很多不稳定项目：
+        # 专项奖、提成、考勤扣罚、专家补贴、清算、岗位补扣、临时补发……
+        #
+        # 如果每个项目都在工资主表里加一列，数据库很快就会爆炸。
+        # 所以正确做法是：
+        #
+        # 1. 导入时，把 Excel 里的宽表拆成一条条项目流水；
+        # 2. 保存明细，方便以后查账；
+        # 3. 再按 target_field 汇总到 payroll_monthly_records 对应字段。
+        #
+        # 这张表只属于薪酬模块，不会污染人员、社保、人工成本三个模块。
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS payroll_monthly_items (
+                item_id TEXT PRIMARY KEY,
+                -- 项目流水号。
+                -- 后续导入时可以用 uuid 生成，保证每条记录唯一。
+
+                cost_month TEXT NOT NULL,
+                -- 核算月份，例如 2026-05。
+                -- 表示这条项目进入哪个月工资。
+
+                emp_id TEXT NOT NULL,
+                -- 员工工号。
+                -- 用来关联 employees 表。
+
+                emp_name_snapshot TEXT,
+                -- 姓名快照。
+                -- 保存导入时这个人叫什么，防止以后改名影响历史记录。
+
+                item_type TEXT DEFAULT '其他',
+                -- 项目类别。
+                -- 例如：岗位补扣、专项奖、提成、考勤扣罚、清算、专家调整。
+
+                item_name TEXT DEFAULT '未命名项目',
+                -- 项目名称。
+                -- 比 item_type 更细。
+                -- 例如：营销S2差额、5月提成、专家月度调整发放。
+
+                amount REAL DEFAULT 0.0,
+                -- 金额。
+                -- 正数表示加钱，负数表示扣钱。
+                -- 例如考勤扣罚可以直接存 -300。
+
+                target_field TEXT DEFAULT 'special_bonus_total',
+                -- 汇总目标字段。
+                -- 表示这条项目最终要汇总到 payroll_monthly_records 的哪个字段。
+                -- 例如：
+                -- 岗位补扣 -> position_adj
+                -- 专项奖/提成/考勤扣罚 -> special_bonus_total
+                -- 清算 -> history_clearance
+                -- 专家调整 -> expert_allowance
+
+                direction TEXT DEFAULT '自动',
+                -- 加减方向。
+                -- 主要用于页面展示。
+                -- 实际计算时优先看 amount 正负。
+
+                source_column TEXT,
+                -- 来源 Excel 列名。
+                -- 例如：岗位补/扣、专项奖、提成。
+
+                source_sheet TEXT,
+                -- 来源 Sheet 名。
+                -- 以后如果从工资表多个 sheet 导入，可以追踪来源。
+
+                source_file TEXT,
+                -- 来源文件名。
+                -- 方便以后查账。
+
+                import_batch_id TEXT,
+                -- 导入批次号。
+                -- 同一次导入的所有记录可以共用一个批次号。
+                -- 以后导错了，可以按批次作废。
+
+                remarks TEXT,
+                -- 备注。
+                -- 放人工说明、领导口径、异常原因。
+
+                is_active INTEGER DEFAULT 1,
+                -- 是否有效。
+                -- 1 表示有效，0 表示作废。
+                -- 工资数据尽量不要物理删除，作废更安全。
+
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                -- 创建时间。
+
+                FOREIGN KEY (emp_id) REFERENCES employees(emp_id)
+                -- 外键：这条项目应该对应一个人员。
+            )
+        ''')
+
+        # --- 表 13.2: 薪酬项目导入映射表 (payroll_item_mapping) ---
+        # 这张表解决一个问题：
+        #
+        # Excel 里的列名经常会变。
+        # 今天叫“专项奖”，明天可能叫“项目奖励”，后天又叫“专项奖惩”。
+        #
+        # 如果把这些名字写死在代码里，以后每改一个列名就要改代码。
+        # 所以这里做成映射表：
+        #
+        # Excel列名 -> 项目类别 -> 汇总到哪个工资字段
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS payroll_item_mapping (
+                map_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                -- 映射规则编号。
+
+                source_column TEXT NOT NULL UNIQUE,
+                -- Excel 来源列名。
+                -- 例如：岗位补/扣、专项奖、提成、考勤扣罚。
+
+                item_type TEXT DEFAULT '其他',
+                -- 系统内部项目类别。
+                -- 例如：岗位补扣、专项奖、清算、专家调整。
+
+                target_field TEXT DEFAULT 'special_bonus_total',
+                -- 汇总目标字段。
+                -- 必须对应 payroll_monthly_records 里的某个字段。
+                -- 例如 position_adj、special_bonus_total、history_clearance。
+
+                item_name TEXT,
+                -- 默认项目名称。
+                -- 如果为空，后续导入时可以直接使用 source_column。
+
+                sign_rule TEXT DEFAULT 'signed_amount',
+                -- 金额符号规则。
+                -- signed_amount 表示 Excel 里正负号照原样使用。
+
+                enabled INTEGER DEFAULT 1,
+                -- 是否启用。
+                -- 1 启用，0 停用。
+
+                remarks TEXT
+                -- 备注。
+            )
+        ''')
+
+        # 旧数据库结构补丁。
+        # 如果这两张表已经存在，但缺少后续新增字段，就自动补齐。
+        ensure_payroll_items_schema_patch(cursor)
+
+        # 初始化默认映射规则。
+        # 反复运行不会重复插入，因为 source_column 有 UNIQUE 约束，且使用 INSERT OR IGNORE。
+        seed_payroll_item_mapping(cursor)
 
         # --- 表 14: 动态长效发条规则表 (payroll_allowance_rules) ---
         cursor.execute('''
