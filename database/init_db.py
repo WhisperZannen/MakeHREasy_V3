@@ -7,6 +7,73 @@
 import sqlite3
 import os
 
+def ensure_payroll_schema_patch(cursor):
+    """
+    薪酬主表结构补丁函数。
+
+    这个函数是干什么的？
+    ------------------------------------------------------------
+    它专门解决“旧数据库已经存在，但是缺少新字段”的问题。
+
+    为什么不能只靠 CREATE TABLE IF NOT EXISTS？
+    ------------------------------------------------------------
+    因为 SQLite 看到表已经存在后，就不会重新创建，也不会自动补字段。
+    所以旧数据库缺什么字段，它还是继续缺什么字段。
+
+    这个函数怎么工作？
+    ------------------------------------------------------------
+    1. 先读取 payroll_monthly_records 当前有哪些字段；
+    2. 再检查我们需要的字段是否存在；
+    3. 如果不存在，就用 ALTER TABLE 自动补上；
+    4. 如果已经存在，就什么都不做，避免重复添加时报错。
+
+    参数 cursor 是什么？
+    ------------------------------------------------------------
+    cursor 是 SQLite 的“执行 SQL 的笔”。
+    init_database() 里面已经创建了 cursor，所以我们直接把它传进来用。
+    """
+
+    # 读取 payroll_monthly_records 表的字段信息。
+    # PRAGMA table_info(表名) 是 SQLite 专门用来查看表结构的命令。
+    cursor.execute("PRAGMA table_info(payroll_monthly_records)")
+
+    # cursor.fetchall() 会返回很多行，每一行代表一个字段。
+    # 每行里第 2 个位置，也就是 col[1]，是字段名。
+    # 这里把所有字段名提取出来，放进一个 set 集合里。
+    # set 的好处是查找很快，而且不会重复。
+    existing_columns = {col[1] for col in cursor.fetchall()}
+
+    # 这里定义“我们希望薪酬主表必须拥有的字段”。
+    # 字典的 key 是字段名。
+    # 字典的 value 是字段类型和默认值。
+    required_columns = {
+        "perf_standard": "REAL DEFAULT 0.0",
+        # 绩效工资标准。
+        # 薪酬底表生成时会写这个字段。
+
+        "history_clearance": "REAL DEFAULT 0.0",
+        # 历史清算。
+        # 最终结账页面会读取/更新这个字段。
+
+        "promotion_backpay": "REAL DEFAULT 0.0",
+        # 晋升补发。
+        # 最终结账页面会读取/更新这个字段。
+    }
+
+    # 逐个检查必需字段。
+    for column_name, column_sql in required_columns.items():
+
+        # 如果字段已经存在，就跳过。
+        # 这样重复运行 init_db.py 也不会报错。
+        if column_name in existing_columns:
+            continue
+
+        # 如果字段不存在，就补上。
+        # ALTER TABLE 表名 ADD COLUMN 字段名 字段类型 默认值
+        cursor.execute(
+            f"ALTER TABLE payroll_monthly_records ADD COLUMN {column_name} {column_sql}"
+        )
+
 def init_database():
     # 获取当前脚本所在绝对路径，拼接数据库文件路径，防止生成的数据库文件位置错乱
     current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -353,57 +420,233 @@ def init_database():
         # 模块 4：全新薪酬核算大一统中心 (完全复刻你的变态级签字用表)
         # ======================================================================
 
-        # --- 表 12: 薪酬月度主账单表 (payroll_monthly_records) ---
+                # --- 表 12: 薪酬月度主账单表 (payroll_monthly_records) ---
+        # 这张表是“每个月每个人的一张工资主账单”。
+        # 你可以把它理解成：某个人某个月工资到底怎么算出来的，所有关键数字都放在这里。
+        #
+        # 为什么这次要修改这里：
+        # 之前 Gemini 后来给数据库补过字段，但是 init_db.py 没同步。
+        # 结果就是：你手上这个被补过的数据库能跑；重新冷启动生成的新数据库会缺字段。
+        #
+        # 本次新增/补齐的关键字段：
+        # 1. perf_standard：绩效工资标准。薪酬页面生成底表时会写入这个字段。
+        # 2. history_clearance：历史清算。薪酬最终结账页面会读取/更新这个字段。
+        # 3. promotion_backpay：晋升补发。薪酬最终结账页面会读取/更新这个字段。
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS payroll_monthly_records (
-                record_id TEXT PRIMARY KEY,                 -- 账单流水号 (格式: 核算月_工号)
-                cost_month TEXT NOT NULL,                   -- 这是发哪个月的工资 (YYYY-MM)
-                emp_id TEXT NOT NULL,                       -- 员工工号
-                dept_name TEXT,                             -- 这个人发钱时算在哪个部门 (部门快照)
-                
-                -- [第一部分：静态与固定发钱区]
-                base_salary REAL DEFAULT 0.0,               -- 岗位工资 (如果没转正可能会打折)
-                seniority_pay REAL DEFAULT 0.0,             -- 工龄工资
-                comp_subsidy REAL DEFAULT 0.0,              -- 综合补贴
-                telecom_subsidy REAL DEFAULT 0.0,           -- 通讯补贴
-                position_adj REAL DEFAULT 0.0,              -- 岗位补/扣发 (如行一/行二非领导的固定差额等手敲金额)
-                expert_allowance REAL DEFAULT 0.0,          -- 专家津贴 或 高校毕业生津贴
-                
-                -- [第二部分：极度复杂的浮动绩效发钱区]
-                perf_base REAL DEFAULT 0.0,                 -- 绩效的原始基准盘 (原始标准 + 激励包基数)
-                perf_kpi_score REAL DEFAULT 100.0,          -- 本月 KPI/KCI 分数 (100分就是满绩效)
-                perf_pack_coef REAL DEFAULT 1.0,            -- 激励包的翻倍系数 (比如乘以1.3倍)
-                perf_leader_coef REAL DEFAULT 1.0,          -- 领导专属的激励倍数
-                perf_excel_coef REAL DEFAULT 1.0,           -- 优才政策倍数 (默认不翻倍为1)
-                perf_salary_calc REAL DEFAULT 0.0,          -- 【绩效考核工资】(由上面几个系数乘出来的最终绩效金额)
-                perf_adj REAL DEFAULT 0.0,                  -- 绩效补/扣发 (跨期滞后导致的手工干预调差额)
-                
-                -- [第三部分：混沌挂载层 (临时或单次的乱七八糟的钱)]
-                dynamic_additions TEXT DEFAULT '{}',        -- 动态加项 (把零散的名目转成JSON格式无限加塞，不占表列)
-                dynamic_deductions TEXT DEFAULT '{}',       -- 动态减项 (如考勤扣款等临时名目放这里)
-                special_bonus_total REAL DEFAULT 0.0,       -- 专项奖金合计 (从外挂奖金池里把零散奖金打包加总到这一个格子里)
-                
-                -- [第四部分：大结账与扣款收网区]
-                gross_salary_total REAL DEFAULT 0.0,        -- 【应发工资合计】(把上面所有应该发给他的钱加总，拿去算个税的起点基数！)
-                
-                -- （下方的社保扣款必须从 表10、表11 强行吸过来！不能在薪酬里自己乱算！）
-                ss_pension_pers REAL DEFAULT 0.0,           -- 代扣养老保险
-                ss_medical_mix REAL DEFAULT 0.0,            -- 代扣医保合并项 (把基本医疗和大病的7块钱揉在一起给你展示)
-                ss_unemp_pers REAL DEFAULT 0.0,             -- 代扣失业保险
-                ss_fund_pers REAL DEFAULT 0.0,              -- 代扣公积金
-                ss_annuity_pers REAL DEFAULT 0.0,           -- 代扣企业年金
-                
-                tax_deduction REAL DEFAULT 0.0,             -- 代扣个税 (财务用专门工具算好后塞回来的扣税金额)
-                net_salary REAL DEFAULT 0.0,                -- 【个人实发工资】(应发合计 减去 五险两金扣款 减去 个税，最终打给银行卡的钱)
-                
-                -- [状态与防改锚点]
-                audit_status TEXT DEFAULT '草稿',            -- 账单算到了哪一步 (草稿 / 待算税 / 已封账)
-                oa_clearing_no TEXT,                        -- 电信OA系统要求的清册编号 (对接OA备用)
-                update_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP, -- 这行数据最后一次变动的时间
+                -- ==============================================================
+                -- 一、主键与基础锚点区
+                -- ==============================================================
+
+                record_id TEXT PRIMARY KEY,
+                -- 账单流水号。
+                -- 设计格式一般是：核算月份_工号，例如：2026-04_42001943。
+                -- 它的作用是唯一锁定“某个人某个月”的工资记录。
+
+                cost_month TEXT NOT NULL,
+                -- 工资核算月份，格式建议固定为 YYYY-MM，例如：2026-04。
+                -- 注意：这里不是发放日期，而是这张工资表归属哪个核算月。
+
+                emp_id TEXT NOT NULL,
+                -- 员工工号。
+                -- 用来关联 employees 人员主表。
+
+                dept_name TEXT,
+                -- 部门名称快照。
+                -- 为什么不用 dept_id？
+                -- 因为工资是历史账，员工以后可能调部门。
+                -- 这里保存当月生成工资时的部门名称，防止以后人员调动导致历史工资乱跳。
+
+
+                -- ==============================================================
+                -- 二、固定工资与固定补贴区
+                -- ==============================================================
+
+                base_salary REAL DEFAULT 0.0,
+                -- 岗位工资。
+                -- 通常由“岗级 + 档次”去薪酬字典/工资矩阵里查出来。
+
+                seniority_pay REAL DEFAULT 0.0,
+                -- 工龄工资。
+                -- 目前薪酬页面还没完全启用，但表里先保留，后面可以按参加工作时间/入职时间计算。
+
+                comp_subsidy REAL DEFAULT 0.0,
+                -- 综合补贴。
+                -- 用于存放相对固定的综合性补贴项目。
+
+                telecom_subsidy REAL DEFAULT 0.0,
+                -- 通讯补贴。
+                -- 如果你们单位有固定通讯费，可以放这里。
+
+                position_adj REAL DEFAULT 0.0,
+                -- 岗位补发/扣发。
+                -- 比如某些岗位差额、岗位调整补扣、特殊岗位补贴，可以放这里。
+
+                expert_allowance REAL DEFAULT 0.0,
+                -- 专家津贴或高校毕业生津贴。
+                -- 这个字段用于放长期规则类津贴，也可以后续由 payroll_allowance_rules 自动汇总过来。
+
+
+                -- ==============================================================
+                -- 三、绩效工资计算区
+                -- ==============================================================
+
+                perf_standard REAL DEFAULT 0.0,
+                -- 【本次补齐字段】
+                -- 绩效工资标准。
+                -- pages/3_payroll.py 里生成底表时会写入这个字段。
+                -- 如果这里没有这个字段，冷启动数据库后，薪酬模块会报 no such column 或 INSERT 字段不存在。
+
+                perf_base REAL DEFAULT 0.0,
+                -- 激励包基数。
+                -- 目前代码里会根据 T级，比如 T1/T2/T3，从薪酬字典里查出激励包金额。
+
+                perf_kpi_score REAL DEFAULT 100.0,
+                -- 本月 KPI/KCI 得分。
+                -- 默认 100 分，表示满绩效。
+                -- 页面上可以人工改，比如 95、110、120。
+
+                perf_pack_coef REAL DEFAULT 1.0,
+                -- 激励包倍数。
+                -- 比如激励包按 1.0、1.2、1.3 倍发放。
+
+                perf_leader_coef REAL DEFAULT 1.0,
+                -- 负责人/领导系数。
+                -- 用于领导岗位或负责人特殊绩效系数。
+
+                perf_excel_coef REAL DEFAULT 1.0,
+                -- 优才、专项政策或外部 Excel 倍数。
+                -- 当前页面暂时未重点使用，但保留给后续复杂政策。
+
+                perf_salary_calc REAL DEFAULT 0.0,
+                -- 系统计算出的绩效工资。
+                -- 目前页面里的大致公式是：
+                -- （绩效标准 + 激励包基数 × 激励包倍数）× KPI / 100 × 负责人系数。
+
+                perf_adj REAL DEFAULT 0.0,
+                -- 绩效补发/扣发。
+                -- 用于处理跨月绩效调整、考核补扣、历史月份补差等情况。
+
+
+                -- ==============================================================
+                -- 四、专项奖金与动态加减项区
+                -- ==============================================================
+
+                dynamic_additions TEXT DEFAULT '{}',
+                -- 动态加项，JSON 文本。
+                -- 为什么用 TEXT 存 JSON？
+                -- 因为工资里经常会突然冒出临时项目，不可能每来一个项目就改一次数据库表。
+                -- 比如：临时补贴、一次性补发、特殊奖励，都可以塞进这个 JSON。
+
+                dynamic_deductions TEXT DEFAULT '{}',
+                -- 动态减项，JSON 文本。
+                -- 比如考勤扣款、其他扣款、临时扣罚等，可以放这里。
+
+                special_bonus_total REAL DEFAULT 0.0,
+                -- 专项奖金合计。
+                -- payroll_special_bonus 明细表里可能有很多条奖金。
+                -- 汇总后会推送到这里，作为当月工资的一部分。
+
+                history_clearance REAL DEFAULT 0.0,
+                -- 【本次补齐字段】
+                -- 历史清算。
+                -- 用于处理历史遗留补扣款。
+                -- 例如：上月多发了，本月扣回来，可以填负数；
+                -- 或者以前少发了，本月补回来，可以填正数。
+                -- pages/3_payroll.py 最终结账页面会读取和更新它。
+
+                promotion_backpay REAL DEFAULT 0.0,
+                -- 【本次补齐字段】
+                -- 晋升补发。
+                -- 用于处理岗级/档次/岗位晋升后产生的补发金额。
+                -- 例如：3月批了晋升，4月工资才补发差额，就可以放这里。
+
+
+                -- ==============================================================
+                -- 五、应发工资汇总区
+                -- ==============================================================
+
+                gross_salary_total REAL DEFAULT 0.0,
+                -- 应发工资合计。
+                -- 这是个人扣社保、扣个税之前的工资总额。
+                -- 后续个税申报、工资表汇总、人工成本台账都很依赖这个字段。
+
+
+                -- ==============================================================
+                -- 六、社保公积金个人代扣区
+                -- ==============================================================
+
+                ss_pension_pers REAL DEFAULT 0.0,
+                -- 个人养老保险扣款。
+                -- 注意：这个数应该从 ss_monthly_records 社保月度记录里倒吸，不应该在薪酬模块重新计算。
+
+                ss_medical_mix REAL DEFAULT 0.0,
+                -- 个人医疗保险扣款合并项。
+                -- 这里通常等于：基本医疗个人部分 + 大病医疗固定扣款。
+                -- 例如你前面一直强调的 199 和 7，在薪酬展示时可以合并扣。
+
+                ss_unemp_pers REAL DEFAULT 0.0,
+                -- 个人失业保险扣款。
+                -- 同样来自社保模块。
+
+                ss_fund_pers REAL DEFAULT 0.0,
+                -- 个人住房公积金扣款。
+                -- 同样来自社保模块。
+
+                ss_annuity_pers REAL DEFAULT 0.0,
+                -- 个人企业年金扣款。
+                -- 同样来自社保模块。
+
+
+                -- ==============================================================
+                -- 七、个税与实发区
+                -- ==============================================================
+
+                tax_deduction REAL DEFAULT 0.0,
+                -- 代扣个人所得税。
+                -- 当前系统设计里，个税不是系统自动算，而是由外部税务/财务工具算好后回灌。
+
+                net_salary REAL DEFAULT 0.0,
+                -- 实发工资。
+                -- 一般公式是：
+                -- 应发工资合计 - 五险两金个人扣款 - 个税。
+                -- 这个就是最终打到员工银行卡的钱。
+
+
+                -- ==============================================================
+                -- 八、流程状态与外部系统对接区
+                -- ==============================================================
+
+                audit_status TEXT DEFAULT '草稿',
+                -- 工资单状态。
+                -- 例如：草稿 / 待算税 / 已封账。
+                -- 后续可以用它控制工资表能不能继续改。
+
+                oa_clearing_no TEXT,
+                -- OA 清册编号。
+                -- 如果后续要对接电信 OA 或者走线下清册编号，可以放这里。
+
+                update_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                -- 更新时间。
+                -- 用来记录这条工资账单最后一次被系统写入的时间。
+
+
+                -- ==============================================================
+                -- 九、约束区
+                -- ==============================================================
+
                 FOREIGN KEY (emp_id) REFERENCES employees(emp_id),
-                UNIQUE(cost_month, emp_id)                  -- 同月同人只发一张主流水单
+                -- 外键约束。
+                -- 表示这条工资记录必须对应 employees 表里的一个员工。
+
+                UNIQUE(cost_month, emp_id)
+                -- 唯一约束。
+                -- 同一个员工同一个月份，只能有一条工资主账单。
+                -- 防止同月同人重复生成两条工资。
             )
         ''')
+
+        ensure_payroll_schema_patch(cursor)
 
         # --- 表 13: 专项奖金外挂池 (payroll_special_bonus) ---
         cursor.execute('''
