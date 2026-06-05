@@ -983,6 +983,32 @@ with tab2:
 # ------------------------------------------------------------------------------
 with tab3:
     st.subheader("🏦 财务个税回灌与薪酬草稿结账")
+
+    # ==========================================================
+    # 操作完成后的提示区
+    # ==========================================================
+    # 为什么要用 st.session_state？
+    # ----------------------------------------------------------
+    # 因为 Streamlit 点击按钮后，经常会重新运行整个页面。
+    # 如果只是 st.success("完成")，提示可能一闪而过。
+    #
+    # session_state 可以把“刚刚完成了什么操作”暂存起来，
+    # 页面刷新后还能继续显示提示。
+    if "payroll_tab3_message" in st.session_state:
+        st.success(st.session_state["payroll_tab3_message"])
+
+        st.info(
+            "下一步流程："
+            "① 下载【发给财务算税底表】 → "
+            "② 发给财务计算个税 → "
+            "③ 导入财务回传个税 → "
+            "④ 再次重新计算应发/实发 → "
+            "⑤ 后续生成 OA 上传表。"
+        )
+
+        # 显示完以后删除，避免这个提示永远挂在页面上。
+        del st.session_state["payroll_tab3_message"]
+
     st.info(
         "💡 这里不是正式封账，只是把岗位工资、岗位补/扣、专家调整、绩效、绩效补/扣、专项奖惩、清算、个税等合并，"
         "生成一版可用于核对、送财务算税、后续导出 OA 的薪酬草稿。"
@@ -992,10 +1018,10 @@ with tab3:
     # 一、选择结账月份
     # ==========================================================
 
-    # 这里单独设置一个月份输入框，不再完全依赖 Tab2 里的 calc_month。
+    # 这里单独设置一个月份输入框。
     # 原因：
-    # Streamlit 虽然同一个脚本里变量能互相读到，
-    # 但用户体验上，Tab3 自己有月份会更稳。
+    # Tab2 的 calc_month 虽然在同一个脚本里能读到，
+    # 但 Tab3 自己放一个月份输入框，用户操作更直观，也更不容易误用。
     final_month = st.text_input(
         "📅 结账月份",
         value=calc_month,
@@ -1011,11 +1037,9 @@ with tab3:
     # 这段 SQL 负责把 payroll_monthly_records 里的关键工资字段取出来。
     #
     # 注意：
-    # 1. 岗位补/扣 position_adj 是固定工资差额，不属于专项奖。
-    # 2. 专家调整 expert_allowance 可以为正，也可以为负。
-    # 3. 绩效补/扣 perf_adj 是绩效口径的补扣。
-    # 4. special_bonus_total 用来承接专项奖、提成、考勤扣罚等合计，可正可负。
-    # 5. history_clearance 用来承接历史清算、绩效清算等。
+    # 1. 这里比上一版多取了五险两金的明细字段。
+    # 2. 原因是：你给财务算税时，不能只给“五险两金合计”，最好把养老、医疗、失业、公积金、年金都拆出来。
+    # 3. 个税是财务算，所以系统只负责导出底表、导入财务回传结果。
     sql_final = """
         SELECT
             p.emp_id                                                   AS "工号",
@@ -1035,6 +1059,12 @@ with tab3:
             IFNULL(p.promotion_backpay, 0)                             AS "晋升补发",
             IFNULL(p.special_bonus_total, 0)                           AS "专项奖惩及提成合计",
             IFNULL(p.history_clearance, 0)                             AS "历史清算",
+
+            IFNULL(p.ss_pension_pers, 0)                               AS "养老个人",
+            IFNULL(p.ss_medical_mix, 0)                                AS "医疗个人含大病",
+            IFNULL(p.ss_unemp_pers, 0)                                 AS "失业个人",
+            IFNULL(p.ss_fund_pers, 0)                                  AS "公积金个人",
+            IFNULL(p.ss_annuity_pers, 0)                               AS "年金个人",
 
             (IFNULL(p.ss_pension_pers, 0)
              + IFNULL(p.ss_medical_mix, 0)
@@ -1059,10 +1089,309 @@ with tab3:
         conn.close()
     else:
         # ==========================================================
-        # 三、页面编辑区
+        # 三、内部计算函数
         # ==========================================================
 
-        st.write("👉 **手工调整与个税录入区**")
+        def calc_gross_from_row(row):
+            """
+            计算应发工资。
+
+            这个函数是干什么的？
+            ------------------------------------------------------------
+            它把一行工资草稿里的各项收入/补扣相加，得到应发工资。
+
+            为什么单独写成函数？
+            ------------------------------------------------------------
+            因为下面有三个地方都要用到这个逻辑：
+
+            1. 页面展示时，给财务导出应发测算；
+            2. 点击“重新计算薪酬草稿应发/实发”时；
+            3. 导入财务个税后，重新计算实发时。
+
+            单独写函数，可以避免三个地方公式不一致。
+            """
+
+            gross = (
+                float(row["岗位工资"] or 0)
+                + float(row["工龄工资"] or 0)
+                + float(row["综合补贴"] or 0)
+                + float(row["通讯补贴"] or 0)
+                + float(row["岗位补/扣"] or 0)
+                + float(row["专家/特殊津贴"] or 0)
+                + float(row["已算绩效"] or 0)
+                + float(row["绩效补/扣"] or 0)
+                + float(row["晋升补发"] or 0)
+                + float(row["专项奖惩及提成合计"] or 0)
+                + float(row["历史清算"] or 0)
+            )
+
+            return round(gross, 2)
+
+
+        def calc_social_total_from_row(row):
+            """
+            计算个人五险两金代扣合计。
+
+            这里拆开养老、医疗、失业、公积金、年金后再相加。
+            好处是：
+            ------------------------------------------------------------
+            如果以后你发现合计不对，可以直接看是哪一项错了。
+            """
+
+            total = (
+                float(row["养老个人"] or 0)
+                + float(row["医疗个人含大病"] or 0)
+                + float(row["失业个人"] or 0)
+                + float(row["公积金个人"] or 0)
+                + float(row["年金个人"] or 0)
+            )
+
+            return round(total, 2)
+
+
+        # ==========================================================
+        # 四、页面指标预览
+        # ==========================================================
+
+        # 这里先复制一份，不直接改 df_final。
+        preview_df = df_final.copy()
+
+        # 计算当前页面上的理论应发和理论实发。
+        # 注意：
+        # 这里的“理论”只是用于页面预览；
+        # 真正写入数据库，要点击后面的按钮。
+        preview_df["页面测算_应发"] = preview_df.apply(calc_gross_from_row, axis=1)
+        preview_df["页面测算_五险两金"] = preview_df.apply(calc_social_total_from_row, axis=1)
+        preview_df["页面测算_实发"] = (
+            preview_df["页面测算_应发"]
+            - preview_df["页面测算_五险两金"]
+            - preview_df["代扣个税"]
+        ).round(2)
+
+        metric_1, metric_2, metric_3, metric_4 = st.columns(4)
+        metric_1.metric("草稿人数", f"{len(preview_df)} 人")
+        metric_2.metric("页面测算应发合计", f"{preview_df['页面测算_应发'].sum():,.2f}")
+        metric_3.metric("个人五险两金合计", f"{preview_df['页面测算_五险两金'].sum():,.2f}")
+        metric_4.metric("页面测算实发合计", f"{preview_df['页面测算_实发'].sum():,.2f}")
+
+        # ==========================================================
+        # 五、导出给财务算税底表
+        # ==========================================================
+
+        st.write("### 1️⃣ 导出给财务算税底表")
+
+        st.caption(
+            "这张表用于发给财务算个税。它包含应发工资、个人社保公积金明细、五险两金合计。"
+            "财务算完后，再把个税结果回传导入。"
+        )
+
+        finance_export_df = preview_df[[
+            "工号",
+            "姓名",
+            "部门",
+
+            "岗位工资",
+            "工龄工资",
+            "综合补贴",
+            "通讯补贴",
+            "岗位补/扣",
+            "专家/特殊津贴",
+            "已算绩效",
+            "绩效补/扣",
+            "晋升补发",
+            "专项奖惩及提成合计",
+            "历史清算",
+
+            "页面测算_应发",
+
+            "养老个人",
+            "医疗个人含大病",
+            "失业个人",
+            "公积金个人",
+            "年金个人",
+            "页面测算_五险两金",
+
+            "代扣个税",
+            "页面测算_实发"
+        ]].copy()
+
+        # 改成更适合财务看的列名。
+        finance_export_df.rename(columns={
+            "页面测算_应发": "应发工资合计",
+            "页面测算_五险两金": "五险两金个人合计",
+            "页面测算_实发": "实发工资测算"
+        }, inplace=True)
+
+        tax_out = io.BytesIO()
+
+        with pd.ExcelWriter(tax_out, engine="openpyxl") as writer:
+            finance_export_df.to_excel(writer, index=False, sheet_name="发给财务算税底表")
+
+            # 给财务回传模板也顺手放一个 sheet。
+            # 财务只需要填工号、姓名、代扣个税即可。
+            tax_template_df = finance_export_df[["工号", "姓名", "应发工资合计", "五险两金个人合计"]].copy()
+            tax_template_df["代扣个税"] = 0.0
+            tax_template_df["备注"] = ""
+
+            tax_template_df.to_excel(writer, index=False, sheet_name="财务回传个税模板")
+
+        st.download_button(
+            label="📤 下载发给财务算税底表",
+            data=tax_out.getvalue(),
+            file_name=f"{final_month}_发给财务算税底表.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+
+        # ==========================================================
+        # 六、导入财务回传个税
+        # ==========================================================
+
+        st.write("### 2️⃣ 导入财务回传个税")
+
+        st.caption(
+            "第一版只要求财务回传表里有【工号】和【代扣个税】两列。"
+            "如果财务列名叫【个税】或【本月个税】，系统也会尝试识别。"
+        )
+
+        tax_file = st.file_uploader(
+            "上传财务回传个税 Excel 或 CSV",
+            type=["xlsx", "csv"],
+            key="tax_import_upload"
+        )
+
+        if tax_file is not None:
+            if st.button("📥 导入财务个税并重算实发", type="primary"):
+
+                try:
+                    # --------------------------------------------------
+                    # 1. 读取财务回传文件
+                    # --------------------------------------------------
+                    if tax_file.name.endswith(".csv"):
+                        tax_df = pd.read_csv(tax_file)
+                    else:
+                        tax_df = pd.read_excel(tax_file)
+
+                    if tax_df.empty:
+                        st.warning("上传的个税表是空的。")
+                        st.stop()
+
+                    if "工号" not in tax_df.columns:
+                        st.error("导入失败：个税表必须有【工号】这一列。")
+                        st.stop()
+
+                    # --------------------------------------------------
+                    # 2. 自动识别个税列
+                    # --------------------------------------------------
+                    possible_tax_cols = ["代扣个税", "个税", "本月个税", "应扣个税", "个人所得税"]
+
+                    tax_col = None
+                    for c in possible_tax_cols:
+                        if c in tax_df.columns:
+                            tax_col = c
+                            break
+
+                    if tax_col is None:
+                        st.error(
+                            "导入失败：没有找到个税列。"
+                            "请确认表里有【代扣个税】、【个税】、【本月个税】、【应扣个税】或【个人所得税】其中之一。"
+                        )
+                        st.stop()
+
+                    cursor = conn.cursor()
+
+                    import_count = 0
+                    skipped_no_emp = 0
+                    skipped_not_in_main = 0
+
+                    # --------------------------------------------------
+                    # 3. 逐行导入个税
+                    # --------------------------------------------------
+                    for _, row in tax_df.iterrows():
+
+                        emp_id = clean_emp_id(row.get("工号"))
+
+                        if not emp_id:
+                            skipped_no_emp += 1
+                            continue
+
+                        tax_amount = safe_money_to_float(row.get(tax_col))
+
+                        # 检查这个人本月是否有薪酬主账。
+                        cursor.execute(
+                            """
+                            SELECT
+                                IFNULL(gross_salary_total, 0),
+                                IFNULL(ss_pension_pers, 0),
+                                IFNULL(ss_medical_mix, 0),
+                                IFNULL(ss_unemp_pers, 0),
+                                IFNULL(ss_fund_pers, 0),
+                                IFNULL(ss_annuity_pers, 0)
+                            FROM payroll_monthly_records
+                            WHERE cost_month = ?
+                              AND emp_id = ?
+                            """,
+                            (final_month, emp_id)
+                        )
+
+                        found = cursor.fetchone()
+
+                        if found is None:
+                            skipped_not_in_main += 1
+                            continue
+
+                        gross_salary = safe_money_to_float(found[0])
+                        social_total = (
+                            safe_money_to_float(found[1])
+                            + safe_money_to_float(found[2])
+                            + safe_money_to_float(found[3])
+                            + safe_money_to_float(found[4])
+                            + safe_money_to_float(found[5])
+                        )
+
+                        # 如果还没点击过“重新计算薪酬草稿应发/实发”，
+                        # gross_salary_total 可能还是 0。
+                        # 这里仍然照实计算，但后面会给提示。
+                        net_salary = round(gross_salary - social_total - tax_amount, 2)
+
+                        cursor.execute(
+                            """
+                            UPDATE payroll_monthly_records
+                            SET tax_deduction = ?,
+                                net_salary = ?
+                            WHERE cost_month = ?
+                              AND emp_id = ?
+                            """,
+                            (tax_amount, net_salary, final_month, emp_id)
+                        )
+
+                        import_count += 1
+
+                    conn.commit()
+
+                    st.success(
+                        f"✅ 个税导入完成！成功导入 {import_count} 人。"
+                        f"跳过无工号行 {skipped_no_emp} 行，"
+                        f"跳过本月无薪酬主账人员 {skipped_not_in_main} 人。"
+                    )
+
+                    st.warning(
+                        "提醒：如果你导入个税前还没有点击【重新计算薪酬草稿应发/实发】，"
+                        "部分人员的应发可能仍为 0，实发也会不准。"
+                        "建议先点一次下方草稿结账按钮，再导入个税；导入个税后如有手工调整，再重新结账一次。"
+                    )
+
+                    st.rerun()
+
+                except Exception as e:
+                    conn.rollback()
+                    st.error(f"导入个税失败：{e}")
+
+        # ==========================================================
+        # 七、页面编辑区
+        # ==========================================================
+
+        st.write("### 3️⃣ 手工调整与草稿结账")
+
         st.caption(
             "这里可以人工改：岗位补/扣、专家/特殊津贴、绩效补/扣、晋升补发、专项奖惩及提成、历史清算、个税。"
             "底薪、已算绩效、五险两金代扣暂时锁定，避免误改。"
@@ -1088,6 +1417,11 @@ with tab3:
                 "综合补贴",
                 "通讯补贴",
                 "已算绩效",
+                "养老个人",
+                "医疗个人含大病",
+                "失业个人",
+                "公积金个人",
+                "年金个人",
                 "五险两金代扣",
                 "系统算_应发总计",
                 "系统算_最终实发"
@@ -1097,7 +1431,7 @@ with tab3:
         )
 
         # ==========================================================
-        # 四、执行草稿结账
+        # 八、执行草稿结账
         # ==========================================================
 
         if st.button("🧮 重新计算薪酬草稿应发/实发", type="primary"):
@@ -1107,55 +1441,20 @@ with tab3:
 
             for _, row in edited_final.iterrows():
 
-                # --------------------------------------------------
-                # 1. 计算应发工资
-                # --------------------------------------------------
-                # 当前第一版草稿公式：
-                #
-                # 应发 =
-                # 岗位工资
-                # + 工龄工资
-                # + 综合补贴
-                # + 通讯补贴
-                # + 岗位补/扣
-                # + 专家/特殊津贴
-                # + 已算绩效
-                # + 绩效补/扣
-                # + 晋升补发
-                # + 专项奖惩及提成合计
-                # + 历史清算
-                #
-                # 注意：
-                # 专项奖惩及提成合计可能为负数，因为里面可能包含考勤扣罚。
-                # 专家/特殊津贴也可能为负数，因为专家待遇调整可能是负数。
-                gross = (
-                    float(row["岗位工资"] or 0)
-                    + float(row["工龄工资"] or 0)
-                    + float(row["综合补贴"] or 0)
-                    + float(row["通讯补贴"] or 0)
-                    + float(row["岗位补/扣"] or 0)
-                    + float(row["专家/特殊津贴"] or 0)
-                    + float(row["已算绩效"] or 0)
-                    + float(row["绩效补/扣"] or 0)
-                    + float(row["晋升补发"] or 0)
-                    + float(row["专项奖惩及提成合计"] or 0)
-                    + float(row["历史清算"] or 0)
-                )
+                # 计算应发工资。
+                gross = calc_gross_from_row(row)
 
-                # --------------------------------------------------
-                # 2. 计算实发工资
-                # --------------------------------------------------
-                # 实发 =
-                # 应发 - 五险两金个人代扣 - 代扣个税
+                # 计算个人社保公积金代扣合计。
+                social_total = calc_social_total_from_row(row)
+
+                # 计算实发工资。
                 net = (
                     gross
-                    - float(row["五险两金代扣"] or 0)
+                    - social_total
                     - float(row["代扣个税"] or 0)
                 )
 
-                # --------------------------------------------------
-                # 3. 写回薪酬主账
-                # --------------------------------------------------
+                # 写回薪酬主账。
                 cursor.execute(
                     """
                     UPDATE payroll_monthly_records
