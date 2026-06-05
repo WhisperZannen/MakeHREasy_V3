@@ -1368,16 +1368,17 @@ with tab3:
 
                     conn.commit()
 
-                    st.success(
+                    # 不直接 st.success + st.rerun。
+                    # 原因：
+                    # st.rerun 会立刻刷新页面，导致成功提示一闪而过。
+                    #
+                    # 这里先把提示文字存到 session_state，
+                    # 页面刷新后，Tab3 顶部的提示区会稳定显示。
+                    st.session_state["payroll_tab3_message"] = (
                         f"✅ 个税导入完成！成功导入 {import_count} 人。"
                         f"跳过无工号行 {skipped_no_emp} 行，"
                         f"跳过本月无薪酬主账人员 {skipped_not_in_main} 人。"
-                    )
-
-                    st.warning(
-                        "提醒：如果你导入个税前还没有点击【重新计算薪酬草稿应发/实发】，"
-                        "部分人员的应发可能仍为 0，实发也会不准。"
-                        "建议先点一次下方草稿结账按钮，再导入个税；导入个税后如有手工调整，再重新结账一次。"
+                        "下一步请再次点击【重新计算薪酬草稿应发/实发】，确保实发金额刷新。"
                     )
 
                     st.rerun()
@@ -1489,7 +1490,15 @@ with tab3:
 
             conn.commit()
 
-            st.success(f"✅ 草稿结账完成！已重新计算 {update_count} 人的应发与实发。")
+            # 不直接 st.success + st.rerun。
+            # 原因：
+            # st.rerun 会立刻刷新页面，导致成功提示一闪而过。
+            #
+            # 这里先把提示文字存到 session_state，
+            # 然后刷新页面，刷新后在 Tab3 顶部稳定显示。
+            st.session_state["payroll_tab3_message"] = (
+                f"✅ 草稿结账完成！已重新计算 {update_count} 人的应发与实发。"
+            )
             st.rerun()
 
         conn.close()
