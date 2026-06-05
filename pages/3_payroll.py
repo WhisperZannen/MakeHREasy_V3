@@ -770,9 +770,9 @@ with tab1:
             )
 
             st.info(
-                "下一步请到 Tab3 重新执行结账计算。"
-                "注意：当前 Tab3 的应发公式下一步还要继续改，"
-                "否则 position_adj、expert_allowance、perf_adj 暂时不会全部进入应发。"
+                "下一步请到 Tab3 重新执行【薪酬草稿应发/实发】计算。"
+                "项目池推送只负责把岗位补/扣、专项奖惩、清算、专家调整等写进薪酬主账；"
+                "应发和实发仍需要在 Tab3 里重新计算。"
             )
 
         except Exception as e:
@@ -908,6 +908,35 @@ with tab2:
     df_perf = pd.read_sql_query(sql_perf, conn, params=[calc_month])
 
     if not df_perf.empty:
+        # ==========================================================
+        # 绩效计算状态提醒
+        # ==========================================================
+        # 为什么要加这个提醒？
+        # ----------------------------------------------------------
+        # Tab2 里“生成底表”和“计算绩效”是两个动作。
+        # 只生成底表时，系统只会写入岗位工资、绩效基数、激励包基数、社保扣款；
+        # 但真正的绩效工资 perf_salary_calc 要点击下面的“计算理论绩效总额并入库”才会生成。
+        #
+        # 如果忘记点这个按钮，Tab3 里就会出现“有岗位工资，但没有绩效工资”的情况。
+        # 所以这里提前给出状态提示，避免以后每个月漏操作。
+        total_perf_rows = len(df_perf)
+        zero_perf_rows = (df_perf["已算出的绩效"].fillna(0) == 0).sum()
+        nonzero_perf_rows = total_perf_rows - zero_perf_rows
+
+        c_status_1, c_status_2, c_status_3 = st.columns(3)
+        c_status_1.metric("本月薪酬底表人数", f"{total_perf_rows} 人")
+        c_status_2.metric("已计算绩效人数", f"{nonzero_perf_rows} 人")
+        c_status_3.metric("绩效仍为0人数", f"{zero_perf_rows} 人")
+
+        if zero_perf_rows > 0:
+            st.warning(
+                "⚠️ 当前仍有人员的【已算出的绩效】为 0。"
+                "如果你还没有点击下方【计算理论绩效总额并入库】，请先点击。"
+                "如果已经点击过，则需要检查这些人的绩效基数、激励包基数或岗位规则是否缺失。"
+            )
+        else:
+            st.success("✅ 当前底表中的绩效工资均已计算。")
+
         # 在 Python 层面为用户显示友好的列名，避开 SQL 解析雷区
         df_perf.rename(columns={"本月KPI": "本月KPI(修改这里)"}, inplace=True)
 
