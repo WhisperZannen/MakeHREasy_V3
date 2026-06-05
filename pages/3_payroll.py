@@ -7,6 +7,8 @@ import streamlit as st
 import pandas as pd
 import sqlite3
 import os
+import io
+import uuid
 import json
 import datetime
 from modules.core_social_security import _get_db_connection
@@ -206,73 +208,577 @@ def normalize_rank_for_payroll(raw_rank):
         return ""
 
 # ------------------------------------------------------------------------------
-# Tab 1: 专项奖池与动态预埋 (明细账蓄水池)
+# Tab 1: 月度项目池导入
 # ------------------------------------------------------------------------------
 with tab1:
-    st.subheader("🎁 专项奖金与特殊项目池 (明细录入)")
-    st.info("⚠️ 必须先在 Tab 2 执行过【抓取】，此处的汇总才会生效！")
+    st.subheader("📂 月度薪酬项目池")
+    st.info(
+        "💡 这里用于导入每月不稳定的工资项目，例如岗位补/扣、专项奖、提成、考勤扣罚、清算、专家补贴等。"
+        "系统会先保存明细流水，再按映射规则汇总到薪酬主账。"
+    )
 
-    bonus_month = st.text_input("📅 奖金发放月份 (如: 2026-04)", value=datetime.date.today().strftime("%Y-%m"),
-                                key="tab1_month")
+    # ==========================================================
+    # 一、基础工具函数
+    # ==========================================================
 
-    # 单笔录入表单
-    with st.form("add_special_bonus_form", clear_on_submit=True):
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            b_emp_id = st.text_input("工号 (必填)")
-        with c2:
-            b_proj_name = st.text_input("项目名称 (如: 13薪)")
-        with c3:
-            b_amount = st.number_input("金额 (元)", value=0.0)
-        if st.form_submit_button("➕ 确认录入明细") and b_emp_id and b_proj_name:
-            conn = _get_db_connection()
-            cursor = conn.cursor()
-            try:
-                bonus_id = f"{bonus_month}_{b_emp_id}_{b_proj_name}"
-                cursor.execute("""
-                               INSERT INTO payroll_special_bonus (bonus_id, cost_month, emp_id, project_name, amount)
-                               VALUES (?, ?, ?, ?, ?) ON CONFLICT(bonus_id) DO
-                               UPDATE SET amount=excluded.amount
-                               """, (bonus_id, bonus_month, b_emp_id, b_proj_name, b_amount))
-                conn.commit()
-                st.success(f"✅ 已记录: {b_emp_id} - {b_proj_name}")
-            except Exception as e:
-                st.error(f"录入错误: {e}")
-            finally:
-                conn.close()
+    def safe_money_to_float(value):
+        """
+        金额清洗函数。
 
-    st.divider()
+        这个函数是干什么的？
+        ------------------------------------------------------------
+        Excel 里的金额可能有很多奇怪形态：
 
-    # 查询与推送
+        1. 空白
+        2. NaN
+        3. 1,000.00
+        4. " 300 "
+        5. "-"
+        6. None
+
+        这些东西如果直接 float()，很容易报错。
+        所以这里统一清洗成数字。
+
+        返回值：
+        ------------------------------------------------------------
+        能识别就返回 float。
+        不能识别就返回 0.0。
+        """
+
+        # 如果是空值，直接当 0。
+        if value is None:
+            return 0.0
+
+        # pandas 的空值要用 pd.isna 判断。
+        try:
+            if pd.isna(value):
+                return 0.0
+        except Exception:
+            pass
+
+        # 转成字符串，去掉前后空格。
+        text = str(value).strip()
+
+        # 处理各种“看起来不是金额”的内容。
+        if text in ["", "-", "—", "无", "None", "nan", "NaN"]:
+            return 0.0
+
+        # 去掉千分位逗号。
+        # 例如 "1,200.50" -> "1200.50"
+        text = text.replace(",", "")
+
+        try:
+            return float(text)
+        except Exception:
+            return 0.0
+
+
+    def clean_emp_id(value):
+        """
+        工号清洗函数。
+
+        为什么需要这个函数？
+        ------------------------------------------------------------
+        Excel 很喜欢把工号 42001943 读成 42001943.0。
+        如果不清洗，系统会找不到对应员工。
+
+        这个函数会把：
+        42001943.0 -> 42001943
+        " 42001943 " -> 42001943
+        空值 -> ""
+        """
+
+        if value is None:
+            return ""
+
+        try:
+            if pd.isna(value):
+                return ""
+        except Exception:
+            pass
+
+        text = str(value).strip()
+
+        # 处理 Excel 把整数工号读成小数的情况。
+        if text.endswith(".0"):
+            text = text[:-2]
+
+        return text
+
+
+    def load_item_mapping(conn):
+        """
+        读取项目映射表。
+
+        映射表是什么？
+        ------------------------------------------------------------
+        payroll_item_mapping 表告诉系统：
+
+        Excel 里的某一列，应该归到哪个工资字段。
+
+        例如：
+        岗位补/扣 -> position_adj
+        专项奖 -> special_bonus_total
+        清算 -> history_clearance
+        专家补贴 -> expert_allowance
+        """
+
+        mapping_df = pd.read_sql_query(
+            """
+            SELECT source_column, item_type, target_field, item_name, sign_rule, enabled, remarks
+            FROM payroll_item_mapping
+            WHERE enabled = 1
+            ORDER BY map_id ASC
+            """,
+            conn
+        )
+
+        return mapping_df
+
+
+    # ==========================================================
+    # 二、选择月份
+    # ==========================================================
+
+    item_month = st.text_input(
+        "📅 项目归属月份",
+        value=datetime.date.today().strftime("%Y-%m"),
+        help="这里填这批项目要进入哪个月工资，例如 2026-05。"
+    )
+
     conn = _get_db_connection()
-    df_list = pd.read_sql_query("""
-                                SELECT b.emp_id AS '工号', e.name AS '姓名', b.project_name AS '名目', b.amount AS '金额'
-                                FROM payroll_special_bonus b
-                                         LEFT JOIN employees e ON b.emp_id = e.emp_id
-                                WHERE b.cost_month = ?
-                                """, conn, params=[bonus_month])
 
-    if not df_list.empty:
-        st.dataframe(df_list, use_container_width=True, hide_index=True)
-        if st.button("🔄 汇总并强力推送到主账本 (Tab 3)", type="primary"):
-            cursor = conn.cursor()
-            # 改进后的 SQL：确保只更新已存在的月份记录，且汇总不为空
-            update_sql = """
-                         UPDATE payroll_monthly_records
-                         SET special_bonus_total = (SELECT SUM(amount) \
-                                                    FROM payroll_special_bonus \
-                                                    WHERE emp_id = payroll_monthly_records.emp_id \
-                                                      AND cost_month = payroll_monthly_records.cost_month)
-                         WHERE cost_month = ? \
-                         """
-            cursor.execute(update_sql, (bonus_month,))
-            conn.commit()
-            conn.close()
-            st.success("✅ 汇总成功！正在刷新数据...")
-            # 【关键】强制 Streamlit 重新运行，确保 Tab 3 看到的是最新库数据
-            st.rerun()
+    try:
+        mapping_df = load_item_mapping(conn)
+    except Exception as e:
+        st.error(f"读取项目映射表失败：{e}")
+        mapping_df = pd.DataFrame()
+
+    # ==========================================================
+    # 三、展示当前映射规则
+    # ==========================================================
+
+    with st.expander("🧭 当前项目映射规则", expanded=False):
+        if mapping_df.empty:
+            st.warning("当前没有启用的项目映射规则。请先检查 payroll_item_mapping 表。")
+        else:
+            show_map = mapping_df.rename(columns={
+                "source_column": "Excel列名",
+                "item_type": "项目类别",
+                "target_field": "汇总目标字段",
+                "item_name": "默认项目名称",
+                "sign_rule": "符号规则",
+                "remarks": "说明"
+            })
+            st.dataframe(
+                show_map[["Excel列名", "项目类别", "汇总目标字段", "默认项目名称", "说明"]],
+                use_container_width=True,
+                hide_index=True
+            )
+
+    # ==========================================================
+    # 四、下载导入模板
+    # ==========================================================
+
+    st.write("### 1️⃣ 下载项目导入模板")
+
+    if mapping_df.empty:
+        st.button("📥 下载模板", disabled=True)
     else:
-        st.caption("当前月份暂无明细。")
+        # 模板固定前几列。
+        # 工号：必须填。
+        # 姓名：不是强制，但建议保留，方便人工核对。
+        # 备注：整行备注。
+        base_cols = ["工号", "姓名"]
+
+        # 根据映射表自动生成金额列。
+        # 例如：岗位补/扣、专项奖、提成、考勤扣罚、清算、专家补贴。
+        item_cols = mapping_df["source_column"].dropna().tolist()
+
+        tail_cols = ["备注"]
+
+        template_cols = base_cols + item_cols + tail_cols
+
+        template_df = pd.DataFrame(columns=template_cols)
+
+        template_io = io.BytesIO()
+
+        with pd.ExcelWriter(template_io, engine="openpyxl") as writer:
+            template_df.to_excel(writer, index=False, sheet_name="月度项目导入模板")
+
+        st.download_button(
+            label="📥 下载月度项目导入模板",
+            data=template_io.getvalue(),
+            file_name=f"月度薪酬项目导入模板_{item_month}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+
+    # ==========================================================
+    # 五、上传并导入项目宽表
+    # ==========================================================
+
+    st.write("### 2️⃣ 上传工资项目宽表")
+
+    uploaded_items_file = st.file_uploader(
+        "上传 Excel 或 CSV",
+        type=["xlsx", "csv"],
+        key="payroll_items_upload"
+    )
+
+    overwrite_old_items = st.checkbox(
+        "导入前先作废本月已有项目流水",
+        value=False,
+        help=(
+            "如果勾选，系统会把当前月份已有的项目流水 is_active 改成 0，"
+            "再导入新数据。适合整月重新导入。"
+        )
+    )
+
+    if uploaded_items_file is not None:
+        if st.button("🚀 执行导入：宽表拆成项目流水", type="primary"):
+
+            try:
+                # ------------------------------------------------------
+                # 1. 读取上传文件
+                # ------------------------------------------------------
+                if uploaded_items_file.name.endswith(".csv"):
+                    import_df = pd.read_csv(uploaded_items_file)
+                    source_sheet_name = "CSV"
+                else:
+                    # 第一版先读取第一个 sheet。
+                    # 后续如果你要支持多个 sheet，我们再扩展。
+                    import_df = pd.read_excel(uploaded_items_file)
+                    source_sheet_name = "第一个Sheet"
+
+                if import_df.empty:
+                    st.warning("上传的表是空的，没有可导入数据。")
+                    st.stop()
+
+                # ------------------------------------------------------
+                # 2. 基础检查：必须有工号列
+                # ------------------------------------------------------
+                if "工号" not in import_df.columns:
+                    st.error("导入失败：表里必须有【工号】这一列。")
+                    st.stop()
+
+                if mapping_df.empty:
+                    st.error("导入失败：当前没有启用的项目映射规则。")
+                    st.stop()
+
+                cursor = conn.cursor()
+
+                # ------------------------------------------------------
+                # 3. 如果用户勾选覆盖，则先作废本月旧流水
+                # ------------------------------------------------------
+                if overwrite_old_items:
+                    cursor.execute(
+                        """
+                        UPDATE payroll_monthly_items
+                        SET is_active = 0
+                        WHERE cost_month = ?
+                        """,
+                        (item_month,)
+                    )
+
+                # ------------------------------------------------------
+                # 4. 生成本次导入批次号
+                # ------------------------------------------------------
+                import_batch_id = f"{item_month}_{uuid.uuid4().hex[:12]}"
+
+                success_count = 0
+                skipped_zero_count = 0
+                skipped_no_emp_count = 0
+
+                # ------------------------------------------------------
+                # 5. 逐行读取人员，逐列拆项目
+                # ------------------------------------------------------
+                for _, row in import_df.iterrows():
+
+                    emp_id = clean_emp_id(row.get("工号"))
+
+                    # 没有工号的行直接跳过。
+                    if not emp_id:
+                        skipped_no_emp_count += 1
+                        continue
+
+                    emp_name_snapshot = str(row.get("姓名", "")).strip() if "姓名" in import_df.columns else ""
+
+                    row_remarks = str(row.get("备注", "")).strip() if "备注" in import_df.columns else ""
+
+                    # 遍历映射表。
+                    # mapping_df 里每一行，代表 Excel 某一列应该怎么入账。
+                    for _, mp in mapping_df.iterrows():
+
+                        source_col = str(mp["source_column"]).strip()
+
+                        # 如果上传的 Excel 里没有这个列，就跳过。
+                        # 这样以后模板列多一点，也不会强制每张表都必须有所有列。
+                        if source_col not in import_df.columns:
+                            continue
+
+                        amount = safe_money_to_float(row.get(source_col))
+
+                        # 金额为 0 的项目不入库。
+                        # 因为工资表通常很多空格，如果 0 也入库，流水会爆炸。
+                        if amount == 0.0:
+                            skipped_zero_count += 1
+                            continue
+
+                        item_id = uuid.uuid4().hex
+
+                        item_type = str(mp["item_type"]).strip() if pd.notna(mp["item_type"]) else "其他"
+                        target_field = str(mp["target_field"]).strip() if pd.notna(mp["target_field"]) else "special_bonus_total"
+
+                        # 如果映射表里没有默认项目名，就用 Excel 列名当项目名。
+                        item_name = str(mp["item_name"]).strip() if pd.notna(mp["item_name"]) and str(mp["item_name"]).strip() else source_col
+
+                        direction = "加项" if amount > 0 else "减项"
+
+                        cursor.execute(
+                            """
+                            INSERT INTO payroll_monthly_items (
+                                item_id,
+                                cost_month,
+                                emp_id,
+                                emp_name_snapshot,
+                                item_type,
+                                item_name,
+                                amount,
+                                target_field,
+                                direction,
+                                source_column,
+                                source_sheet,
+                                source_file,
+                                import_batch_id,
+                                remarks,
+                                is_active
+                            )
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+                            """,
+                            (
+                                item_id,
+                                item_month,
+                                emp_id,
+                                emp_name_snapshot,
+                                item_type,
+                                item_name,
+                                amount,
+                                target_field,
+                                direction,
+                                source_col,
+                                source_sheet_name,
+                                uploaded_items_file.name,
+                                import_batch_id,
+                                row_remarks
+                            )
+                        )
+
+                        success_count += 1
+
+                conn.commit()
+
+                st.success(
+                    f"✅ 导入完成！成功写入 {success_count} 条项目流水。"
+                    f"跳过空金额 {skipped_zero_count} 个，跳过无工号行 {skipped_no_emp_count} 行。"
+                )
+
+                st.info(f"本次导入批次号：{import_batch_id}")
+
+            except Exception as e:
+                conn.rollback()
+                st.error(f"导入失败：{e}")
+
+    # ==========================================================
+    # 六、查看本月项目流水
+    # ==========================================================
+
+    st.write("### 3️⃣ 本月项目流水查看")
+
+    try:
+        items_df = pd.read_sql_query(
+            """
+            SELECT
+                cost_month,
+                emp_id,
+                emp_name_snapshot,
+                item_type,
+                item_name,
+                amount,
+                target_field,
+                direction,
+                source_column,
+                remarks,
+                import_batch_id
+            FROM payroll_monthly_items
+            WHERE cost_month = ?
+              AND is_active = 1
+            ORDER BY emp_id ASC, target_field ASC, item_type ASC
+            """,
+            conn,
+            params=[item_month]
+        )
+    except Exception as e:
+        st.error(f"读取项目流水失败：{e}")
+        items_df = pd.DataFrame()
+
+    if items_df.empty:
+        st.caption("当前月份暂无项目流水。")
+    else:
+        show_items = items_df.rename(columns={
+            "cost_month": "月份",
+            "emp_id": "工号",
+            "emp_name_snapshot": "姓名",
+            "item_type": "项目类别",
+            "item_name": "项目名称",
+            "amount": "金额",
+            "target_field": "汇总字段",
+            "direction": "方向",
+            "source_column": "来源列",
+            "remarks": "备注",
+            "import_batch_id": "导入批次"
+        })
+
+        st.dataframe(show_items, use_container_width=True, hide_index=True)
+
+        # 汇总展示：按项目类别汇总。
+        st.write("#### 📊 按项目类别汇总")
+        summary_by_type = (
+            show_items
+            .groupby(["项目类别", "汇总字段"], as_index=False)["金额"]
+            .sum()
+            .sort_values(["汇总字段", "项目类别"])
+        )
+
+        st.dataframe(summary_by_type, use_container_width=True, hide_index=True)
+
+    # ==========================================================
+    # 七、汇总推送到薪酬主账
+    # ==========================================================
+
+    st.write("### 4️⃣ 汇总推送到薪酬主账")
+
+    st.warning(
+        "⚠️ 推送会用项目池的汇总结果覆盖薪酬主账中的相关字段。"
+        "例如 position_adj、special_bonus_total、history_clearance 等。"
+        "如果你在第三步手工改过这些字段，推送后可能会被项目池结果覆盖。"
+    )
+
+    if st.button("🔄 将本月项目池汇总推送到薪酬主账", type="primary"):
+
+        try:
+            cursor = conn.cursor()
+
+            # ------------------------------------------------------
+            # 1. 检查本月薪酬主账是否已经生成
+            # ------------------------------------------------------
+            cursor.execute(
+                """
+                SELECT COUNT(*)
+                FROM payroll_monthly_records
+                WHERE cost_month = ?
+                """,
+                (item_month,)
+            )
+
+            main_count = cursor.fetchone()[0]
+
+            if main_count == 0:
+                st.error(
+                    "推送失败：本月薪酬主账还没有生成。"
+                    "请先到 Tab2 点击【抓取固定底薪与社保代扣】生成底表。"
+                )
+                st.stop()
+
+            # ------------------------------------------------------
+            # 2. 允许被项目池汇总覆盖的字段白名单
+            # ------------------------------------------------------
+            allowed_target_fields = [
+                "position_adj",
+                "expert_allowance",
+                "special_bonus_total",
+                "history_clearance",
+                "promotion_backpay",
+                "perf_adj"
+            ]
+
+            # ------------------------------------------------------
+            # 3. 先把这些字段清零
+            # ------------------------------------------------------
+            # 为什么要清零？
+            # ------------------------------------------------------
+            # 假设你第一次导入专项奖 1000，推送后主账是 1000。
+            # 第二次你删除了这条项目并重新导入，如果不清零，旧的 1000 可能残留。
+            for field in allowed_target_fields:
+                cursor.execute(
+                    f"""
+                    UPDATE payroll_monthly_records
+                    SET {field} = 0.0
+                    WHERE cost_month = ?
+                    """,
+                    (item_month,)
+                )
+
+            # ------------------------------------------------------
+            # 4. 按 工号 + 目标字段 汇总项目池
+            # ------------------------------------------------------
+            sum_df = pd.read_sql_query(
+                """
+                SELECT
+                    emp_id,
+                    target_field,
+                    SUM(amount) AS total_amount
+                FROM payroll_monthly_items
+                WHERE cost_month = ?
+                  AND is_active = 1
+                GROUP BY emp_id, target_field
+                """,
+                conn,
+                params=[item_month]
+            )
+
+            update_count = 0
+            skipped_field_count = 0
+
+            for _, row in sum_df.iterrows():
+
+                emp_id = clean_emp_id(row["emp_id"])
+                target_field = str(row["target_field"]).strip()
+                total_amount = safe_money_to_float(row["total_amount"])
+
+                # 防止映射表里写了奇怪字段，避免 SQL 注入或误改其他字段。
+                if target_field not in allowed_target_fields:
+                    skipped_field_count += 1
+                    continue
+
+                cursor.execute(
+                    f"""
+                    UPDATE payroll_monthly_records
+                    SET {target_field} = ?
+                    WHERE cost_month = ?
+                      AND emp_id = ?
+                    """,
+                    (total_amount, item_month, emp_id)
+                )
+
+                update_count += 1
+
+            conn.commit()
+
+            st.success(
+                f"✅ 推送完成！更新 {update_count} 条员工字段汇总。"
+                f"跳过不在白名单内的字段 {skipped_field_count} 条。"
+            )
+
+            st.info(
+                "下一步请到 Tab3 重新执行结账计算。"
+                "注意：当前 Tab3 的应发公式下一步还要继续改，"
+                "否则 position_adj、expert_allowance、perf_adj 暂时不会全部进入应发。"
+            )
+
+        except Exception as e:
+            conn.rollback()
+            st.error(f"推送失败：{e}")
+
     conn.close()
 
 # ------------------------------------------------------------------------------
