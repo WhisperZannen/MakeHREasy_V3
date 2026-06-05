@@ -1507,8 +1507,389 @@ with tab3:
 # Tab 4: 综合查询与发薪凭证
 # ------------------------------------------------------------------------------
 with tab4:
-    st.subheader("🖨️ 历史薪酬总账与发卡清单")
-    st.write("🔍 查询功能建设中：将提供1:1复刻原始报表的下载，以及银行代发清单的导出。")
+    st.subheader("📜 薪酬总账查询与 OA 上传草稿")
+    st.info(
+        "💡 这里暂时只做【查询与导出】，不会写入数据库。"
+        "当前导出的 OA 表是草稿模板，后续要根据 OA 系统真实字段继续校准。"
+    )
+
+    # ==========================================================
+    # 一、选择查询月份
+    # ==========================================================
+
+    query_month = st.text_input(
+        "📅 查询/导出月份",
+        value=calc_month,
+        key="tab4_query_month",
+        help="例如 2026-04、2026-05、2199-12。正式导出时请确认月份正确。"
+    )
+
+    conn = _get_db_connection()
+
+    # ==========================================================
+    # 二、读取薪酬主账
+    # ==========================================================
+
+    sql_ledger = """
+        SELECT
+            p.cost_month                                                AS "月份",
+            p.emp_id                                                    AS "工号",
+            e.name                                                      AS "姓名",
+            p.dept_name                                                 AS "部门",
+
+            IFNULL(p.base_salary, 0)                                    AS "岗位工资",
+            IFNULL(p.seniority_pay, 0)                                  AS "工龄工资",
+            IFNULL(p.comp_subsidy, 0)                                   AS "综合补贴",
+            IFNULL(p.telecom_subsidy, 0)                                AS "通讯补贴",
+            IFNULL(p.position_adj, 0)                                   AS "岗位补/扣",
+            IFNULL(p.expert_allowance, 0)                               AS "专家/特殊津贴",
+
+            IFNULL(p.perf_standard, 0)                                  AS "绩效标准",
+            IFNULL(p.perf_base, 0)                                      AS "激励包基数",
+            IFNULL(p.perf_pack_coef, 0)                                 AS "激励包倍数",
+            IFNULL(p.perf_kpi_score, 0)                                 AS "KPI分数",
+            IFNULL(p.perf_leader_coef, 0)                               AS "负责人系数",
+            IFNULL(p.perf_salary_calc, 0)                               AS "绩效工资",
+            IFNULL(p.perf_adj, 0)                                       AS "绩效补/扣",
+
+            IFNULL(p.promotion_backpay, 0)                              AS "晋升补发",
+            IFNULL(p.special_bonus_total, 0)                            AS "专项奖惩及提成合计",
+            IFNULL(p.history_clearance, 0)                              AS "历史清算",
+
+            IFNULL(p.ss_pension_pers, 0)                                AS "养老个人",
+            IFNULL(p.ss_medical_mix, 0)                                 AS "医疗个人含大病",
+            IFNULL(p.ss_unemp_pers, 0)                                  AS "失业个人",
+            IFNULL(p.ss_fund_pers, 0)                                   AS "公积金个人",
+            IFNULL(p.ss_annuity_pers, 0)                                AS "年金个人",
+
+            IFNULL(p.tax_deduction, 0)                                  AS "代扣个税",
+            IFNULL(p.gross_salary_total, 0)                             AS "应发工资合计",
+            IFNULL(p.net_salary, 0)                                     AS "实发工资",
+
+            IFNULL(p.audit_status, '草稿')                              AS "状态",
+            IFNULL(p.oa_clearing_no, '')                                AS "OA清册编号",
+            p.update_time                                               AS "更新时间"
+
+        FROM payroll_monthly_records p
+                 JOIN employees e ON p.emp_id = e.emp_id
+        WHERE p.cost_month = ?
+        ORDER BY p.dept_name ASC, p.emp_id ASC
+    """
+
+    payroll_df = pd.read_sql_query(sql_ledger, conn, params=[query_month])
+
+    if payroll_df.empty:
+        st.warning("⚠️ 当前月份没有薪酬主账。请先到 Tab2 生成底表，并到 Tab3 计算应发/实发。")
+        conn.close()
+
+    else:
+        # ==========================================================
+        # 三、页面复核计算
+        # ==========================================================
+
+        # 五险两金个人合计：这是个人社保/公积金/年金代扣，不是“五项扣除”。
+        payroll_df["五险两金个人合计"] = (
+            payroll_df["养老个人"]
+            + payroll_df["医疗个人含大病"]
+            + payroll_df["失业个人"]
+            + payroll_df["公积金个人"]
+            + payroll_df["年金个人"]
+        ).round(2)
+
+        payroll_df["页面复核_应发"] = (
+            payroll_df["岗位工资"]
+            + payroll_df["工龄工资"]
+            + payroll_df["综合补贴"]
+            + payroll_df["通讯补贴"]
+            + payroll_df["岗位补/扣"]
+            + payroll_df["专家/特殊津贴"]
+            + payroll_df["绩效工资"]
+            + payroll_df["绩效补/扣"]
+            + payroll_df["晋升补发"]
+            + payroll_df["专项奖惩及提成合计"]
+            + payroll_df["历史清算"]
+        ).round(2)
+
+        payroll_df["页面复核_实发"] = (
+            payroll_df["页面复核_应发"]
+            - payroll_df["五险两金个人合计"]
+            - payroll_df["代扣个税"]
+        ).round(2)
+
+        payroll_df["应发差异"] = (
+            payroll_df["页面复核_应发"]
+            - payroll_df["应发工资合计"]
+        ).round(2)
+
+        payroll_df["实发差异"] = (
+            payroll_df["页面复核_实发"]
+            - payroll_df["实发工资"]
+        ).round(2)
+
+        # ==========================================================
+        # 四、顶部汇总指标
+        # ==========================================================
+
+        m1, m2, m3, m4, m5 = st.columns(5)
+
+        m1.metric("薪酬人数", f"{len(payroll_df)} 人")
+        m2.metric("应发合计", f"{payroll_df['应发工资合计'].sum():,.2f}")
+        m3.metric("五险两金个人合计", f"{payroll_df['五险两金个人合计'].sum():,.2f}")
+        m4.metric("个税合计", f"{payroll_df['代扣个税'].sum():,.2f}")
+        m5.metric("实发合计", f"{payroll_df['实发工资'].sum():,.2f}")
+
+        # ==========================================================
+        # 五、数据质量检查
+        # ==========================================================
+
+        st.write("### 1️⃣ 数据质量检查")
+
+        gross_diff_count = (payroll_df["应发差异"].abs() > 0.01).sum()
+        net_diff_count = (payroll_df["实发差异"].abs() > 0.01).sum()
+        zero_gross_count = (payroll_df["应发工资合计"].fillna(0) == 0).sum()
+        zero_net_count = (payroll_df["实发工资"].fillna(0) == 0).sum()
+        zero_perf_count = (payroll_df["绩效工资"].fillna(0) == 0).sum()
+        zero_tax_count = (payroll_df["代扣个税"].fillna(0) == 0).sum()
+
+        check_df = pd.DataFrame([
+            {
+                "检查项": "应发公式差异",
+                "异常数量": int(gross_diff_count),
+                "说明": "页面复核应发 与 数据库应发不一致。通常说明 Tab3 公式改过后还没重新结账。"
+            },
+            {
+                "检查项": "实发公式差异",
+                "异常数量": int(net_diff_count),
+                "说明": "页面复核实发 与 数据库实发不一致。通常说明个税导入后还没重新结账。"
+            },
+            {
+                "检查项": "应发为0",
+                "异常数量": int(zero_gross_count),
+                "说明": "正式月份一般不应出现应发为0。测试月份或特殊人员除外。"
+            },
+            {
+                "检查项": "实发为0",
+                "异常数量": int(zero_net_count),
+                "说明": "正式月份一般不应出现实发为0。测试月份或特殊人员除外。"
+            },
+            {
+                "检查项": "绩效工资为0",
+                "异常数量": int(zero_perf_count),
+                "说明": "可能是未在 Tab2 计算绩效，也可能是绩效规则缺失。领导层或特殊人员需单独判断。"
+            },
+            {
+                "检查项": "个税为0",
+                "异常数量": int(zero_tax_count),
+                "说明": "可能是财务尚未回传个税，也可能确实无需缴税。正式发薪前需要确认。"
+            },
+        ])
+
+        st.dataframe(check_df, use_container_width=True, hide_index=True)
+
+        if gross_diff_count > 0 or net_diff_count > 0:
+            st.warning(
+                "⚠️ 检查到应发/实发存在公式差异。"
+                "建议回到 Tab3 点击【重新计算薪酬草稿应发/实发】，再回到 Tab4 导出。"
+            )
+        else:
+            st.success("✅ 当前数据库应发/实发与页面复核公式一致。")
+
+        # ==========================================================
+        # 六、筛选查看
+        # ==========================================================
+
+        st.write("### 2️⃣ 薪酬总账明细查看")
+
+        dept_options = ["全部"] + sorted(payroll_df["部门"].dropna().unique().tolist())
+
+        c_filter_1, c_filter_2 = st.columns([1, 2])
+
+        with c_filter_1:
+            dept_filter = st.selectbox("部门筛选", dept_options, key="tab4_dept_filter")
+
+        with c_filter_2:
+            keyword = st.text_input(
+                "姓名/工号搜索",
+                value="",
+                key="tab4_keyword",
+                help="可以输入姓名的一部分，或者工号的一部分。"
+            )
+
+        show_df = payroll_df.copy()
+
+        if dept_filter != "全部":
+            show_df = show_df[show_df["部门"] == dept_filter]
+
+        if keyword.strip():
+            kw = keyword.strip()
+            show_df = show_df[
+                show_df["姓名"].astype(str).str.contains(kw, na=False)
+                | show_df["工号"].astype(str).str.contains(kw, na=False)
+            ]
+
+        display_cols = [
+            "月份",
+            "工号",
+            "姓名",
+            "部门",
+            "岗位工资",
+            "岗位补/扣",
+            "专家/特殊津贴",
+            "绩效工资",
+            "绩效补/扣",
+            "晋升补发",
+            "专项奖惩及提成合计",
+            "历史清算",
+            "应发工资合计",
+            "五险两金个人合计",
+            "代扣个税",
+            "实发工资",
+            "应发差异",
+            "实发差异",
+            "状态"
+        ]
+
+        st.dataframe(
+            show_df[display_cols],
+            use_container_width=True,
+            hide_index=True
+        )
+
+        # ==========================================================
+        # 七、部门汇总
+        # ==========================================================
+
+        st.write("### 3️⃣ 部门汇总")
+
+        dept_summary_df = (
+            payroll_df
+            .groupby("部门", as_index=False)
+            .agg({
+                "工号": "count",
+                "岗位工资": "sum",
+                "绩效工资": "sum",
+                "专项奖惩及提成合计": "sum",
+                "历史清算": "sum",
+                "应发工资合计": "sum",
+                "五险两金个人合计": "sum",
+                "代扣个税": "sum",
+                "实发工资": "sum"
+            })
+            .rename(columns={"工号": "人数"})
+        )
+
+        st.dataframe(dept_summary_df, use_container_width=True, hide_index=True)
+
+        # ==========================================================
+        # 八、导出 Excel
+        # ==========================================================
+
+        st.write("### 4️⃣ 导出薪酬结果")
+
+        st.warning(
+            "⚠️ 当前导出的 OA 表是【草稿】。"
+            "因为还没有按照 OA 系统真实模板字段做最终映射，正式上传前必须人工核对列名、顺序和金额。"
+        )
+
+        export_scope = st.radio(
+            "导出范围",
+            ["导出当前筛选结果", "导出本月全部人员"],
+            horizontal=True,
+            key="tab4_export_scope"
+        )
+
+        if export_scope == "导出当前筛选结果":
+            export_base_df = show_df.copy()
+        else:
+            export_base_df = payroll_df.copy()
+
+        # ------------------------------
+        # 1. 薪酬总账明细
+        # ------------------------------
+        payroll_ledger_export_df = export_base_df.copy()
+
+        # ------------------------------
+        # 2. OA 薪酬上传草稿
+        # ------------------------------
+        oa_salary_df = export_base_df[[
+            "工号",
+            "姓名",
+            "部门",
+            "岗位工资",
+            "工龄工资",
+            "综合补贴",
+            "通讯补贴",
+            "岗位补/扣",
+            "专家/特殊津贴",
+            "绩效工资",
+            "绩效补/扣",
+            "晋升补发",
+            "专项奖惩及提成合计",
+            "历史清算",
+            "应发工资合计",
+            "代扣个税",
+            "实发工资"
+        ]].copy()
+
+        oa_salary_df["备注"] = "OA薪酬上传草稿，正式模板待校准"
+
+        # ------------------------------
+        # 3. OA 五项扣除上传草稿
+        # ------------------------------
+        # 注意：
+        # 这里的“五项扣除”不是社保扣款。
+        # 这是个人所得税专项附加扣除类信息：
+        # 赡养老人、住房租金、住房贷款利息、继续教育、子女教育。
+        #
+        # 目前系统没有保存每个人的五项扣除金额，
+        # 所以第一版先导出人员名单和空模板，后续再做导入/维护。
+        oa_tax_deduct_df = export_base_df[[
+            "工号",
+            "姓名",
+            "部门"
+        ]].copy()
+
+        oa_tax_deduct_df["赡养老人"] = 0.0
+        oa_tax_deduct_df["住房租金"] = 0.0
+        oa_tax_deduct_df["住房贷款利息"] = 0.0
+        oa_tax_deduct_df["继续教育"] = 0.0
+        oa_tax_deduct_df["子女教育"] = 0.0
+
+        oa_tax_deduct_df["专项附加扣除合计"] = (
+            oa_tax_deduct_df["赡养老人"]
+            + oa_tax_deduct_df["住房租金"]
+            + oa_tax_deduct_df["住房贷款利息"]
+            + oa_tax_deduct_df["继续教育"]
+            + oa_tax_deduct_df["子女教育"]
+        ).round(2)
+
+        oa_tax_deduct_df["备注"] = "OA五项扣除上传草稿，金额需按财务/税务回传数据填写"
+
+        # ------------------------------
+        # 4. 数据检查结果
+        # ------------------------------
+        check_export_df = check_df.copy()
+
+        # ------------------------------
+        # 5. 写入同一个 Excel 文件
+        # ------------------------------
+        export_io = io.BytesIO()
+
+        with pd.ExcelWriter(export_io, engine="openpyxl") as writer:
+            payroll_ledger_export_df.to_excel(writer, index=False, sheet_name="薪酬总账明细")
+            dept_summary_df.to_excel(writer, index=False, sheet_name="部门汇总")
+            oa_salary_df.to_excel(writer, index=False, sheet_name="OA薪酬上传草稿")
+            oa_tax_deduct_df.to_excel(writer, index=False, sheet_name="OA五项扣除草稿")
+            check_export_df.to_excel(writer, index=False, sheet_name="数据检查")
+
+        st.download_button(
+            label="📥 下载本月薪酬查询与 OA 上传草稿包",
+            data=export_io.getvalue(),
+            file_name=f"{query_month}_薪酬查询与OA上传草稿包.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+
+        conn.close()
 
 # ------------------------------------------------------------------------------
 # Tab 5: 全局参数与薪酬字典
