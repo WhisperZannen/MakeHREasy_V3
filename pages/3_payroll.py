@@ -19,9 +19,9 @@ st.title("💸 薪酬核算与多平台分发中心")
 st.caption("🔒 核心流向：参数字典维护 ➡️ 抓取社保与算力底表 ➡️ 个税回灌与最终结算 ➡️ 台账封账")
 
 tab1, tab2, tab3, tab4, tab5 = st.tabs([
-    "📂 第一步：专项奖池与动态预埋",
+    "📂 第一步：月度项目池导入",
     "🧮 第二步：生成底表与绩效算力",
-    "📥 第三步：清算、扣税与最终结账",
+    "📥 第三步：扣税与草稿结账",
     "📜 综合查询与发薪凭证",
     "⚙️ 全局参数与薪酬字典 (总阀门)"
 ])
@@ -953,77 +953,218 @@ with tab2:
 # Tab 3: 财务个税回灌与结算
 # ------------------------------------------------------------------------------
 with tab3:
-    st.subheader("🏦 三/四期工程：手工调账、个税回灌与结账封盘")
-    st.info("💡 系统将自动合并各项收入与扣款，并在扣除个税后形成打款实发数！")
+    st.subheader("🏦 财务个税回灌与薪酬草稿结账")
+    st.info(
+        "💡 这里不是正式封账，只是把岗位工资、岗位补/扣、专家调整、绩效、绩效补/扣、专项奖惩、清算、个税等合并，"
+        "生成一版可用于核对、送财务算税、后续导出 OA 的薪酬草稿。"
+    )
+
+    # ==========================================================
+    # 一、选择结账月份
+    # ==========================================================
+
+    # 这里单独设置一个月份输入框，不再完全依赖 Tab2 里的 calc_month。
+    # 原因：
+    # Streamlit 虽然同一个脚本里变量能互相读到，
+    # 但用户体验上，Tab3 自己有月份会更稳。
+    final_month = st.text_input(
+        "📅 结账月份",
+        value=calc_month,
+        help="这里要和 Tab2 生成底表的月份一致，例如 2026-04。"
+    )
 
     conn = _get_db_connection()
-    # 终极 SQL 语法净化：绝不混入任何注释(--)和奇怪符号
+
+    # ==========================================================
+    # 二、读取薪酬主账草稿
+    # ==========================================================
+
+    # 这段 SQL 负责把 payroll_monthly_records 里的关键工资字段取出来。
+    #
+    # 注意：
+    # 1. 岗位补/扣 position_adj 是固定工资差额，不属于专项奖。
+    # 2. 专家调整 expert_allowance 可以为正，也可以为负。
+    # 3. 绩效补/扣 perf_adj 是绩效口径的补扣。
+    # 4. special_bonus_total 用来承接专项奖、提成、考勤扣罚等合计，可正可负。
+    # 5. history_clearance 用来承接历史清算、绩效清算等。
     sql_final = """
-                SELECT p.emp_id                                                   AS "工号", \
-                       e.name                                                     AS "姓名", \
-                       p.base_salary                                              AS "底薪", \
-                       IFNULL(p.perf_salary_calc, 0)                              AS "已算绩效", \
-                       IFNULL(p.history_clearance, 0)                             AS "历史清算", \
-                       IFNULL(p.promotion_backpay, 0)                             AS "晋升补发", \
-                       IFNULL(p.special_bonus_total, 0)                           AS "专项奖合计", \
-                       (IFNULL(p.ss_pension_pers, 0) + IFNULL(p.ss_medical_mix, 0) + IFNULL(p.ss_unemp_pers, 0) + \
-                        IFNULL(p.ss_fund_pers, 0) + IFNULL(p.ss_annuity_pers, 0)) AS "五险两金代扣", \
-                       IFNULL(p.tax_deduction, 0)                                 AS "代扣个税", \
-                       p.gross_salary_total                                       AS "系统算_应发总计", \
-                       p.net_salary                                               AS "系统算_最终实发"
-                FROM payroll_monthly_records p
-                         JOIN employees e ON p.emp_id = e.emp_id
-                WHERE p.cost_month = ? \
-                """
-    df_final = pd.read_sql_query(sql_final, conn, params=[calc_month])
+        SELECT
+            p.emp_id                                                   AS "工号",
+            e.name                                                     AS "姓名",
+            p.dept_name                                                AS "部门",
 
-    if not df_final.empty:
-        # 在 Python 层面安全重命名，防爆引擎
-        df_final.rename(columns={
-            "历史清算": "历史清算(填负数)",
-            "代扣个税": "代扣个税(录入)"
-        }, inplace=True)
+            IFNULL(p.base_salary, 0)                                   AS "岗位工资",
+            IFNULL(p.seniority_pay, 0)                                 AS "工龄工资",
+            IFNULL(p.comp_subsidy, 0)                                  AS "综合补贴",
+            IFNULL(p.telecom_subsidy, 0)                               AS "通讯补贴",
+            IFNULL(p.position_adj, 0)                                  AS "岗位补/扣",
+            IFNULL(p.expert_allowance, 0)                              AS "专家/特殊津贴",
 
-        st.write("👉 **手工补调与个税录入区 (修改数字后按回车保存)**")
+            IFNULL(p.perf_salary_calc, 0)                              AS "已算绩效",
+            IFNULL(p.perf_adj, 0)                                      AS "绩效补/扣",
+
+            IFNULL(p.promotion_backpay, 0)                             AS "晋升补发",
+            IFNULL(p.special_bonus_total, 0)                           AS "专项奖惩及提成合计",
+            IFNULL(p.history_clearance, 0)                             AS "历史清算",
+
+            (IFNULL(p.ss_pension_pers, 0)
+             + IFNULL(p.ss_medical_mix, 0)
+             + IFNULL(p.ss_unemp_pers, 0)
+             + IFNULL(p.ss_fund_pers, 0)
+             + IFNULL(p.ss_annuity_pers, 0))                           AS "五险两金代扣",
+
+            IFNULL(p.tax_deduction, 0)                                 AS "代扣个税",
+            IFNULL(p.gross_salary_total, 0)                            AS "系统算_应发总计",
+            IFNULL(p.net_salary, 0)                                    AS "系统算_最终实发"
+
+        FROM payroll_monthly_records p
+                 JOIN employees e ON p.emp_id = e.emp_id
+        WHERE p.cost_month = ?
+        ORDER BY p.dept_name ASC, p.emp_id ASC
+    """
+
+    df_final = pd.read_sql_query(sql_final, conn, params=[final_month])
+
+    if df_final.empty:
+        st.warning("⚠️ 当前月份没有薪酬主账。请先到 Tab2 生成底表。")
+        conn.close()
+    else:
+        # ==========================================================
+        # 三、页面编辑区
+        # ==========================================================
+
+        st.write("👉 **手工调整与个税录入区**")
+        st.caption(
+            "这里可以人工改：岗位补/扣、专家/特殊津贴、绩效补/扣、晋升补发、专项奖惩及提成、历史清算、个税。"
+            "底薪、已算绩效、五险两金代扣暂时锁定，避免误改。"
+        )
+
         edited_final = st.data_editor(
             df_final,
             column_config={
-                "历史清算(填负数)": st.column_config.NumberColumn(format="%.2f"),
+                "岗位补/扣": st.column_config.NumberColumn(format="%.2f"),
+                "专家/特殊津贴": st.column_config.NumberColumn(format="%.2f"),
+                "绩效补/扣": st.column_config.NumberColumn(format="%.2f"),
                 "晋升补发": st.column_config.NumberColumn(format="%.2f"),
-                "专项奖合计": st.column_config.NumberColumn(format="%.2f"),
-                "代扣个税(录入)": st.column_config.NumberColumn(format="%.2f"),
+                "专项奖惩及提成合计": st.column_config.NumberColumn(format="%.2f"),
+                "历史清算": st.column_config.NumberColumn(format="%.2f"),
+                "代扣个税": st.column_config.NumberColumn(format="%.2f"),
             },
-            disabled=["工号", "姓名", "底薪", "已算绩效", "五险两金代扣", "系统算_应发总计", "系统算_最终实发"],
-            use_container_width=True, hide_index=True
+            disabled=[
+                "工号",
+                "姓名",
+                "部门",
+                "岗位工资",
+                "工龄工资",
+                "综合补贴",
+                "通讯补贴",
+                "已算绩效",
+                "五险两金代扣",
+                "系统算_应发总计",
+                "系统算_最终实发"
+            ],
+            use_container_width=True,
+            hide_index=True
         )
 
-        if st.button("🔥 终极大结账！生成实发工资！", type="primary"):
-            cursor = conn.cursor()
-            for _, row in edited_final.iterrows():
-                gross = (row['底薪'] + row['已算绩效'] + row['晋升补发'] + row['专项奖合计'] + row['历史清算(填负数)'])
-                net = gross - row['五险两金代扣'] - row['代扣个税(录入)']
+        # ==========================================================
+        # 四、执行草稿结账
+        # ==========================================================
 
-                cursor.execute("""
-                               UPDATE payroll_monthly_records
-                               SET history_clearance   = ?,
-                                   promotion_backpay   = ?,
-                                   special_bonus_total = ?,
-                                   tax_deduction       = ?,
-                                   gross_salary_total  = ?,
-                                   net_salary          = ?
-                               WHERE cost_month = ?
-                                 AND emp_id = ?
-                               """, (
-                                   row['历史清算(填负数)'], row['晋升补发'], row['专项奖合计'], row['代扣个税(录入)'],
-                                   round(gross, 2), round(net, 2),
-                                   calc_month, row['工号']
-                               ))
+        if st.button("🧮 重新计算薪酬草稿应发/实发", type="primary"):
+            cursor = conn.cursor()
+
+            update_count = 0
+
+            for _, row in edited_final.iterrows():
+
+                # --------------------------------------------------
+                # 1. 计算应发工资
+                # --------------------------------------------------
+                # 当前第一版草稿公式：
+                #
+                # 应发 =
+                # 岗位工资
+                # + 工龄工资
+                # + 综合补贴
+                # + 通讯补贴
+                # + 岗位补/扣
+                # + 专家/特殊津贴
+                # + 已算绩效
+                # + 绩效补/扣
+                # + 晋升补发
+                # + 专项奖惩及提成合计
+                # + 历史清算
+                #
+                # 注意：
+                # 专项奖惩及提成合计可能为负数，因为里面可能包含考勤扣罚。
+                # 专家/特殊津贴也可能为负数，因为专家待遇调整可能是负数。
+                gross = (
+                    float(row["岗位工资"] or 0)
+                    + float(row["工龄工资"] or 0)
+                    + float(row["综合补贴"] or 0)
+                    + float(row["通讯补贴"] or 0)
+                    + float(row["岗位补/扣"] or 0)
+                    + float(row["专家/特殊津贴"] or 0)
+                    + float(row["已算绩效"] or 0)
+                    + float(row["绩效补/扣"] or 0)
+                    + float(row["晋升补发"] or 0)
+                    + float(row["专项奖惩及提成合计"] or 0)
+                    + float(row["历史清算"] or 0)
+                )
+
+                # --------------------------------------------------
+                # 2. 计算实发工资
+                # --------------------------------------------------
+                # 实发 =
+                # 应发 - 五险两金个人代扣 - 代扣个税
+                net = (
+                    gross
+                    - float(row["五险两金代扣"] or 0)
+                    - float(row["代扣个税"] or 0)
+                )
+
+                # --------------------------------------------------
+                # 3. 写回薪酬主账
+                # --------------------------------------------------
+                cursor.execute(
+                    """
+                    UPDATE payroll_monthly_records
+                    SET position_adj        = ?,
+                        expert_allowance    = ?,
+                        perf_adj            = ?,
+                        promotion_backpay   = ?,
+                        special_bonus_total = ?,
+                        history_clearance   = ?,
+                        tax_deduction       = ?,
+                        gross_salary_total  = ?,
+                        net_salary          = ?
+                    WHERE cost_month = ?
+                      AND emp_id = ?
+                    """,
+                    (
+                        float(row["岗位补/扣"] or 0),
+                        float(row["专家/特殊津贴"] or 0),
+                        float(row["绩效补/扣"] or 0),
+                        float(row["晋升补发"] or 0),
+                        float(row["专项奖惩及提成合计"] or 0),
+                        float(row["历史清算"] or 0),
+                        float(row["代扣个税"] or 0),
+                        round(gross, 2),
+                        round(net, 2),
+                        final_month,
+                        row["工号"]
+                    )
+                )
+
+                update_count += 1
+
             conn.commit()
-            st.success("✅ 全员结账完毕！所有应发、代扣、实发数字已彻底封印入库，随时可推送台账。")
+
+            st.success(f"✅ 草稿结账完成！已重新计算 {update_count} 人的应发与实发。")
             st.rerun()
-    else:
-        st.warning("⚠️ 请先在 Tab 2 中生成底表。")
-    conn.close()
+
+        conn.close()
 
 # ------------------------------------------------------------------------------
 # Tab 4: 综合查询与发薪凭证
