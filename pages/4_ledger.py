@@ -80,6 +80,154 @@ def format_excel_sheet(worksheet, df_columns):
                     cell.font = Font(bold=True)
 
 # ==============================================================================
+# 人工成本台账部门归属刷新工具
+# ==============================================================================
+def build_effective_dept_snapshot(conn, target_month):
+    """
+    根据人员模块和人员变动流水，计算某个月每个人“应当归属”的部门。
+
+    这个函数是干什么的？
+    ------------------------------------------------------------
+    它不是算钱的，也不会改人工成本金额。
+    它只负责回答一个问题：
+
+    某个人在 target_month 这个月，人工成本应该归属哪个部门？
+
+    核心业务规则：
+    ------------------------------------------------------------
+    以每月 15 日为切片点。
+
+    1. 如果员工在当月 15 日及以前调动：
+       当月人工成本归新部门。
+
+       例如：
+       A 员工 2026-05-05 从研一调到研二。
+       因为 5月5日 <= 5月15日，
+       所以 2026-05 的人工成本归研二。
+
+    2. 如果员工在当月 15 日之后调动：
+       当月人工成本仍归原部门。
+
+       例如：
+       B 员工 2026-05-20 从研一调到研二。
+       因为 5月20日 > 5月15日，
+       所以 2026-05 的人工成本仍归研一。
+
+    为什么要从“当前人员表”往回推？
+    ------------------------------------------------------------
+    因为 employees 表保存的是员工当前最新部门。
+    如果我们要算历史月份，就需要根据 personnel_changes 里的调动记录，
+    把目标月 15 日之后发生的调动“倒回去”。
+
+    参数说明：
+    ------------------------------------------------------------
+    conn:
+        SQLite 数据库连接。
+
+    target_month:
+        目标月份，格式必须是 YYYY-MM，例如 2026-05。
+
+    返回值：
+    ------------------------------------------------------------
+    返回一个字典：
+    {
+        "工号": "应归属部门名称"
+    }
+    """
+
+    # ----------------------------------------------------------
+    # 一、读取部门字典
+    # ----------------------------------------------------------
+    # departments 表里保存 dept_id 和 dept_name。
+    # 后面我们会先算出每个人应归属的 dept_id，
+    # 再通过这个字典翻译成部门名称。
+    dept_df = pd.read_sql_query(
+        "SELECT dept_id, dept_name FROM departments",
+        conn
+    )
+
+    dept_name_by_id = dict(zip(dept_df["dept_id"], dept_df["dept_name"]))
+
+    # ----------------------------------------------------------
+    # 二、读取当前人员表
+    # ----------------------------------------------------------
+    # employees 表里的 dept_id 是“当前最新部门”。
+    # 注意：这不是历史部门。
+    # 但我们可以以它为起点，再通过 personnel_changes 往回倒推。
+    emp_df = pd.read_sql_query(
+        """
+        SELECT emp_id, name, dept_id, status
+        FROM employees
+        """,
+        conn
+    )
+
+    # effective_dept_id_by_emp 初始值 = 员工当前部门。
+    # 后面如果发现目标月 15 日之后还有调动，就逐步回滚到旧部门。
+    effective_dept_id_by_emp = dict(zip(emp_df["emp_id"], emp_df["dept_id"]))
+
+    # ----------------------------------------------------------
+    # 三、设置目标月 15 日切片点
+    # ----------------------------------------------------------
+    # 例：
+    # target_month = 2026-05
+    # target_deadline = 2026-05-15 23:59:59
+    target_deadline = f"{target_month}-15 23:59:59"
+
+    # ----------------------------------------------------------
+    # 四、读取所有发生在切片点之后的部门调动
+    # ----------------------------------------------------------
+    # 为什么只读取 change_date > target_deadline？
+    # ----------------------------------------------------------
+    # 因为 15 日之后的调动，当月仍然应该算旧部门。
+    # 所以我们要把这些调动回滚掉。
+    #
+    # 为什么 ORDER BY change_date DESC？
+    # ----------------------------------------------------------
+    # 如果一个人后续发生多次调动，要从最新调动一层一层往回倒。
+    # 比如：
+    # 5月20日：A -> B
+    # 6月10日：B -> C
+    # 当前表是 C
+    # 要算 5月15日状态，就要先 C 回到 B，再 B 回到 A。
+    rollback_df = pd.read_sql_query(
+        """
+        SELECT emp_id, old_dept_id, new_dept_id, change_date
+        FROM personnel_changes
+        WHERE change_date > ?
+          AND old_dept_id IS NOT NULL
+          AND new_dept_id IS NOT NULL
+        ORDER BY change_date DESC
+        """,
+        conn,
+        params=[target_deadline]
+    )
+
+    # ----------------------------------------------------------
+    # 五、逐条回滚 15 日之后的调动
+    # ----------------------------------------------------------
+    for _, rb_row in rollback_df.iterrows():
+        emp_id = str(rb_row["emp_id"]).strip()
+        old_dept_id = rb_row["old_dept_id"]
+
+        # 如果这个员工还在人员表里，就把他的有效部门回滚到 old_dept_id。
+        if emp_id in effective_dept_id_by_emp:
+            effective_dept_id_by_emp[emp_id] = old_dept_id
+
+    # ----------------------------------------------------------
+    # 六、把 dept_id 翻译成 dept_name
+    # ----------------------------------------------------------
+    effective_dept_name_by_emp = {}
+
+    for emp_id, dept_id in effective_dept_id_by_emp.items():
+        effective_dept_name_by_emp[str(emp_id).strip()] = dept_name_by_id.get(
+            dept_id,
+            "未分配部门"
+        )
+
+    return effective_dept_name_by_emp
+
+# ==============================================================================
 # 页面主框架
 # ==============================================================================
 st.title("💰 人工成本台账管理中心")
@@ -400,6 +548,175 @@ with tab2:
 # ------------------------------------------------------------------------------
 with tab3:
     st.subheader("📥 历史财务数据导入引擎")
+
+    # ==========================================================
+    # 小工具：刷新已导入台账的部门归属
+    # ==========================================================
+    st.write("### 🧭 小工具：按人员变动刷新已导入台账部门归属")
+
+    st.info(
+        "这个工具只刷新 labor_cost_ledger 里的【归属部门】，不会改任何金额。"
+        "适用于你已经导入人工成本后，才发现人员调动日期漏维护或维护晚了的情况。"
+    )
+
+    conn_refresh = _get_db_connection()
+
+    try:
+        refresh_months = pd.read_sql_query(
+            """
+            SELECT DISTINCT cost_month
+            FROM labor_cost_ledger
+            ORDER BY cost_month DESC
+            """,
+            conn_refresh
+        )["cost_month"].tolist()
+    except Exception:
+        refresh_months = []
+
+    if not refresh_months:
+        st.caption("当前人工成本台账暂无月份数据，无法刷新部门归属。")
+        conn_refresh.close()
+    else:
+        refresh_col_1, refresh_col_2 = st.columns([1, 2])
+
+        with refresh_col_1:
+            refresh_month = st.selectbox(
+                "选择要刷新的人工成本月份",
+                refresh_months,
+                key="ledger_refresh_month"
+            )
+
+        with refresh_col_2:
+            st.warning(
+                "执行前请确认：你已经在人员模块补录了正确的调动记录，"
+                "并且已经备份数据库。刷新后会直接更新该月份 labor_cost_ledger.dept_name。"
+            )
+
+        # ------------------------------------------------------
+        # 生成刷新预览
+        # ------------------------------------------------------
+        if st.button("🔍 预览该月份需要调整的部门归属", type="secondary"):
+            try:
+                effective_dept_map = build_effective_dept_snapshot(
+                    conn_refresh,
+                    refresh_month
+                )
+
+                ledger_df = pd.read_sql_query(
+                    """
+                    SELECT
+                        record_id,
+                        cost_month,
+                        emp_id,
+                        emp_name,
+                        dept_name,
+                        emp_status,
+                        total_labor_cost
+                    FROM labor_cost_ledger
+                    WHERE cost_month = ?
+                    ORDER BY dept_name ASC, emp_id ASC
+                    """,
+                    conn_refresh,
+                    params=[refresh_month]
+                )
+
+                if ledger_df.empty:
+                    st.warning("当前月份没有人工成本台账数据。")
+                else:
+                    preview_rows = []
+
+                    for _, row in ledger_df.iterrows():
+                        emp_id = str(row["emp_id"]).replace(".0", "").strip()
+                        old_dept_name = str(row["dept_name"]).strip()
+                        new_dept_name = effective_dept_map.get(emp_id, old_dept_name)
+
+                        if old_dept_name != new_dept_name:
+                            preview_rows.append({
+                                "流水ID": row["record_id"],
+                                "核算月份": row["cost_month"],
+                                "工号": emp_id,
+                                "姓名": row["emp_name"],
+                                "当前台账部门": old_dept_name,
+                                "应调整为部门": new_dept_name,
+                                "人员状态": row["emp_status"],
+                                "人工成本合计": row["total_labor_cost"],
+                            })
+
+                    if not preview_rows:
+                        st.success("✅ 预览完成：当前月份没有发现需要调整部门归属的台账记录。")
+                    else:
+                        preview_df = pd.DataFrame(preview_rows)
+
+                        # 把预览结果暂存到 session_state。
+                        # 这样用户看完预览后，再点执行按钮，系统知道要更新哪些 record_id。
+                        st.session_state["ledger_dept_refresh_preview"] = preview_df
+                        st.session_state["ledger_dept_refresh_month"] = refresh_month
+
+                        st.warning(f"⚠️ 预览发现 {len(preview_df)} 条台账记录需要刷新部门归属。")
+                        st.dataframe(preview_df, use_container_width=True, hide_index=True)
+
+            except Exception as e:
+                st.error(f"预览失败：{e}")
+
+        # ------------------------------------------------------
+        # 执行刷新
+        # ------------------------------------------------------
+        if (
+            "ledger_dept_refresh_preview" in st.session_state
+            and "ledger_dept_refresh_month" in st.session_state
+            and st.session_state["ledger_dept_refresh_month"] == refresh_month
+        ):
+            st.write("#### 待执行的部门归属调整")
+            st.dataframe(
+                st.session_state["ledger_dept_refresh_preview"],
+                use_container_width=True,
+                hide_index=True
+            )
+
+            confirm_refresh = st.checkbox(
+                "我确认已经备份数据库，并确认执行上述部门归属刷新",
+                key="confirm_ledger_dept_refresh"
+            )
+
+            if st.button("✅ 执行刷新部门归属", type="primary", disabled=not confirm_refresh):
+                try:
+                    cursor = conn_refresh.cursor()
+                    preview_df = st.session_state["ledger_dept_refresh_preview"]
+
+                    update_count = 0
+
+                    for _, row in preview_df.iterrows():
+                        cursor.execute(
+                            """
+                            UPDATE labor_cost_ledger
+                            SET dept_name = ?
+                            WHERE record_id = ?
+                            """,
+                            (
+                                row["应调整为部门"],
+                                int(row["流水ID"])
+                            )
+                        )
+                        update_count += 1
+
+                    conn_refresh.commit()
+
+                    st.success(
+                        f"✅ 部门归属刷新完成！已更新 {update_count} 条人工成本台账记录。"
+                        "本次只修改归属部门，没有修改任何金额。"
+                    )
+
+                    # 清除预览缓存，防止重复执行。
+                    del st.session_state["ledger_dept_refresh_preview"]
+                    del st.session_state["ledger_dept_refresh_month"]
+
+                except Exception as e:
+                    conn_refresh.rollback()
+                    st.error(f"执行刷新失败：{e}")
+
+        conn_refresh.close()
+
+    st.divider()
 
     tc1, tc2 = st.columns(2)
     with tc1:
