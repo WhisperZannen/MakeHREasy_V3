@@ -652,8 +652,10 @@ with tab3:
                         st.session_state["ledger_dept_refresh_preview"] = preview_df
                         st.session_state["ledger_dept_refresh_month"] = refresh_month
 
-                        st.warning(f"⚠️ 预览发现 {len(preview_df)} 条台账记录需要刷新部门归属。")
-                        st.dataframe(preview_df, use_container_width=True, hide_index=True)
+                        st.warning(
+                            f"⚠️ 预览发现 {len(preview_df)} 条台账记录需要刷新部门归属。"
+                            "请在下方【待执行的部门归属调整】区域核对明细。"
+                        )
 
             except Exception as e:
                 st.error(f"预览失败：{e}")

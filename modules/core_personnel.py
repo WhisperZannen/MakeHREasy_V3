@@ -80,20 +80,106 @@ def update_employee(emp_id, emp_data, profile_data, reason="档案更新", chang
         trigger_snapshot = False
         change_tags = []
         if old:
-            def is_diff(v1, v2): return str(v1).strip() != str(v2).strip()
+            # ==========================================================
+            # 人员变动差异比较工具
+            # ==========================================================
+            # 为什么不能直接 str(v1) != str(v2)？
+            # ----------------------------------------------------------
+            # 因为数据库里可能是 13，页面传回来的可能是 13.0。
+            # 这两个在人事业务上是同一个岗级，但字符串比较会误判：
+            # "13" != "13.0"
+            #
+            # 这会导致你明明只是把员工状态改成“离职”，
+            # 历史流水却显示“变为离职 + 岗级调整”。
+            #
+            # 所以这里要分字段类型比较：
+            # 1. 岗级用数字比较；
+            # 2. 档次、状态、岗位、部门、T级用清洗后的文本比较。
+            def normalize_text(value):
+                """
+                把普通文本字段清洗成可比较的字符串。
 
-            if is_diff(old['status'], emp_data.get('status')):
+                None、空值、nan 都统一处理成空字符串。
+                """
+                if value is None:
+                    return ""
+
+                text = str(value).strip()
+
+                if text in ["None", "nan", "NaN"]:
+                    return ""
+
+                return text
+
+            def normalize_rank_value(value):
+                """
+                把岗级字段清洗成可比较的数字文本。
+
+                例子：
+                13      -> "13"
+                13.0    -> "13"
+                "13.0"  -> "13"
+                21.5    -> "21.5"
+
+                注意：
+                这里不能简单 int()，因为你有 21.5 这种用于领导排序的小数岗级。
+                所以规则是：
+                - 如果是整数小数，比如 13.0，转成 13；
+                - 如果是真小数，比如 21.5，保留 21.5。
+                """
+                if value is None:
+                    return ""
+
+                text = str(value).strip()
+
+                if text in ["", "None", "nan", "NaN"]:
+                    return ""
+
+                try:
+                    number = float(text)
+
+                    # 如果是 13.0 这种整数小数，就转成 13。
+                    if number.is_integer():
+                        return str(int(number))
+
+                    # 如果是 21.5 这种真实小数，就保留小数。
+                    return str(number)
+
+                except Exception:
+                    return text
+
+            def is_text_diff(v1, v2):
+                """
+                普通字段比较。
+                """
+                return normalize_text(v1) != normalize_text(v2)
+
+            def is_rank_diff(v1, v2):
+                """
+                岗级字段比较。
+                """
+                return normalize_rank_value(v1) != normalize_rank_value(v2)
+
+            if is_text_diff(old['status'], emp_data.get('status')):
                 change_tags.append(f"变为{emp_data.get('status')}")
 
-            if is_diff(old['dept_id'], emp_data['dept_id']): change_tags.append("跨部门调动")
+            if is_text_diff(old['dept_id'], emp_data['dept_id']):
+                change_tags.append("跨部门调动")
 
-            if is_diff(old['pos_id'], profile_data.get('pos_id')):
-                if str(old['old_pos_name']) == '实习岗': change_tags.append("实习转正")
-                else: change_tags.append("岗位调整")
+            if is_text_diff(old['pos_id'], profile_data.get('pos_id')):
+                if str(old['old_pos_name']) == '实习岗':
+                    change_tags.append("实习转正")
+                else:
+                    change_tags.append("岗位调整")
 
-            if is_diff(old['tech_grade'], profile_data.get('tech_grade')): change_tags.append("T级变动")
-            if is_diff(old['post_rank'], emp_data['post_rank']): change_tags.append("岗级调整")
-            if is_diff(old['post_grade'], emp_data['post_grade']): change_tags.append("档次调整")
+            if is_text_diff(old['tech_grade'], profile_data.get('tech_grade')):
+                change_tags.append("T级变动")
+
+            if is_rank_diff(old['post_rank'], emp_data['post_rank']):
+                change_tags.append("岗级调整")
+
+            if is_text_diff(old['post_grade'], emp_data['post_grade']):
+                change_tags.append("档次调整")
 
             if change_tags:
                 trigger_snapshot = True
