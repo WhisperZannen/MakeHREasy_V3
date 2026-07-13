@@ -319,10 +319,296 @@ def seed_payroll_item_mapping(cursor):
             VALUES (?, ?, ?, ?, ?, ?, ?)
         """, row)
 
-def init_database():
+
+def _add_columns_if_missing(cursor, table_name, required_columns):
+    """只为旧表补字段，不删除、不重建已有业务表。"""
+    cursor.execute(f"PRAGMA table_info({table_name})")
+    existing_columns = {row[1] for row in cursor.fetchall()}
+    for column_name, column_sql in required_columns.items():
+        if column_name not in existing_columns:
+            cursor.execute(
+                f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_sql}"
+            )
+
+
+def ensure_work_arrangement_schema(cursor):
+    """
+    建立“用工关系 -> 险种路由 -> 月度明细 -> 结算批次”兼容层。
+
+    旧的 ss_emp_matrix、ss_monthly_records 继续保留，避免破坏既有工资、
+    人工成本和历史结算数据；新表负责表达挂靠代缴、地市工作转入、
+    下沉等带有效期的业务关系。
+    """
+
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS business_entities (
+            entity_code TEXT PRIMARY KEY,
+            entity_name TEXT NOT NULL UNIQUE,
+            entity_type TEXT NOT NULL DEFAULT '法人',
+            parent_entity_code TEXT,
+            bank_category TEXT,
+            bank_name TEXT,
+            bank_account TEXT,
+            active INTEGER NOT NULL DEFAULT 1,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (parent_entity_code) REFERENCES business_entities(entity_code)
+        )
+    ''')
+
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS employee_arrangements (
+            arrangement_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            emp_id TEXT NOT NULL,
+            arrangement_type TEXT NOT NULL DEFAULT 'normal',
+            contract_entity_code TEXT,
+            payroll_entity_code TEXT,
+            home_dept_id INTEGER,
+            actual_work_unit_code TEXT,
+            related_branch_code TEXT,
+            accounting_entity_code TEXT,
+            ultimate_cost_bearer_code TEXT,
+            start_date DATE NOT NULL,
+            planned_end_date DATE,
+            actual_end_date DATE,
+            payroll_included INTEGER NOT NULL DEFAULT 1,
+            settlement_mode TEXT NOT NULL DEFAULT 'none',
+            settlement_cycle TEXT NOT NULL DEFAULT 'none',
+            status TEXT NOT NULL DEFAULT 'active',
+            source_document_no TEXT,
+            remarks TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (emp_id) REFERENCES employees(emp_id),
+            FOREIGN KEY (home_dept_id) REFERENCES departments(dept_id),
+            FOREIGN KEY (contract_entity_code) REFERENCES business_entities(entity_code),
+            FOREIGN KEY (payroll_entity_code) REFERENCES business_entities(entity_code),
+            FOREIGN KEY (actual_work_unit_code) REFERENCES business_entities(entity_code),
+            FOREIGN KEY (related_branch_code) REFERENCES business_entities(entity_code),
+            FOREIGN KEY (accounting_entity_code) REFERENCES business_entities(entity_code),
+            FOREIGN KEY (ultimate_cost_bearer_code) REFERENCES business_entities(entity_code)
+        )
+    ''')
+    cursor.execute('''
+        CREATE INDEX IF NOT EXISTS idx_employee_arrangements_effective
+        ON employee_arrangements(emp_id, start_date, actual_end_date, status)
+    ''')
+
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS social_route_policies (
+            route_policy_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            policy_name TEXT NOT NULL,
+            arrangement_type TEXT NOT NULL,
+            contract_entity_code TEXT,
+            insurance_item TEXT NOT NULL,
+            effective_from_month TEXT NOT NULL,
+            effective_to_month TEXT,
+            enabled_default INTEGER,
+            calculation_policy_entity TEXT,
+            payer_entity_rule TEXT NOT NULL DEFAULT 'legacy',
+            payer_entity_code TEXT,
+            cost_bearer_rule TEXT NOT NULL DEFAULT 'legacy',
+            cost_bearer_code TEXT,
+            settlement_counterparty_code TEXT,
+            settlement_mode TEXT NOT NULL DEFAULT 'none',
+            settlement_cycle TEXT NOT NULL DEFAULT 'none',
+            amount_source TEXT NOT NULL DEFAULT 'system_calculated',
+            payment_channel_code TEXT,
+            priority INTEGER NOT NULL DEFAULT 100,
+            active INTEGER NOT NULL DEFAULT 1,
+            remarks TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (contract_entity_code) REFERENCES business_entities(entity_code),
+            FOREIGN KEY (payer_entity_code) REFERENCES business_entities(entity_code),
+            FOREIGN KEY (cost_bearer_code) REFERENCES business_entities(entity_code),
+            FOREIGN KEY (settlement_counterparty_code) REFERENCES business_entities(entity_code)
+        )
+    ''')
+    cursor.execute('''
+        CREATE INDEX IF NOT EXISTS idx_social_route_policies_effective
+        ON social_route_policies(arrangement_type, insurance_item,
+                                 effective_from_month, effective_to_month, active)
+    ''')
+
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS employee_social_overrides (
+            override_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            emp_id TEXT NOT NULL,
+            insurance_item TEXT NOT NULL,
+            effective_from_month TEXT NOT NULL,
+            effective_to_month TEXT,
+            enabled INTEGER,
+            calculation_policy_entity TEXT,
+            payer_entity_code TEXT,
+            cost_bearer_code TEXT,
+            settlement_counterparty_code TEXT,
+            settlement_mode TEXT,
+            settlement_cycle TEXT,
+            amount_source TEXT,
+            payment_channel_code TEXT,
+            special_reason TEXT NOT NULL,
+            source_document_no TEXT,
+            active INTEGER NOT NULL DEFAULT 1,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (emp_id) REFERENCES employees(emp_id),
+            FOREIGN KEY (payer_entity_code) REFERENCES business_entities(entity_code),
+            FOREIGN KEY (cost_bearer_code) REFERENCES business_entities(entity_code),
+            FOREIGN KEY (settlement_counterparty_code) REFERENCES business_entities(entity_code)
+        )
+    ''')
+    cursor.execute('''
+        CREATE INDEX IF NOT EXISTS idx_employee_social_overrides_effective
+        ON employee_social_overrides(emp_id, insurance_item,
+                                     effective_from_month, effective_to_month, active)
+    ''')
+
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS social_monthly_items (
+            item_record_id TEXT PRIMARY KEY,
+            monthly_record_id TEXT NOT NULL,
+            cost_month TEXT NOT NULL,
+            emp_id TEXT NOT NULL,
+            arrangement_id INTEGER,
+            business_type_snapshot TEXT NOT NULL DEFAULT 'normal',
+            insurance_item TEXT NOT NULL,
+            base_amount REAL DEFAULT 0.0,
+            company_amount REAL DEFAULT 0.0,
+            personal_amount REAL DEFAULT 0.0,
+            calculation_policy_entity TEXT,
+            payer_entity_code TEXT,
+            cost_bearer_code TEXT,
+            settlement_counterparty_code TEXT,
+            settlement_mode TEXT NOT NULL DEFAULT 'none',
+            settlement_cycle TEXT NOT NULL DEFAULT 'none',
+            amount_source TEXT NOT NULL DEFAULT 'system_calculated',
+            payment_channel_code TEXT,
+            route_policy_id INTEGER,
+            override_id INTEGER,
+            close_status TEXT NOT NULL DEFAULT 'draft',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(cost_month, emp_id, insurance_item),
+            FOREIGN KEY (monthly_record_id) REFERENCES ss_monthly_records(record_id),
+            FOREIGN KEY (emp_id) REFERENCES employees(emp_id),
+            FOREIGN KEY (arrangement_id) REFERENCES employee_arrangements(arrangement_id),
+            FOREIGN KEY (route_policy_id) REFERENCES social_route_policies(route_policy_id),
+            FOREIGN KEY (override_id) REFERENCES employee_social_overrides(override_id)
+        )
+    ''')
+    cursor.execute('''
+        CREATE INDEX IF NOT EXISTS idx_social_monthly_items_settlement
+        ON social_monthly_items(cost_month, cost_bearer_code,
+                                settlement_mode, settlement_cycle, close_status)
+    ''')
+
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS settlement_batches (
+            batch_id TEXT PRIMARY KEY,
+            business_type TEXT NOT NULL,
+            settlement_cycle TEXT NOT NULL,
+            period_start TEXT NOT NULL,
+            period_end TEXT NOT NULL,
+            payer_entity_code TEXT,
+            payee_entity_code TEXT,
+            related_branch_code TEXT,
+            amount_scope TEXT NOT NULL DEFAULT 'social_total',
+            total_amount REAL NOT NULL DEFAULT 0.0,
+            settled_amount REAL NOT NULL DEFAULT 0.0,
+            status TEXT NOT NULL DEFAULT 'draft',
+            document_no TEXT,
+            generated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            sent_at TIMESTAMP,
+            settled_at TIMESTAMP,
+            voucher_no TEXT,
+            remarks TEXT,
+            FOREIGN KEY (payer_entity_code) REFERENCES business_entities(entity_code),
+            FOREIGN KEY (payee_entity_code) REFERENCES business_entities(entity_code),
+            FOREIGN KEY (related_branch_code) REFERENCES business_entities(entity_code)
+        )
+    ''')
+
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS settlement_batch_items (
+            batch_item_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            batch_id TEXT NOT NULL,
+            source_type TEXT NOT NULL,
+            source_record_id TEXT NOT NULL,
+            emp_id TEXT,
+            item_name TEXT,
+            amount REAL NOT NULL DEFAULT 0.0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(batch_id, source_type, source_record_id),
+            FOREIGN KEY (batch_id) REFERENCES settlement_batches(batch_id),
+            FOREIGN KEY (emp_id) REFERENCES employees(emp_id)
+        )
+    ''')
+
+    # 现有主体和银行资料先以兼容方式落库，地市主体由当前成本中心自动发现。
+    default_entities = [
+        ('province_public', '省公众', '法人'),
+        ('ct_digital', '中电数智', '法人'),
+        ('province_company', '省公司', '上级单位'),
+    ]
+    cursor.executemany('''
+        INSERT OR IGNORE INTO business_entities(entity_code, entity_name, entity_type)
+        VALUES (?, ?, ?)
+    ''', default_entities)
+
+    # 以下字段都是加法迁移。已有数据保持原值，新数据开始写入快照。
+    _add_columns_if_missing(cursor, 'ss_monthly_records', {
+        'arrangement_id': 'INTEGER',
+        'business_type_snapshot': "TEXT DEFAULT 'normal'",
+        'calculation_status': "TEXT DEFAULT 'calculated'",
+        'close_status': "TEXT DEFAULT 'draft'",
+        'closed_at': 'TIMESTAMP',
+        'closed_by': 'TEXT',
+        'rebuild_reason': 'TEXT',
+    })
+    _add_columns_if_missing(cursor, 'ss_retroactive_records', {
+        'arrangement_id': 'INTEGER',
+        'payer_entity_code': 'TEXT',
+        'cost_bearer_code': 'TEXT',
+        'settlement_counterparty_code': 'TEXT',
+        'settlement_mode': "TEXT DEFAULT 'none'",
+        'source_document_no': 'TEXT',
+        'import_batch_id': 'TEXT',
+    })
+    _add_columns_if_missing(cursor, 'payroll_monthly_records', {
+        'arrangement_id': 'INTEGER',
+        'business_type_snapshot': "TEXT DEFAULT 'normal'",
+        'payroll_entity_code': 'TEXT',
+        'actual_work_unit_code': 'TEXT',
+        'ultimate_cost_bearer_code': 'TEXT',
+        'salary_source': "TEXT DEFAULT '本单位发放'",
+    })
+    _add_columns_if_missing(cursor, 'labor_cost_ledger', {
+        'arrangement_id': 'INTEGER',
+        'business_type_snapshot': "TEXT DEFAULT 'normal'",
+        'actual_work_unit_code': 'TEXT',
+        'accounting_entity_code': 'TEXT',
+        'ultimate_cost_bearer_code': 'TEXT',
+        'reallocation_mode': "TEXT DEFAULT 'none'",
+        'reallocation_status': "TEXT DEFAULT 'not_required'",
+        'settlement_batch_id': 'TEXT',
+    })
+
+    # 当前数据库里的地市名称也纳入主体字典，供关系表使用。
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='ss_emp_matrix'")
+    if cursor.fetchone():
+        cursor.execute('''
+            INSERT OR IGNORE INTO business_entities(entity_code, entity_name, entity_type)
+            SELECT 'branch:' || trim(cost_center), trim(cost_center), '地市分公司'
+            FROM ss_emp_matrix
+            WHERE trim(COALESCE(cost_center, '')) NOT IN ('', '本级')
+            GROUP BY trim(cost_center)
+        ''')
+
+def init_database(db_path=None):
     # 获取当前脚本所在绝对路径，拼接数据库文件路径，防止生成的数据库文件位置错乱
     current_dir = os.path.dirname(os.path.abspath(__file__))
-    db_path = os.path.join(current_dir, 'hr_core.db')
+    db_path = db_path or os.path.join(current_dir, 'hr_core.db')
 
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
@@ -526,7 +812,8 @@ def init_database():
         # --- 表 8: 政策规则与动态算力引擎表 (ss_policy_rules) ---
         cursor.execute('''
         CREATE TABLE IF NOT EXISTS ss_policy_rules (
-            rule_year TEXT PRIMARY KEY,         -- 生效年份，如 "2026"
+            rule_year TEXT NOT NULL,            -- 生效年份，如 "2026"
+            manage_entity TEXT NOT NULL,        -- 计算政策主体，不再等同于实际付款主体
             
             pension_upper REAL,                 -- 养老金最高只能按这个基数交 (封顶)
             pension_lower REAL,                 -- 养老金最低必须按这个基数交 (保底)
@@ -560,8 +847,11 @@ def init_database():
             annuity_comp_rate REAL,             -- 公司交企业年金的百分比
             annuity_pers_rate REAL,             -- 员工交企业年金的百分比
             
-            rounding_mode TEXT DEFAULT 'round_to_yuan',    -- 【核心开关】社保算出小数怎么办？(精确到分/四舍五入到元/逢角进元等)
-            fund_calc_method TEXT DEFAULT 'reverse_from_ss' -- 【核心开关】公积金算法 (是基数×12%独立算，还是用社保取整后的基数倒推逢元进十)
+            rounding_mode TEXT DEFAULT 'round_to_yuan',    -- 【核心开关】社保算出小数怎么办？
+            fund_calc_method TEXT DEFAULT 'reverse_from_ss', -- 【核心开关】公积金算法
+            fund_soe_upper REAL DEFAULT 0.0,
+            fund_soe_lower REAL DEFAULT 0.0,
+            PRIMARY KEY (rule_year, manage_entity)
         )
         ''')
 
@@ -1070,8 +1360,12 @@ def init_database():
             )
         ''')
 
+        # --- 表 15+：多形态用工、社保路由与结算兼容层 ---
+        # 只新增表和字段，不删除现有人员、社保、薪酬或人工成本数据。
+        ensure_work_arrangement_schema(cursor)
+
         conn.commit()
-        print(f"✅ V3.5 差异快照底座与全量社保引擎初始化成功！")
+        print("✅ V3.6 用工关系、社保路由与结算底座初始化成功！")
     except sqlite3.Error as e:
         conn.rollback()
         print(f"❌ 初始化失败: {e}")

@@ -24,6 +24,7 @@ from modules.core_labor_cost import (
     _get_db_connection, cleanse_db_timestamps,
     sort_flat_ledger_df, add_subtotals_and_totals, get_ledger_data
 )
+from modules.core_arrangements import get_effective_arrangement
 
 st.set_page_config(page_title="人工成本台账", layout="wide")
 
@@ -311,6 +312,16 @@ with tab1:
             f"{total_headcount} 人次"
         )
 
+        if 'reallocation_mode' in active_metric_df.columns:
+            reallocation_df = active_metric_df[
+                active_metric_df['reallocation_mode'].fillna('none') != 'none'
+            ]
+            if not reallocation_df.empty:
+                st.warning(
+                    f"🔁 当前范围有 {len(reallocation_df)} 人次需要地市结算或人工成本划转，"
+                    f"涉及台账人工成本 {reallocation_df['total_labor_cost'].sum():,.2f} 元。"
+                )
+
         disp_df = raw_df.rename(columns=DB_TO_CN_MAP)
         disp_cols = [col for col in LEDGER_MAP.keys() if col in disp_df.columns]
 
@@ -436,6 +447,65 @@ with tab2:
             else:
                 st.warning("所选范围内无数据。")
 
+    st.write("### 🔁 地市人工成本划转专项表")
+    st.caption(
+        "用于“正式转入但仍在地市工作”等人员的年度全口径人工成本上报；"
+        "只提取已标记需要划转的台账，不混入普通本级人员。"
+    )
+    if st.button("生成所选期间地市人工成本划转表", type="secondary"):
+        s_m, e_m = min(start_month, end_month), max(start_month, end_month)
+        conn_reallocation = _get_db_connection()
+        reallocation_export = pd.read_sql_query(
+            """
+            SELECT l.cost_month AS 核算月份,
+                   l.emp_id AS 工号,
+                   l.emp_name AS 姓名,
+                   l.dept_name AS 归属部门,
+                   l.business_type_snapshot AS 业务关系类型,
+                   COALESCE(work.entity_name, l.actual_work_unit_code, '') AS 实际工作单位,
+                   COALESCE(bearer.entity_name, l.ultimate_cost_bearer_code, '') AS 最终成本承担单位,
+                   l.gross_salary_total AS 工资应发合计,
+                   l.other_cost_total AS 其他人工成本合计,
+                   l.total_labor_cost AS 人工成本合计,
+                   l.reallocation_mode AS 划转方式,
+                   l.reallocation_status AS 划转状态
+            FROM labor_cost_ledger l
+            LEFT JOIN business_entities work ON l.actual_work_unit_code = work.entity_code
+            LEFT JOIN business_entities bearer ON l.ultimate_cost_bearer_code = bearer.entity_code
+            WHERE l.cost_month BETWEEN ? AND ?
+              AND COALESCE(l.reallocation_mode, 'none') != 'none'
+            ORDER BY 最终成本承担单位, 姓名, 核算月份
+            """,
+            conn_reallocation,
+            params=[s_m, e_m]
+        )
+        conn_reallocation.close()
+        if reallocation_export.empty:
+            st.info("所选期间没有已标记的地市人工成本划转记录。")
+        else:
+            reallocation_summary = (
+                reallocation_export.groupby(
+                    ['最终成本承担单位', '业务关系类型'], dropna=False, as_index=False
+                )
+                .agg(
+                    核算人次=('工号', 'count'),
+                    工资应发合计=('工资应发合计', 'sum'),
+                    其他人工成本合计=('其他人工成本合计', 'sum'),
+                    人工成本合计=('人工成本合计', 'sum')
+                )
+            )
+            reallocation_io = io.BytesIO()
+            with pd.ExcelWriter(reallocation_io, engine='openpyxl') as writer:
+                reallocation_export.to_excel(writer, index=False, sheet_name='划转明细')
+                reallocation_summary.to_excel(writer, index=False, sheet_name='地市汇总')
+                format_excel_sheet(writer.sheets['划转明细'], reallocation_export.columns)
+                format_excel_sheet(writer.sheets['地市汇总'], reallocation_summary.columns)
+            st.download_button(
+                "📥 下载地市人工成本划转表",
+                data=reallocation_io.getvalue(),
+                file_name=f"地市人工成本划转_{s_m}至{e_m}.xlsx",
+            )
+
     st.divider()
 
     # ==========================================================================
@@ -528,6 +598,34 @@ with tab2:
 
                     if new_rows:
                         base_df = pd.concat([base_df, pd.DataFrame(new_rows)], ignore_index=True)
+
+                    # 把当月有效的用工与成本关系固化进初始化底表。
+                    for idx, relation_row in base_df.iterrows():
+                        relation_emp_id = str(relation_row.get('emp_id', '')).replace('.0', '').strip()
+                        if not relation_emp_id:
+                            continue
+                        arrangement = get_effective_arrangement(relation_emp_id, target_month, conn)
+                        relation_type = arrangement.get('arrangement_type', 'normal')
+                        if relation_type == 'city_transfer':
+                            reallocation_mode = 'annual_labor_cost_reallocation'
+                            reallocation_status = 'pending'
+                        elif relation_type == 'down_secondment':
+                            reallocation_mode = 'mixed_by_item'
+                            reallocation_status = 'pending'
+                        elif relation_type == 'proxy_social':
+                            reallocation_mode = 'quarterly_social_settlement'
+                            reallocation_status = 'pending'
+                        else:
+                            reallocation_mode = 'none'
+                            reallocation_status = 'not_required'
+
+                        base_df.at[idx, 'arrangement_id'] = arrangement.get('arrangement_id')
+                        base_df.at[idx, 'business_type_snapshot'] = relation_type
+                        base_df.at[idx, 'actual_work_unit_code'] = arrangement.get('actual_work_unit_code')
+                        base_df.at[idx, 'accounting_entity_code'] = arrangement.get('accounting_entity_code')
+                        base_df.at[idx, 'ultimate_cost_bearer_code'] = arrangement.get('ultimate_cost_bearer_code')
+                        base_df.at[idx, 'reallocation_mode'] = reallocation_mode
+                        base_df.at[idx, 'reallocation_status'] = reallocation_status
 
                     export_cn = base_df.rename(columns=DB_TO_CN_MAP)
 
@@ -814,6 +912,28 @@ with tab3:
                                 db_data[db_col] = 0.0
                         else:
                             db_data[db_col] = str(val).strip() if pd.notna(val) else ""
+
+                    # 兼容旧版Excel：没有新增关系列时，按核算月份自动补齐快照。
+                    if not db_data.get('business_type_snapshot'):
+                        arrangement = get_effective_arrangement(e_id, c_month, conn)
+                        relation_type = arrangement.get('arrangement_type', 'normal')
+                        db_data['arrangement_id'] = arrangement.get('arrangement_id')
+                        db_data['business_type_snapshot'] = relation_type
+                        db_data['actual_work_unit_code'] = arrangement.get('actual_work_unit_code')
+                        db_data['accounting_entity_code'] = arrangement.get('accounting_entity_code')
+                        db_data['ultimate_cost_bearer_code'] = arrangement.get('ultimate_cost_bearer_code')
+                        if relation_type == 'city_transfer':
+                            db_data['reallocation_mode'] = 'annual_labor_cost_reallocation'
+                            db_data['reallocation_status'] = 'pending'
+                        elif relation_type == 'down_secondment':
+                            db_data['reallocation_mode'] = 'mixed_by_item'
+                            db_data['reallocation_status'] = 'pending'
+                        elif relation_type == 'proxy_social':
+                            db_data['reallocation_mode'] = 'quarterly_social_settlement'
+                            db_data['reallocation_status'] = 'pending'
+                        else:
+                            db_data['reallocation_mode'] = 'none'
+                            db_data['reallocation_status'] = 'not_required'
 
                     # =============================================================
                     # 女工劳保费特殊口径

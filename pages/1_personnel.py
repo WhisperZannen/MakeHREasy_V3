@@ -17,6 +17,13 @@ from dateutil.relativedelta import relativedelta
 from modules.core_dept import get_all_departments, add_department, update_department, soft_delete_department
 from modules.core_position import get_all_positions, add_position, update_position
 from modules.core_personnel import get_all_employees, add_employee, update_employee, update_employee_status, get_all_history, rollback_history
+from modules.core_arrangements import (
+    ARRANGEMENT_LABELS,
+    close_arrangement,
+    create_arrangement,
+    get_arrangements_dataframe,
+    get_entities_dataframe,
+)
 
 st.set_page_config(page_title="组织人事中枢", layout="wide")
 
@@ -100,7 +107,10 @@ def build_dept_tree(df, parent_id=None, level=0):
 # ==============================================================================
 st.sidebar.title("🎛️ 组织人事中枢")
 # 严格按照你的要求调整了次序：人员 -> 流水 -> 部门 -> 岗位
-current_page = st.sidebar.radio("请选择操作模块:", ["👥 人员档案", "🕰️ 历史变动流水", "🏢 部门管理", "🎯 岗位字典"])
+current_page = st.sidebar.radio(
+    "请选择操作模块:",
+    ["👥 人员档案", "🔄 用工与结算关系", "🕰️ 历史变动流水", "🏢 部门管理", "🎯 岗位字典"]
+)
 st.title(current_page)
 
 # ==============================================================================
@@ -571,7 +581,194 @@ elif current_page == "👥 人员档案":
                     else: st.error(msg)
 
 # ==============================================================================
-# 模块 D: 🕰️ 历史变动流水 (全量归位侧边栏审计)
+# 模块 D: 🔄 用工与结算关系
+# ==============================================================================
+elif current_page == "🔄 用工与结算关系":
+    st.subheader("🔄 用工、实际工作与成本结算关系")
+    st.info(
+        "这里不改变员工的在职/离职状态。挂靠代缴、地市工作转入、下沉等关系"
+        "按生效日期独立留痕，用于决定工资范围、社保路由和成本结算。"
+    )
+
+    relation_df = get_arrangements_dataframe(include_closed=True)
+    entity_df = get_entities_dataframe(active_only=True)
+    entity_options = [None] + entity_df['entity_code'].tolist()
+    entity_names = dict(zip(entity_df['entity_code'], entity_df['entity_name']))
+
+    tab_list, tab_add, tab_close = st.tabs(["📋 关系台账", "➕ 新建关系", "✅ 到期/结束关系"])
+
+    with tab_list:
+        if relation_df.empty:
+            st.caption("暂无显式关系；未配置人员继续按原有普通/挂靠逻辑兼容运行。")
+        else:
+            show_df = relation_df.copy()
+            show_df['关系类型'] = show_df['arrangement_type'].map(ARRANGEMENT_LABELS).fillna(show_df['arrangement_type'])
+            show_df['工资范围'] = show_df['payroll_included'].map({1: '本系统发薪', 0: '本系统不发薪'})
+            show_df['计划结束'] = pd.to_datetime(show_df['planned_end_date'], errors='coerce')
+
+            today_ts = pd.Timestamp(date.today())
+            expiring = show_df[
+                show_df['status'].eq('active')
+                & show_df['计划结束'].notna()
+                & (show_df['计划结束'] >= today_ts)
+                & (show_df['计划结束'] <= today_ts + pd.Timedelta(days=90))
+            ]
+            overdue = show_df[
+                show_df['status'].eq('active')
+                & show_df['计划结束'].notna()
+                & (show_df['计划结束'] < today_ts)
+            ]
+            if not overdue.empty:
+                st.error(f"有 {len(overdue)} 条关系已超过计划结束日期，必须确认延期、返回或转入。")
+            if not expiring.empty:
+                st.warning(f"有 {len(expiring)} 条关系将在90天内到期。")
+
+            display_columns = {
+                'arrangement_id': '关系ID', 'emp_name': '姓名', 'emp_id': '工号',
+                '关系类型': '关系类型', 'contract_entity_name': '劳动合同主体',
+                'payroll_entity_name': '工资主体', 'actual_work_unit_name': '实际工作单位',
+                'related_branch_name': '关联地市', 'ultimate_cost_bearer_name': '最终成本承担',
+                'start_date': '开始日期', 'planned_end_date': '计划结束',
+                'actual_end_date': '实际结束', '工资范围': '工资范围',
+                'settlement_cycle': '结算周期', 'status': '状态', 'remarks': '备注'
+            }
+            st.dataframe(
+                show_df[[c for c in display_columns if c in show_df.columns]].rename(columns=display_columns),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+    with tab_add:
+        relation_type = st.selectbox(
+            "关系类型",
+            list(ARRANGEMENT_LABELS.keys()),
+            format_func=lambda value: ARRANGEMENT_LABELS[value],
+        )
+        default_payroll = relation_type not in {'proxy_social', 'down_secondment'}
+        default_mode = {
+            'normal': 'none',
+            'proxy_social': 'proxy_social',
+            'city_transfer': 'annual_labor_cost_reallocation',
+            'down_secondment': 'mixed_by_item',
+        }[relation_type]
+        default_cycle = {
+            'normal': 'none', 'proxy_social': 'quarterly',
+            'city_transfer': 'annual', 'down_secondment': 'mixed'
+        }[relation_type]
+
+        active_people = df_emps[df_emps['status'].isin(['在职', '挂靠人员'])].copy()
+        emp_options = active_people['emp_id'].astype(str).tolist()
+        emp_label = dict(zip(
+            active_people['emp_id'].astype(str),
+            active_people.apply(lambda row: f"{row['name']}（{row['emp_id']}）", axis=1)
+        ))
+
+        with st.form("arrangement_create_form"):
+            target_emp_id = st.selectbox("员工*", emp_options, format_func=lambda value: emp_label[value])
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                contract_entity = st.selectbox(
+                    "劳动合同主体", entity_options,
+                    format_func=lambda value: "未指定" if value is None else entity_names[value]
+                )
+                payroll_entity = st.selectbox(
+                    "工资发放主体", entity_options,
+                    format_func=lambda value: "未指定/外部发放" if value is None else entity_names[value]
+                )
+            with c2:
+                actual_work_unit = st.selectbox(
+                    "实际工作单位", entity_options,
+                    format_func=lambda value: "未指定" if value is None else entity_names[value]
+                )
+                related_branch = st.selectbox(
+                    "关联地市", entity_options,
+                    format_func=lambda value: "未指定" if value is None else entity_names[value]
+                )
+            with c3:
+                accounting_entity = st.selectbox(
+                    "当前记账单位", entity_options,
+                    format_func=lambda value: "未指定" if value is None else entity_names[value]
+                )
+                cost_bearer = st.selectbox(
+                    "最终成本承担单位", entity_options,
+                    format_func=lambda value: "未指定" if value is None else entity_names[value]
+                )
+
+            d1, d2 = st.columns(2)
+            with d1:
+                start_date_value = st.date_input("开始日期*", value=date.today())
+                has_planned_end = st.checkbox("设置计划结束日期", value=relation_type == 'down_secondment')
+            with d2:
+                planned_default = date.today() + relativedelta(years=2)
+                planned_end_value = st.date_input("计划结束日期", value=planned_default)
+                payroll_included = st.checkbox("纳入本系统工资发放", value=default_payroll)
+
+            s1, s2 = st.columns(2)
+            with s1:
+                settlement_mode = st.text_input("结算方式", value=default_mode)
+                settlement_cycle = st.selectbox(
+                    "结算周期", ['none', 'monthly', 'quarterly', 'annual', 'mixed'],
+                    index=['none', 'monthly', 'quarterly', 'annual', 'mixed'].index(default_cycle)
+                )
+            with s2:
+                source_document_no = st.text_input("政策/协议文号")
+                relation_remarks = st.text_area("备注")
+
+            submitted = st.form_submit_button("保存关系", type="primary")
+            if submitted:
+                employee_row = active_people[active_people['emp_id'].astype(str) == str(target_emp_id)].iloc[0]
+                ok, msg = create_arrangement({
+                    'emp_id': str(target_emp_id),
+                    'arrangement_type': relation_type,
+                    'contract_entity_code': contract_entity,
+                    'payroll_entity_code': payroll_entity,
+                    'home_dept_id': int(employee_row['dept_id']) if pd.notna(employee_row['dept_id']) else None,
+                    'actual_work_unit_code': actual_work_unit,
+                    'related_branch_code': related_branch,
+                    'accounting_entity_code': accounting_entity,
+                    'ultimate_cost_bearer_code': cost_bearer,
+                    'start_date': start_date_value.isoformat(),
+                    'planned_end_date': planned_end_value.isoformat() if has_planned_end else None,
+                    'actual_end_date': None,
+                    'payroll_included': 1 if payroll_included else 0,
+                    'settlement_mode': settlement_mode,
+                    'settlement_cycle': settlement_cycle,
+                    'status': 'active',
+                    'source_document_no': source_document_no,
+                    'remarks': relation_remarks,
+                })
+                if ok:
+                    set_msg_and_rerun(msg)
+                else:
+                    st.error(msg)
+
+    with tab_close:
+        active_relations = relation_df[relation_df['status'] == 'active'] if not relation_df.empty else pd.DataFrame()
+        if active_relations.empty:
+            st.caption("没有可结束的活动关系。")
+        else:
+            relation_options = active_relations['arrangement_id'].astype(int).tolist()
+            relation_labels = {
+                int(row['arrangement_id']): (
+                    f"#{int(row['arrangement_id'])} {row['emp_name']} - "
+                    f"{ARRANGEMENT_LABELS.get(row['arrangement_type'], row['arrangement_type'])}"
+                )
+                for _, row in active_relations.iterrows()
+            }
+            with st.form("arrangement_close_form"):
+                close_id = st.selectbox("选择关系", relation_options, format_func=lambda value: relation_labels[value])
+                close_date_value = st.date_input("实际结束日期", value=date.today())
+                close_status = st.selectbox("结束结果", ['returned', 'transferred', 'extended_replaced', 'closed'])
+                close_remarks = st.text_area("处理说明")
+                if st.form_submit_button("确认结束关系", type="primary"):
+                    ok, msg = close_arrangement(close_id, close_date_value, close_status, close_remarks)
+                    if ok:
+                        set_msg_and_rerun(msg)
+                    else:
+                        st.error(msg)
+
+# ==============================================================================
+# 模块 E: 🕰️ 历史变动流水 (全量归位侧边栏审计)
 # ==============================================================================
 elif current_page == "🕰️ 历史变动流水":
     st.subheader("🕰️ 全生命周期时空审计")

@@ -12,6 +12,7 @@ import uuid
 import json
 import datetime
 from modules.core_social_security import _get_db_connection
+from modules.core_arrangements import get_effective_arrangement
 
 st.set_page_config(page_title="薪酬核算与发放", layout="wide")
 
@@ -816,8 +817,13 @@ with tab2:
             base_df = pd.read_sql_query(sql, conn, params=[calc_month])
 
             count = 0
+            excluded_count = 0
             for _, row in base_df.iterrows():
                 eid = row['emp_id']
+                arrangement = get_effective_arrangement(str(eid), calc_month, conn)
+                if not int(arrangement.get('payroll_included', 1)):
+                    excluded_count += 1
+                    continue
 
                 # 这里不能直接写 str(row['post_rank'])。
                 # 原因：
@@ -859,8 +865,10 @@ with tab2:
                              INSERT INTO payroll_monthly_records (record_id, cost_month, emp_id, dept_name, \
                                                                   base_salary, perf_standard, perf_base, \
                                                                   ss_pension_pers, ss_medical_mix, ss_unemp_pers, \
-                                                                  ss_fund_pers, ss_annuity_pers) \
-                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(record_id) DO \
+                                                                  ss_fund_pers, ss_annuity_pers, arrangement_id, \
+                                                                  business_type_snapshot, payroll_entity_code, \
+                                                                  actual_work_unit_code, ultimate_cost_bearer_code, salary_source) \
+                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(record_id) DO \
                              UPDATE SET
                                  dept_name=excluded.dept_name, \
                                  base_salary=excluded.base_salary, \
@@ -870,17 +878,26 @@ with tab2:
                                  ss_medical_mix=excluded.ss_medical_mix, \
                                  ss_unemp_pers=excluded.ss_unemp_pers, \
                                  ss_fund_pers=excluded.ss_fund_pers, \
-                                 ss_annuity_pers=excluded.ss_annuity_pers \
+                                 ss_annuity_pers=excluded.ss_annuity_pers, \
+                                 arrangement_id=excluded.arrangement_id, \
+                                 business_type_snapshot=excluded.business_type_snapshot, \
+                                 payroll_entity_code=excluded.payroll_entity_code, \
+                                 actual_work_unit_code=excluded.actual_work_unit_code, \
+                                 ultimate_cost_bearer_code=excluded.ultimate_cost_bearer_code, \
+                                 salary_source=excluded.salary_source \
                              """
                 cursor.execute(upsert_sql, (
                     rec_id, calc_month, eid, row['dept_name'],
                     base_sal, perf_base_val, pack_base,
-                    row['ss_pension'], row['ss_medical'], row['ss_unemp'], row['ss_fund'], row['ss_annuity']
+                    row['ss_pension'], row['ss_medical'], row['ss_unemp'], row['ss_fund'], row['ss_annuity'],
+                    arrangement.get('arrangement_id'), arrangement.get('arrangement_type', 'normal'),
+                    arrangement.get('payroll_entity_code'), arrangement.get('actual_work_unit_code'),
+                    arrangement.get('ultimate_cost_bearer_code'), '本单位发放'
                 ))
                 count += 1
 
             conn.commit()
-            st.success(f"✅ 底盘备料成功！已根据非线性二维矩阵自动匹配 {count} 人的岗位工资与绩效基数，社保倒吸完毕！")
+            st.success(f"✅ 底盘备料成功！已匹配 {count} 人；按有效用工关系排除 {excluded_count} 名非本系统发薪人员。")
         except Exception as e:
             st.error(f"提取失败: {e}")
         finally:

@@ -11,6 +11,8 @@ import os
 import pandas as pd
 import math
 
+from modules.core_arrangements import resolve_social_route
+
 # ------------------------------------------------------------------------------
 # 核心防御机制：空值清洗器 (必须在底层也配备一把，防止入库时遇到脏数据崩溃)
 # ------------------------------------------------------------------------------
@@ -28,7 +30,7 @@ def safe_float(val, default=0.0):
 def _get_db_connection():
     current_dir = os.path.dirname(os.path.abspath(__file__))
     project_root = os.path.dirname(current_dir)
-    db_path = os.path.join(project_root, 'database', 'hr_core.db')
+    db_path = os.environ.get('MAKE_HR_DB_PATH', os.path.join(project_root, 'database', 'hr_core.db'))
     conn = sqlite3.connect(db_path)
     conn.execute("PRAGMA foreign_keys = ON;")
     conn.row_factory = sqlite3.Row
@@ -44,7 +46,9 @@ def _ensure_multi_entity_schema():
         cursor.execute("PRAGMA table_info(ss_policy_rules)")
         columns = [col['name'] for col in cursor.fetchall()]
         if 'manage_entity' not in columns:
-            cursor.execute("DROP TABLE IF EXISTS ss_policy_rules")
+            # 旧版只有 rule_year 主键。先改名并完整迁移，禁止直接 DROP
+            # 导致已经维护的费率参数丢失。
+            cursor.execute("ALTER TABLE ss_policy_rules RENAME TO ss_policy_rules_legacy")
             cursor.execute('''
             CREATE TABLE ss_policy_rules (
                 rule_year TEXT, manage_entity TEXT,
@@ -63,6 +67,21 @@ def _ensure_multi_entity_schema():
                 PRIMARY KEY (rule_year, manage_entity) 
             )
             ''')
+            cursor.execute("PRAGMA table_info(ss_policy_rules_legacy)")
+            legacy_columns = [col['name'] for col in cursor.fetchall()]
+            copy_columns = [
+                c for c in legacy_columns
+                if c not in {'manage_entity'}
+            ]
+            select_columns = ", ".join(copy_columns)
+            insert_columns = ", ".join(['manage_entity'] + copy_columns)
+            for entity in ['省公众', '中电数智', '省公司']:
+                cursor.execute(
+                    f"INSERT INTO ss_policy_rules ({insert_columns}) "
+                    f"SELECT ?, {select_columns} FROM ss_policy_rules_legacy",
+                    (entity,)
+                )
+            cursor.execute("DROP TABLE ss_policy_rules_legacy")
         else:
             if 'fund_soe_upper' not in columns:
                 cursor.execute("ALTER TABLE ss_policy_rules ADD COLUMN fund_soe_upper REAL DEFAULT 0.0")
@@ -289,7 +308,8 @@ def calc_insurance_item(item_type: str, raw_base: float, upper: float, lower: fl
 # ------------------------------------------------------------------------------
 # 核心算子 3: 五险两金全量计算引擎 (终极修复：公积金独立基数绝对豁免版)
 # ------------------------------------------------------------------------------
-def calculate_complete_bill(emp_row: dict, target_year: str) -> dict:
+def calculate_complete_bill(emp_row: dict, target_year: str, target_month: str = None) -> dict:
+    target_month = target_month or f"{target_year}-01"
     res = {'工号': emp_row['工号'], '姓名': emp_row['姓名'], '财务归属': emp_row['财务归属']}
 
     items_config = {
@@ -308,17 +328,50 @@ def calculate_complete_bill(emp_row: dict, target_year: str) -> dict:
     res['medical_serious_个'] = 0.0
 
     for item, (base_col, en_col, acc_col) in items_config.items():
+        context = resolve_social_route(
+            str(emp_row['工号']),
+            item,
+            target_month,
+            legacy_enabled=int(emp_row.get(en_col, 0) or 0),
+            legacy_payer_name=str(emp_row.get(acc_col, "省公众")),
+            legacy_cost_center=str(emp_row.get('财务归属', '本级')),
+        )
+
+        # 隐藏快照列只供入库使用，页面导出时会过滤掉。
+        for key in [
+            'arrangement_id', 'arrangement_type', 'calculation_policy_entity',
+            'payer_entity_code', 'cost_bearer_code',
+            'settlement_counterparty_code', 'settlement_mode',
+            'settlement_cycle', 'amount_source', 'payment_channel_code',
+            'route_policy_id', 'override_id'
+        ]:
+            res[f'__{item}_{key}'] = context.get(key)
+
+        if context.get('cost_bearer_name'):
+            res['财务归属'] = context['cost_bearer_name']
+
         # 如果个人未开启参保开关，强制全部归零
-        if int(emp_row.get(en_col, 0)) == 0:
+        if int(context.get('enabled', 0)) == 0:
             res[f'{item}_企'] = res[f'{item}_个'] = 0.0
             res[f'{item}_route'] = '不参保'
+            res[f'__{item}_base_amount'] = 0.0
             continue
 
-        route_entity = emp_row.get(acc_col, "省公众")
+        route_entity = context.get('payer_entity_name') or emp_row.get(acc_col, "省公众")
         res[f'{item}_route'] = route_entity
-        rules = get_policy_rules(target_year, route_entity)
+        policy_entity = context.get('calculation_policy_entity') or route_entity
+
+        # 地市属地直缴等项目需要回传实缴金额，不允许套省内规则伪算。
+        if context.get('amount_source') != 'system_calculated':
+            res[f'{item}_企'] = res[f'{item}_个'] = 0.0
+            res[f'__{item}_base_amount'] = 0.0
+            continue
+
+        rules = get_policy_rules(target_year, policy_entity)
         if not rules:
             res[f'{item}_企'] = res[f'{item}_个'] = 0.0
+            res[f'__{item}_base_amount'] = 0.0
+            res[f'__{item}_calculation_error'] = f'{target_year}-{policy_entity}未配置计算规则'
             continue
 
         # ----------------------------------------------------------------------
@@ -336,7 +389,7 @@ def calculate_complete_bill(emp_row: dict, target_year: str) -> dict:
                 # 强制降级为最原始纯粹的 'independent' 算法（严格按比例计算，只四舍五入到 1 元）
                 current_fund_method = 'independent'
 
-        _, c_amt, p_amt = calc_insurance_item(
+        actual_base, c_amt, p_amt = calc_insurance_item(
             item, raw_base,
             rules.get(f'{item}_upper', 0), rules.get(f'{item}_lower', 0),
             rules.get(f'{item}_comp_rate', 0), rules.get(f'{item}_pers_rate', 0),
@@ -345,12 +398,22 @@ def calculate_complete_bill(emp_row: dict, target_year: str) -> dict:
             rules.get('fund_soe_upper', 0),
             rules.get('fund_soe_lower', 0)
         )
+        res[f'__{item}_base_amount'] = actual_base
 
         # [核心解毒] 大病医疗 7 块钱绝对独立出来，绝不再塞进基本医疗里！
         if item == 'medical':
             serious_fix = rules.get('medical_serious_fix', 7.0)
             res['medical_serious_个'] = serious_fix
             total_pers += serious_fix  # 单独加到合计中，保证底账平齐
+            for key in [
+                'arrangement_id', 'arrangement_type', 'calculation_policy_entity',
+                'payer_entity_code', 'cost_bearer_code',
+                'settlement_counterparty_code', 'settlement_mode',
+                'settlement_cycle', 'amount_source', 'payment_channel_code',
+                'route_policy_id', 'override_id'
+            ]:
+                res[f'__medical_serious_{key}'] = context.get(key)
+            res['__medical_serious_base_amount'] = actual_base
 
         res[f'{item}_企'] = c_amt
         res[f'{item}_个'] = p_amt
@@ -371,6 +434,14 @@ def save_monthly_ss_records(df: pd.DataFrame, month: str) -> tuple:
     conn = _get_db_connection()
     cursor = conn.cursor()
     try:
+        locked_count = cursor.execute(
+            "SELECT COUNT(*) FROM ss_monthly_records WHERE cost_month = ? AND close_status = 'closed'",
+            (month,)
+        ).fetchone()[0]
+        if locked_count:
+            return False, f"❌ {month} 已封账，禁止覆盖。请先执行有记录的解封流程。"
+
+        cursor.execute("DELETE FROM social_monthly_items WHERE cost_month = ?", (month,))
         cursor.execute("DELETE FROM ss_monthly_records WHERE cost_month = ?", (month,))
 
         sql = """
@@ -378,19 +449,31 @@ def save_monthly_ss_records(df: pd.DataFrame, month: str) -> tuple:
                 record_id, cost_month, emp_id, cost_center,
                 pension_pers, medical_pers, medical_serious_pers, unemp_pers, fund_pers, annuity_pers,
                 pension_comp, medical_comp, unemp_comp, injury_comp, maternity_comp, fund_comp, annuity_comp,
-                pension_route, medical_route, unemp_route, injury_route, maternity_route, fund_route, annuity_route
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                pension_route, medical_route, unemp_route, injury_route, maternity_route, fund_route, annuity_route,
+                arrangement_id, business_type_snapshot, calculation_status, close_status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """
 
         insert_data = []
+        item_insert_data = []
+        item_codes = ['pension', 'medical', 'medical_serious', 'unemp', 'injury', 'maternity', 'fund', 'annuity']
         for _, row in df.iterrows():
-            eid = row['工号']
+            eid = str(row['工号'])
 
             # [核心解毒] 动态抓取前置计算出来的大病金额，不参保的人这里就是 0.0，彻底告别强行写死 7.0
             serious_pers_val = safe_float(row.get('medical_serious_个', 0.0))
 
+            record_id = f"{month}_{eid}"
+            arrangement_id = row.get('__pension_arrangement_id')
+            business_type = row.get('__pension_arrangement_type', 'normal') or 'normal'
+            calculation_status = (
+                'external_pending'
+                if any(row.get(f'__{item}_amount_source') not in {None, '', 'system_calculated'} for item in item_codes)
+                else 'calculated'
+            )
+
             insert_data.append((
-                f"{month}_{eid}", month, eid, row.get('财务归属', '本级'),
+                record_id, month, eid, row.get('财务归属', '本级'),
                 safe_float(row.get('pension_个')), safe_float(row.get('medical_个')), serious_pers_val,
                 safe_float(row.get('unemp_个')), safe_float(row.get('fund_个')), safe_float(row.get('annuity_个')),
 
@@ -398,12 +481,53 @@ def save_monthly_ss_records(df: pd.DataFrame, month: str) -> tuple:
                 safe_float(row.get('injury_企')), safe_float(row.get('maternity_企')), safe_float(row.get('fund_企')), safe_float(row.get('annuity_企')),
 
                 row.get('pension_route', ''), row.get('medical_route', ''), row.get('unemp_route', ''),
-                row.get('injury_route', ''), row.get('maternity_route', ''), row.get('fund_route', ''), row.get('annuity_route', '')
+                row.get('injury_route', ''), row.get('maternity_route', ''), row.get('fund_route', ''), row.get('annuity_route', ''),
+                arrangement_id, business_type, calculation_status, 'draft'
             ))
 
+            for item in item_codes:
+                source_item = 'medical' if item == 'medical_serious' else item
+                company_amount = 0.0 if item == 'medical_serious' else safe_float(row.get(f'{item}_企'))
+                personal_amount = (
+                    serious_pers_val if item == 'medical_serious'
+                    else safe_float(row.get(f'{item}_个'))
+                )
+                item_insert_data.append((
+                    f"{record_id}_{item}", record_id, month, eid,
+                    row.get(f'__{source_item}_arrangement_id'),
+                    row.get(f'__{source_item}_arrangement_type', business_type) or business_type,
+                    item, safe_float(row.get(f'__{item}_base_amount')),
+                    company_amount, personal_amount,
+                    row.get(f'__{source_item}_calculation_policy_entity'),
+                    row.get(f'__{source_item}_payer_entity_code'),
+                    row.get(f'__{source_item}_cost_bearer_code'),
+                    row.get(f'__{source_item}_settlement_counterparty_code'),
+                    row.get(f'__{source_item}_settlement_mode', 'none') or 'none',
+                    row.get(f'__{source_item}_settlement_cycle', 'none') or 'none',
+                    row.get(f'__{source_item}_amount_source', 'system_calculated') or 'system_calculated',
+                    row.get(f'__{source_item}_payment_channel_code'),
+                    row.get(f'__{source_item}_route_policy_id'),
+                    row.get(f'__{source_item}_override_id'),
+                    'draft'
+                ))
+
         cursor.executemany(sql, insert_data)
+        cursor.executemany("""
+            INSERT INTO social_monthly_items (
+                item_record_id, monthly_record_id, cost_month, emp_id,
+                arrangement_id, business_type_snapshot, insurance_item,
+                base_amount, company_amount, personal_amount,
+                calculation_policy_entity, payer_entity_code, cost_bearer_code,
+                settlement_counterparty_code, settlement_mode, settlement_cycle,
+                amount_source, payment_channel_code, route_policy_id, override_id,
+                close_status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, item_insert_data)
         conn.commit()
-        return True, f"✅ {month} 月份共 {len(insert_data)} 条核算记录（彻底斩断双重计费）已成功固化入库！"
+        return True, (
+            f"✅ {month} 共固化 {len(insert_data)} 人、{len(item_insert_data)} 条险种明细；"
+            "旧版汇总账同步保留。"
+        )
     except Exception as e:
         conn.rollback()
         return False, f"❌ 保存失败: {e}"

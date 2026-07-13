@@ -8,7 +8,19 @@ import pandas as pd
 import sqlite3
 import os
 
+from database.init_db import init_database
+
 st.set_page_config(page_title="MakeHREasy 系统中枢", layout="wide")
+
+
+@st.cache_resource
+def initialize_runtime_database():
+    """每个服务进程只执行一次兼容式结构升级。"""
+    init_database(os.environ.get('MAKE_HR_DB_PATH'))
+    return True
+
+
+initialize_runtime_database()
 
 
 # ------------------------------------------------------------------------------
@@ -17,7 +29,13 @@ st.set_page_config(page_title="MakeHREasy 系统中枢", layout="wide")
 def get_dashboard_metrics():
     current_dir = os.path.dirname(os.path.abspath(__file__))
     db_path = os.path.join(current_dir, 'database', 'hr_core.db')
-    metrics = {"total_active": 0, "interns_count": 0, "db_status": "离线"}
+    metrics = {
+        "total_active": 0,
+        "interns_count": 0,
+        "special_arrangements": 0,
+        "expiring_arrangements": 0,
+        "db_status": "离线",
+    }
     try:
         if os.path.exists(db_path):
             conn = sqlite3.connect(db_path)
@@ -38,6 +56,21 @@ def get_dashboard_metrics():
                              AND pos.pos_name = '实习岗'
                            """)
             metrics["interns_count"] = cursor.fetchone()[0]
+
+            cursor.execute("""
+                SELECT COUNT(*) FROM employee_arrangements
+                WHERE status = 'active'
+                  AND arrangement_type IN ('proxy_social', 'city_transfer', 'down_secondment')
+            """)
+            metrics["special_arrangements"] = cursor.fetchone()[0]
+
+            cursor.execute("""
+                SELECT COUNT(*) FROM employee_arrangements
+                WHERE status = 'active'
+                  AND planned_end_date IS NOT NULL
+                  AND date(planned_end_date) BETWEEN date('now') AND date('now', '+90 day')
+            """)
+            metrics["expiring_arrangements"] = cursor.fetchone()[0]
             conn.close()
     except Exception as e:
         metrics["db_status"] = f"连接异常: {e}"
@@ -62,11 +95,12 @@ def render_home_page():
         st.divider()
 
         st.subheader("📊 实时业务基盘")
-        m1, m2, m3, m4 = st.columns(4)
+        m1, m2, m3, m4, m5 = st.columns(5)
         m1.metric("当前在岗基数 (真实)", f"{real_data['total_active']} 人")
         m2.metric("在期实习生 (真实)", f"{real_data['interns_count']} 人")
-        m3.metric("薪酬引擎模块", "已就绪，待算力注入")
-        m4.metric("台账库对齐状态", "正常")
+        m3.metric("特殊用工关系", f"{real_data['special_arrangements']} 人")
+        m4.metric("90天内到期", f"{real_data['expiring_arrangements']} 人")
+        m5.metric("台账库对齐状态", "正常")
 
         st.write("<br>", unsafe_allow_html=True)
 

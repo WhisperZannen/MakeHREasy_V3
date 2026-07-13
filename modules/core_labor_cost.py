@@ -12,6 +12,10 @@ import pandas as pd
 # ------------------------------------------------------------------------------
 LEDGER_MAP = {
     '核算月份': 'cost_month', '工号': 'emp_id', '姓名': 'emp_name', '归属部门': 'dept_name', '人员状态': 'emp_status',
+    '用工关系ID': 'arrangement_id', '业务关系类型': 'business_type_snapshot',
+    '实际工作单位编码': 'actual_work_unit_code', '当前记账单位编码': 'accounting_entity_code',
+    '最终成本承担单位编码': 'ultimate_cost_bearer_code', '成本划转方式': 'reallocation_mode',
+    '成本划转状态': 'reallocation_status',
     '岗位工资': 'base_salary', '工龄工资': 'seniority_pay', '综合补贴': 'comp_subsidy', '岗位绩效浮动补贴': 'perf_float_subsidy',
     '通讯费': 'telecom_subsidy', '其他岗位工资': 'other_base_pay', '实习补贴': 'intern_subsidy', '高校毕业生/专家津贴': 'grad_allowance',
     '绩效工资标准(参考)': 'perf_standard', 'KPI得分(参考)': 'kpi_score', '考核绩效': 'eval_perf_pay', '提成绩效': 'commission_pay',
@@ -33,7 +37,13 @@ LEDGER_MAP = {
 }
 
 DB_TO_CN_MAP = {v: k for k, v in LEDGER_MAP.items()}
-NUMERIC_COLS = list(LEDGER_MAP.keys())[5:]
+TEXT_DB_COLUMNS = {
+    'cost_month', 'emp_id', 'emp_name', 'dept_name', 'emp_status',
+    'arrangement_id', 'business_type_snapshot', 'actual_work_unit_code',
+    'accounting_entity_code', 'ultimate_cost_bearer_code',
+    'reallocation_mode', 'reallocation_status',
+}
+NUMERIC_COLS = [cn for cn, db in LEDGER_MAP.items() if db not in TEXT_DB_COLUMNS]
 
 # ------------------------------------------------------------------------------
 # 数据库连接池初始化

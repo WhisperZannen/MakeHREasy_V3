@@ -42,6 +42,20 @@ from modules.core_social_security import (
     _get_db_connection,
     batch_update_emp_matrix
 )
+from modules.core_arrangements import (
+    ARRANGEMENT_LABELS,
+    INSURANCE_LABELS,
+    backfill_relationship_snapshots,
+    create_route_policy,
+    create_social_override,
+    get_entities_dataframe,
+    get_route_policies_dataframe,
+    get_settlement_batches_dataframe,
+    get_social_overrides_dataframe,
+    register_social_settlement_batch,
+    resolve_social_route,
+    update_settlement_batch_status,
+)
 
 st.set_page_config(page_title="社保与福利结算", layout="wide")
 
@@ -110,8 +124,9 @@ if 'pending_params' not in st.session_state: st.session_state['pending_params'] 
 st.title("🛡️ 社保与福利结算中心")
 st.caption("核心业务流向：当月基数备料 ➡️ 理论核算与补缴对账 ➡️ 跨主体结算与公对公要款 ➡️ 引擎底座配置")
 
-tab1, tab2, tab3, tab4 = st.tabs(
-    ["🧮 当月社保沙盘 (含补缴)", "📤 财务提款与公对公结算函", "⚙️ 全局规则与参数配置", "📥 历史账单导入 (冷启动)"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(
+    ["🧮 当月社保沙盘 (含补缴)", "📤 财务提款与公对公结算函", "⚙️ 全局规则与参数配置",
+     "📥 历史账单导入 (冷启动)", "🔀 缴费路由与个人例外"])
 
 # ------------------------------------------------------------------------------
 # Tab 1: 当月社保沙盘与对账池
@@ -224,14 +239,31 @@ with tab1:
             from modules.core_social_security import calculate_complete_bill
 
             for _, row in roster_df.iterrows():
-                all_bills.append(calculate_complete_bill(row.to_dict(), rule_year_to_use))
+                all_bills.append(calculate_complete_bill(row.to_dict(), rule_year_to_use, calc_month))
             st.session_state['temp_bills'] = pd.DataFrame(all_bills)
 
     if 'temp_bills' in st.session_state:
         raw_df_preview = st.session_state['temp_bills']
         export_df = raw_df_preview.copy()
 
-        cols_to_drop = ['injury_个', 'maternity_个']
+        calculation_error_cols = [
+            c for c in raw_df_preview.columns
+            if c.startswith('__') and c.endswith('_calculation_error')
+        ]
+        calculation_errors = []
+        for col in calculation_error_cols:
+            calculation_errors.extend(
+                raw_df_preview[col].dropna().astype(str).unique().tolist()
+            )
+        if calculation_errors:
+            st.error(
+                "🚨 检测到缺失的社保计算政策，相关险种已暂停计算，禁止直接固化："
+                + "；".join(sorted(set(calculation_errors)))
+            )
+
+        cols_to_drop = ['injury_个', 'maternity_个'] + [
+            c for c in export_df.columns if c.startswith('__')
+        ]
         export_df = export_df.drop(columns=[c for c in cols_to_drop if c in export_df.columns])
 
         audit_rename_map = {
@@ -277,15 +309,48 @@ with tab1:
                 export_df.to_excel(writer, index=False, sheet_name='0.全量合并底稿')
                 format_excel_sheet(writer.sheets['0.全量合并底稿'], export_df.columns)
 
-                # 定义拆分规则
-                split_configs = [
-                    {'name': '1.中电数智(五险两金综合)', 'route': '中电数智',
-                     'items': ['养老', '医疗', '大病', '失业', '工伤', '生育', '公积金', '年金']},
-                    {'name': '2.省公司(年金)', 'route': '省公司', 'items': ['年金']},
-                    {'name': '3.省公司(医疗_生育_工伤)', 'route': '省公司', 'items': ['医疗', '大病', '生育', '工伤']},
-                    {'name': '4.省公众(公积金)', 'route': '省公众', 'items': ['公积金']},
-                    {'name': '5.省公众(养老_失业_工伤)', 'route': '省公众', 'items': ['养老', '失业', '工伤']}
-                ]
+                # 根据本月实际“付款通道+险种”动态拆分，主体切换后不再漏表。
+                item_meta = {
+                    'pension': '养老', 'medical': '医疗', 'unemp': '失业',
+                    'injury': '工伤', 'maternity': '生育', 'fund': '公积金',
+                    'annuity': '年金'
+                }
+                channel_groups = {}
+                channel_lookup = {}
+                for item_code, item_name in item_meta.items():
+                    hidden_col = f'__{item_code}_payment_channel_code'
+                    route_col = f'{item_code}_route'
+                    if hidden_col not in raw_df_preview.columns or route_col not in raw_df_preview.columns:
+                        continue
+                    for _, source_row in raw_df_preview.iterrows():
+                        route_name = str(source_row.get(route_col, '')).strip()
+                        channel_code = str(source_row.get(hidden_col, '')).strip()
+                        if route_name in {'', '不参保', 'nan'} or not channel_code:
+                            continue
+                        key = (channel_code, route_name)
+                        channel_groups.setdefault(key, set()).add(item_name)
+                        if item_code == 'medical':
+                            channel_groups[key].add('大病')
+                        channel_lookup[(str(source_row['工号']), item_name)] = channel_code
+                        if item_code == 'medical':
+                            channel_lookup[(str(source_row['工号']), '大病')] = channel_code
+
+                split_configs = []
+                for idx, ((channel_code, route_name), item_names) in enumerate(
+                    sorted(channel_groups.items(), key=lambda value: (value[0][1], value[0][0])),
+                    1
+                ):
+                    ordered_items = [
+                        name for name in ['养老', '医疗', '大病', '失业', '工伤', '生育', '公积金', '年金']
+                        if name in item_names
+                    ]
+                    short_items = '_'.join(ordered_items)
+                    split_configs.append({
+                        'name': f'{idx}.{route_name}({short_items})'[:31],
+                        'route': route_name,
+                        'channel': channel_code,
+                        'items': ordered_items,
+                    })
 
                 # 2. 依次生成分表
                 for cfg in split_configs:
@@ -297,13 +362,19 @@ with tab1:
                     has_money = pd.Series([False] * len(df_sub), index=df_sub.index)
                     for item in cfg['items']:
                         if item == '大病':
-                            mask = df_sub['医疗缴纳主体'] == cfg['route']  # 大病跟着医疗的主体走
+                            channel_mask = df_sub['工号'].astype(str).map(
+                                lambda emp_id: channel_lookup.get((emp_id, '大病'))
+                            ) == cfg['channel']
+                            mask = (df_sub['医疗缴纳主体'] == cfg['route']) & channel_mask
                             df_sub.loc[~mask, '大病(个人)'] = 0.0
                             if '大病(个人)' in df_sub.columns: cols_to_keep.append('大病(个人)')
                             has_money = has_money | (df_sub['大病(个人)'] > 0)
                         else:
                             route_col = f"{item}缴纳主体"
-                            mask = df_sub[route_col] == cfg['route']
+                            channel_mask = df_sub['工号'].astype(str).map(
+                                lambda emp_id, item_name=item: channel_lookup.get((emp_id, item_name))
+                            ) == cfg['channel']
+                            mask = (df_sub[route_col] == cfg['route']) & channel_mask
 
                             c_col = f"{item}(企业)"
                             p_col = f"{item}(个人)"
@@ -329,7 +400,11 @@ with tab1:
             )
 
         with c_save:
-            if st.button("💾 2. 线下复核无误，将当期明细固化入库", type="primary"):
+            if st.button(
+                "💾 2. 线下复核无误，将当期明细固化入库",
+                type="primary",
+                disabled=bool(calculation_errors),
+            ):
                 from modules.core_social_security import save_monthly_ss_records
 
                 success, msg = save_monthly_ss_records(raw_df_preview, calc_month)
@@ -383,19 +458,53 @@ with tab1:
                 sql = """
                       INSERT INTO ss_retroactive_records (retro_id, process_month, emp_id, target_start_month, \
                                                           target_end_month, retro_type, \
-                                                          total_comp_retro, total_pers_retro, late_fee, remarks) \
-                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+                                                          total_comp_retro, total_pers_retro, late_fee, remarks,
+                                                          arrangement_id, payer_entity_code, cost_bearer_code,
+                                                          settlement_counterparty_code, settlement_mode) \
+                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
                       """
                 count = 0
+                retro_item_map = {
+                    '养老保险': 'pension', '医疗保险': 'medical', '大病医疗': 'medical',
+                    '失业保险': 'unemp', '工伤保险': 'injury', '生育保险': 'maternity',
+                    '住房公积金': 'fund', '企业年金': 'annuity'
+                }
+                matrix_account_columns = {
+                    'pension': ('pension_enabled', 'pension_account'),
+                    'medical': ('medical_enabled', 'medical_account'),
+                    'unemp': ('unemp_enabled', 'unemp_account'),
+                    'injury': ('injury_enabled', 'injury_account'),
+                    'maternity': ('maternity_enabled', 'maternity_account'),
+                    'fund': ('fund_enabled', 'fund_account'),
+                    'annuity': ('annuity_enabled', 'annuity_account'),
+                }
                 for _, row in r_df.iterrows():
                     eid = str(row.get('工号(必填)', '')).replace('.0', '').strip()
                     if not eid or eid == 'nan': continue
+                    process_month = str(row.get('处理月份(必填:YYYY-MM)', calc_month)).strip()
+                    retro_type = str(row.get('补缴险种(必选下拉框)', '未知险种'))
+                    item_code = retro_item_map.get(retro_type, 'pension')
+                    matrix_row = cursor.execute(
+                        "SELECT * FROM ss_emp_matrix WHERE emp_id = ?", (eid,)
+                    ).fetchone()
+                    matrix_data = dict(matrix_row) if matrix_row else {}
+                    enabled_col, account_col = matrix_account_columns[item_code]
+                    route_context = resolve_social_route(
+                        eid, item_code, process_month,
+                        legacy_enabled=int(matrix_data.get(enabled_col, 1) or 0),
+                        legacy_payer_name=str(matrix_data.get(account_col) or '省公众'),
+                        legacy_cost_center=str(matrix_data.get('cost_center') or '本级'),
+                        conn=conn,
+                    )
                     cursor.execute(sql, (
-                        str(uuid.uuid4())[:12], str(row.get('处理月份(必填:YYYY-MM)', calc_month)).strip(), eid,
+                        str(uuid.uuid4())[:12], process_month, eid,
                         str(row.get('补缴起始月(选填:YYYY-MM)', '')), str(row.get('补缴结束月(选填:YYYY-MM)', '')),
-                        str(row.get('补缴险种(必选下拉框)', '未知险种')),
+                        retro_type,
                         safe_float(row.get('企业本金合计', 0.0)), safe_float(row.get('个人本金合计', 0.0)),
-                        safe_float(row.get('企业承担滞纳金', 0.0)), str(row.get('备注(原因等)', ''))
+                        safe_float(row.get('企业承担滞纳金', 0.0)), str(row.get('备注(原因等)', '')),
+                        route_context.get('arrangement_id'), route_context.get('payer_entity_code'),
+                        route_context.get('cost_bearer_code'), route_context.get('settlement_counterparty_code'),
+                        route_context.get('settlement_mode') or 'none'
                     ))
                     count += 1
                 conn.commit()
@@ -404,6 +513,259 @@ with tab1:
                 st.error(f"❌ 写入补缴表失败: {e}")
             finally:
                 if 'conn' in locals(): conn.close()
+
+
+# ------------------------------------------------------------------------------
+# Tab 5: 带生效期的缴费路由与个人例外
+# ------------------------------------------------------------------------------
+with tab5:
+    st.subheader("🔀 缴费主体、计算政策与成本结算分离")
+    st.info(
+        "公共政策只定义某类关系从哪个月开始如何缴；挂靠人员具体缴哪些险种、"
+        "李峰林等个人特例在“个人例外”中按险种维护。新增版本不会改写历史账单。"
+    )
+
+    entity_df = get_entities_dataframe(active_only=True)
+    entity_names = dict(zip(entity_df['entity_code'], entity_df['entity_name']))
+    entity_options = [None] + entity_df['entity_code'].tolist()
+    item_options = list(INSURANCE_LABELS.keys())
+
+    route_tab, override_tab = st.tabs(["📘 公共路由政策", "👤 个人险种例外"])
+
+    with route_tab:
+        policy_df = get_route_policies_dataframe(active_only=False)
+        if not policy_df.empty:
+            display_policy = policy_df.copy()
+            display_policy['关系类型'] = display_policy['arrangement_type'].map(ARRANGEMENT_LABELS)
+            display_policy['险种'] = display_policy['insurance_item'].map(INSURANCE_LABELS)
+            st.dataframe(
+                display_policy[[
+                    'route_policy_id', 'policy_name', '关系类型', 'contract_entity_name', '险种',
+                    'effective_from_month', 'effective_to_month', 'calculation_policy_entity',
+                    'payer_entity_rule', 'payer_entity_name', 'cost_bearer_rule',
+                    'cost_bearer_name', 'settlement_mode', 'settlement_cycle',
+                    'amount_source', 'priority', 'active'
+                ]].rename(columns={
+                    'route_policy_id': '政策ID', 'policy_name': '政策名称',
+                    'contract_entity_name': '适用牌子', 'effective_from_month': '生效月',
+                    'effective_to_month': '失效月', 'calculation_policy_entity': '计算政策',
+                    'payer_entity_rule': '缴费主体规则', 'payer_entity_name': '固定缴费主体',
+                    'cost_bearer_rule': '成本承担规则', 'cost_bearer_name': '固定成本单位',
+                    'settlement_mode': '结算方式', 'settlement_cycle': '结算周期',
+                    'amount_source': '金额来源', 'priority': '优先级', 'active': '启用'
+                }),
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            st.caption("尚未设置公共路由政策，系统继续完全沿用现有人员参保矩阵。")
+
+        with st.expander("➕ 新增一个生效版本", expanded=False):
+            with st.form("route_policy_form"):
+                policy_name = st.text_input("政策名称*")
+                pc1, pc2, pc3 = st.columns(3)
+                with pc1:
+                    arrangement_type = st.selectbox(
+                        "适用关系*", list(ARRANGEMENT_LABELS.keys()),
+                        format_func=lambda value: ARRANGEMENT_LABELS[value]
+                    )
+                    contract_entity = st.selectbox(
+                        "限定劳动合同主体", entity_options,
+                        format_func=lambda value: "全部牌子" if value is None else entity_names[value]
+                    )
+                    insurance_item = st.selectbox(
+                        "险种*", item_options,
+                        format_func=lambda value: INSURANCE_LABELS[value]
+                    )
+                with pc2:
+                    effective_from = st.text_input("生效月份*", value=datetime.date.today().strftime('%Y-%m'))
+                    has_policy_end = st.checkbox("设置失效月份")
+                    effective_to = st.text_input("失效月份", value="")
+                    enabled_option = st.selectbox("参保开关", ['沿用个人配置', '默认参保', '默认不参保'])
+                with pc3:
+                    calculation_entity = st.selectbox(
+                        "计算政策主体", entity_options,
+                        format_func=lambda value: "沿用原缴费主体" if value is None else entity_names[value]
+                    )
+                    amount_source = st.selectbox(
+                        "金额来源", ['system_calculated', 'external_actual', 'manual_confirmed']
+                    )
+                    priority = st.number_input("优先级", min_value=1, max_value=9999, value=100)
+
+                pr1, pr2 = st.columns(2)
+                with pr1:
+                    payer_rule = st.selectbox(
+                        "实际缴费主体规则",
+                        ['legacy', 'fixed', 'contract_entity', 'payroll_entity', 'actual_work_unit', 'related_branch']
+                    )
+                    payer_entity = st.selectbox(
+                        "固定缴费主体", entity_options,
+                        format_func=lambda value: "不固定" if value is None else entity_names[value]
+                    )
+                    payment_channel = st.text_input("付款通道编码（可选）")
+                with pr2:
+                    cost_rule = st.selectbox(
+                        "最终成本承担规则",
+                        ['legacy', 'fixed', 'accounting_entity', 'ultimate_cost_bearer', 'related_branch']
+                    )
+                    cost_entity = st.selectbox(
+                        "固定成本承担单位", entity_options,
+                        format_func=lambda value: "不固定" if value is None else entity_names[value]
+                    )
+                    settlement_counterparty = st.selectbox(
+                        "固定结算对象", entity_options,
+                        format_func=lambda value: "按关系处理" if value is None else entity_names[value]
+                    )
+
+                ps1, ps2 = st.columns(2)
+                with ps1:
+                    settlement_mode = st.selectbox(
+                        "结算方式", ['none', 'proxy_social', 'central_chargeback',
+                                     'annual_reimbursement', 'local_direct', 'record_only']
+                    )
+                    settlement_cycle = st.selectbox(
+                        "结算周期", ['none', 'monthly', 'quarterly', 'annual', 'mixed']
+                    )
+                with ps2:
+                    policy_remarks = st.text_area("政策说明")
+
+                if st.form_submit_button("保存新政策版本", type="primary"):
+                    enabled_default = {'沿用个人配置': None, '默认参保': 1, '默认不参保': 0}[enabled_option]
+                    ok, msg = create_route_policy({
+                        'policy_name': policy_name,
+                        'arrangement_type': arrangement_type,
+                        'contract_entity_code': contract_entity,
+                        'insurance_item': insurance_item,
+                        'effective_from_month': effective_from.strip(),
+                        'effective_to_month': effective_to.strip() if has_policy_end and effective_to.strip() else None,
+                        'enabled_default': enabled_default,
+                        'calculation_policy_entity': calculation_entity,
+                        'payer_entity_rule': payer_rule,
+                        'payer_entity_code': payer_entity,
+                        'cost_bearer_rule': cost_rule,
+                        'cost_bearer_code': cost_entity,
+                        'settlement_counterparty_code': settlement_counterparty,
+                        'settlement_mode': settlement_mode,
+                        'settlement_cycle': settlement_cycle,
+                        'amount_source': amount_source,
+                        'payment_channel_code': payment_channel.strip() or None,
+                        'priority': int(priority), 'active': 1, 'remarks': policy_remarks,
+                    })
+                    if ok:
+                        st.success(msg)
+                    else:
+                        st.error(msg)
+
+    with override_tab:
+        override_df = get_social_overrides_dataframe(active_only=False)
+        if not override_df.empty:
+            display_override = override_df.copy()
+            display_override['险种'] = display_override['insurance_item'].map(INSURANCE_LABELS)
+            st.dataframe(
+                display_override[[
+                    'override_id', 'emp_name', 'emp_id', '险种', 'effective_from_month',
+                    'effective_to_month', 'enabled', 'calculation_policy_entity',
+                    'payer_entity_name', 'cost_bearer_name', 'settlement_mode',
+                    'settlement_cycle', 'special_reason', 'source_document_no', 'active'
+                ]].rename(columns={
+                    'override_id': '例外ID', 'emp_name': '姓名', 'emp_id': '工号',
+                    'effective_from_month': '生效月', 'effective_to_month': '失效月',
+                    'enabled': '参保', 'calculation_policy_entity': '计算政策',
+                    'payer_entity_name': '缴费主体', 'cost_bearer_name': '成本承担',
+                    'settlement_mode': '结算方式', 'settlement_cycle': '结算周期',
+                    'special_reason': '特殊原因', 'source_document_no': '依据', 'active': '启用'
+                }),
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            st.caption("暂无个人例外。原挂靠人员仍按现有Excel参保开关和缴费主体运行。")
+
+        conn_people = _get_db_connection()
+        people_df = pd.read_sql_query(
+            "SELECT emp_id, name, status FROM employees WHERE status IN ('在职','挂靠人员') ORDER BY name",
+            conn_people
+        )
+        conn_people.close()
+        people_options = people_df['emp_id'].astype(str).tolist()
+        people_names = dict(zip(
+            people_df['emp_id'].astype(str),
+            people_df.apply(lambda row: f"{row['name']}（{row['status']}）", axis=1)
+        ))
+
+        with st.expander("➕ 新增个人险种例外", expanded=False):
+            with st.form("social_override_form"):
+                oc1, oc2, oc3 = st.columns(3)
+                with oc1:
+                    override_emp = st.selectbox("员工*", people_options, format_func=lambda value: people_names[value])
+                    override_item = st.selectbox("险种*", item_options, format_func=lambda value: INSURANCE_LABELS[value])
+                    override_enabled = st.selectbox("参保开关", ['沿用原配置', '参保', '不参保'])
+                with oc2:
+                    override_from = st.text_input("生效月份*", value=datetime.date.today().strftime('%Y-%m'), key='override_from')
+                    override_has_end = st.checkbox("设置失效月份", key='override_has_end')
+                    override_to = st.text_input("失效月份", value="", key='override_to')
+                    override_calc_entity = st.selectbox(
+                        "计算政策主体", entity_options,
+                        format_func=lambda value: "沿用公共/原配置" if value is None else entity_names[value],
+                        key='override_calc_entity'
+                    )
+                with oc3:
+                    override_payer = st.selectbox(
+                        "实际缴费主体", entity_options,
+                        format_func=lambda value: "沿用公共/原配置" if value is None else entity_names[value],
+                        key='override_payer'
+                    )
+                    override_cost = st.selectbox(
+                        "最终成本承担", entity_options,
+                        format_func=lambda value: "沿用关系/原配置" if value is None else entity_names[value],
+                        key='override_cost'
+                    )
+                    override_counterparty = st.selectbox(
+                        "结算对象", entity_options,
+                        format_func=lambda value: "沿用关系" if value is None else entity_names[value],
+                        key='override_counterparty'
+                    )
+
+                oo1, oo2 = st.columns(2)
+                with oo1:
+                    override_settlement = st.selectbox(
+                        "结算方式", ['沿用关系', 'none', 'proxy_social', 'central_chargeback',
+                                     'annual_reimbursement', 'local_direct', 'record_only']
+                    )
+                    override_cycle = st.selectbox(
+                        "结算周期", ['沿用关系', 'none', 'monthly', 'quarterly', 'annual', 'mixed']
+                    )
+                    override_amount_source = st.selectbox(
+                        "金额来源", ['沿用公共政策', 'system_calculated', 'external_actual', 'manual_confirmed']
+                    )
+                with oo2:
+                    special_reason = st.text_input("特殊原因*")
+                    override_document = st.text_input("政策/协议依据")
+                    override_channel = st.text_input("付款通道编码（可选）")
+
+                if st.form_submit_button("保存个人例外", type="primary"):
+                    enabled_value = {'沿用原配置': None, '参保': 1, '不参保': 0}[override_enabled]
+                    ok, msg = create_social_override({
+                        'emp_id': override_emp, 'insurance_item': override_item,
+                        'effective_from_month': override_from.strip(),
+                        'effective_to_month': override_to.strip() if override_has_end and override_to.strip() else None,
+                        'enabled': enabled_value,
+                        'calculation_policy_entity': override_calc_entity,
+                        'payer_entity_code': override_payer,
+                        'cost_bearer_code': override_cost,
+                        'settlement_counterparty_code': override_counterparty,
+                        'settlement_mode': None if override_settlement == '沿用关系' else override_settlement,
+                        'settlement_cycle': None if override_cycle == '沿用关系' else override_cycle,
+                        'amount_source': None if override_amount_source == '沿用公共政策' else override_amount_source,
+                        'payment_channel_code': override_channel.strip() or None,
+                        'special_reason': special_reason,
+                        'source_document_no': override_document,
+                        'active': 1,
+                    })
+                    if ok:
+                        st.success(msg)
+                    else:
+                        st.error(msg)
 
 # ------------------------------------------------------------------------------
 # (Tab 2, Tab 3, Tab 4 维持之前的代码逻辑不动)
@@ -449,10 +811,14 @@ with tab2:
         raw_df = pd.read_sql_query(query, conn, params=[s_m, e_m])
 
         retro_query = """
-            SELECT r.*, e.name AS '姓名', IFNULL(m.cost_center, '本级') AS 'cost_center'
+            SELECT r.*, e.name AS '姓名',
+                   COALESCE(cost_entity.entity_name, m.cost_center, '本级') AS 'cost_center',
+                   payer_entity.entity_name AS 'retro_payer_name'
             FROM ss_retroactive_records r
             LEFT JOIN employees e ON r.emp_id = e.emp_id
             LEFT JOIN ss_emp_matrix m ON r.emp_id = m.emp_id
+            LEFT JOIN business_entities cost_entity ON r.cost_bearer_code = cost_entity.entity_code
+            LEFT JOIN business_entities payer_entity ON r.payer_entity_code = payer_entity.entity_code
             WHERE r.process_month >= ? AND r.process_month <= ?
         """
         retro_df = pd.read_sql_query(retro_query, conn, params=[s_m, e_m])
@@ -481,6 +847,35 @@ with tab2:
                 ]
 
                 all_insurance_items = ['pension', 'medical', 'unemp', 'injury', 'maternity', 'fund', 'annuity']
+
+                # 保留现有5个财务通道，同时自动发现主体切换后新增的“主体+险种”组合。
+                # 例如医疗、生育转到省公众后，会形成新增通道文件，不会被旧硬编码漏掉。
+                covered_pairs = {
+                    (cfg['route'], item)
+                    for cfg in channel_configs
+                    for item in cfg['items']
+                }
+                extra_pairs = {}
+                if not raw_df.empty:
+                    for item in all_insurance_items:
+                        route_col = f'{item}_route'
+                        money_cols_for_item = [
+                            col for col in [f'{item}_comp', f'{item}_pers']
+                            if col in raw_df.columns
+                        ]
+                        if route_col not in raw_df.columns or not money_cols_for_item:
+                            continue
+                        positive_rows = raw_df[raw_df[money_cols_for_item].fillna(0).abs().sum(axis=1) > 0]
+                        for route_name in positive_rows[route_col].dropna().astype(str).unique():
+                            if route_name not in {'', '不参保', 'None'} and (route_name, item) not in covered_pairs:
+                                extra_pairs.setdefault(route_name, set()).add(item)
+
+                for route_name, items in sorted(extra_pairs.items()):
+                    channel_configs.append({
+                        'name': f"{len(channel_configs) + 1}.{route_name}(新增缴费通道)",
+                        'route': route_name,
+                        'items': sorted(items, key=all_insurance_items.index)
+                    })
 
                 if not raw_df.empty:
                     for config in channel_configs:
@@ -597,10 +992,42 @@ with tab2:
         """
         ext_df = pd.read_sql_query(ext_query, conn, params=ext_params)
 
+        item_mode_df = pd.read_sql_query(
+            """
+            SELECT cost_month, emp_id, insurance_item, settlement_mode
+            FROM social_monthly_items
+            WHERE cost_month >= ? AND cost_month <= ?
+            """,
+            conn,
+            params=[s_m, e_m]
+        )
+        if not item_mode_df.empty and not ext_df.empty:
+            settlement_mode_map = {
+                (str(row['cost_month']), str(row['emp_id']), str(row['insurance_item'])):
+                    str(row['settlement_mode'])
+                for _, row in item_mode_df.iterrows()
+            }
+            allowed_letter_modes = {
+                'proxy_social', 'annual_reimbursement', 'central_chargeback'
+            }
+            for idx, ext_row in ext_df.iterrows():
+                month_key = str(ext_row['cost_month'])
+                emp_key = str(ext_row['emp_id'])
+                for item in ['pension', 'medical', 'unemp', 'injury', 'maternity', 'fund', 'annuity']:
+                    mode = settlement_mode_map.get((month_key, emp_key, item))
+                    if mode is not None and mode not in allowed_letter_modes:
+                        if f'{item}_comp' in ext_df.columns:
+                            ext_df.at[idx, f'{item}_comp'] = 0.0
+                        if f'{item}_pers' in ext_df.columns:
+                            ext_df.at[idx, f'{item}_pers'] = 0.0
+                        if item == 'medical' and 'medical_serious_pers' in ext_df.columns:
+                            ext_df.at[idx, 'medical_serious_pers'] = 0.0
+
         retro_query = f"""
             SELECT r.*, e.name AS '姓名', 
-                   IFNULL(m.cost_center, '本级') AS 'cost_center',
+                   COALESCE(cost_entity.entity_name, m.cost_center, '本级') AS 'cost_center',
                    COALESCE(NULLIF(m.ss_base_actual, 0.0), NULLIF(m.base_salary_avg, 0.0), 0.0) AS '基数',
+                   payer_entity.entity_name AS 'retro_payer_name',
                    m.pension_account AS 'pension_route', m.medical_account AS 'medical_route',
                    m.unemp_account AS 'unemp_route', m.injury_account AS 'injury_route',
                    m.maternity_account AS 'maternity_route', m.fund_account AS 'fund_route',
@@ -608,7 +1035,10 @@ with tab2:
             FROM ss_retroactive_records r
             LEFT JOIN employees e ON r.emp_id = e.emp_id
             LEFT JOIN ss_emp_matrix m ON r.emp_id = m.emp_id
-            WHERE r.process_month >= ? AND r.process_month <= ? AND IFNULL(m.cost_center, '本级') IN ({placeholders})
+            LEFT JOIN business_entities cost_entity ON r.cost_bearer_code = cost_entity.entity_code
+            LEFT JOIN business_entities payer_entity ON r.payer_entity_code = payer_entity.entity_code
+            WHERE r.process_month >= ? AND r.process_month <= ?
+              AND COALESCE(cost_entity.entity_name, m.cost_center, '本级') IN ({placeholders})
         """
         retro_df = pd.read_sql_query(retro_query, conn, params=ext_params)
         conn.close()
@@ -616,6 +1046,11 @@ with tab2:
         retro_map = {'养老保险':'pension', '医疗保险':'medical', '大病医疗':'medical_serious', '失业保险':'unemp', '工伤保险':'injury', '生育保险':'maternity', '住房公积金':'fund', '企业年金':'annuity'}
         normalized_retro = []
         for _, row in retro_df.iterrows():
+            retro_settlement_mode = row.get('settlement_mode')
+            if pd.notna(retro_settlement_mode) and str(retro_settlement_mode) not in {
+                '', 'proxy_social', 'annual_reimbursement', 'central_chargeback'
+            }:
+                continue
             prefix = retro_map.get(row.get('retro_type', ''))
             if not prefix: continue
 
@@ -623,7 +1058,8 @@ with tab2:
                 'cost_month': f"补缴({row['process_month']})",
                 'emp_id': row['emp_id'], '姓名': row['姓名'], 'cost_center': row['cost_center'], '基数': row['基数'],
                 f'{prefix}_comp': row['total_comp_retro'], f'{prefix}_pers': row['total_pers_retro'],
-                f'{prefix}_route': row.get(f'{prefix}_route', '未知'), 'late_fee': row['late_fee']
+                f'{prefix}_route': row.get('retro_payer_name') or row.get(f'{prefix}_route', '未知'),
+                'late_fee': row['late_fee']
             }
             normalized_retro.append(new_row)
 
@@ -696,6 +1132,9 @@ with tab2:
                         row_totals.append(r_tot)
                     df_cc_route['当行合计'] = row_totals
                     total_sum = sum(row_totals)
+                    settlement_batch_id = register_social_settlement_batch(
+                        s_m, e_m, str(cc), str(route_name), total_sum
+                    )
 
                     if not first_letter: merged_doc.add_page_break()
                     first_letter = False
@@ -718,7 +1157,11 @@ with tab2:
 
                     ins_str = "、".join([ac['name'] for ac in active_cols])
                     p_body1 = merged_doc.add_paragraph(f"    因业务开展需要，{cc}{emp_names}社保（{ins_str}）暂由{account_name}代缴，代缴金额据实结算。")
-                    p_body2 = merged_doc.add_paragraph(f"    从{s_m[:4]}年{s_m[-2:]}月到{e_m[:4]}年{e_m[-2:]}月，代缴金额为{total_sum:.2f}元，明细如下：\n")
+                    p_body2 = merged_doc.add_paragraph(
+                        f"    从{s_m[:4]}年{s_m[-2:]}月到{e_m[:4]}年{e_m[-2:]}月，"
+                        f"代缴金额为{total_sum:.2f}元，明细如下：\n"
+                        f"    系统结算批次：{settlement_batch_id}"
+                    )
                     for p in [p_body1, p_body2]:
                         for run in p.runs:
                             run.font.name = '宋体'; run._element.rPr.rFonts.set(qn('w:eastAsia'), '宋体'); run.font.size = Pt(12)
@@ -827,6 +1270,53 @@ with tab2:
             file_name=st.session_state['ss_word_filename'],
             type="secondary"
         )
+
+    st.divider()
+    st.subheader("📚 结算批次台账")
+    batch_df = get_settlement_batches_dataframe()
+    if batch_df.empty:
+        st.caption("生成结算函后，系统会在这里登记唯一批次，避免同一期间重复结算。")
+    else:
+        st.dataframe(
+            batch_df[[
+                'batch_id', 'period_start', 'period_end', 'branch_name', 'payee_name',
+                'total_amount', 'settled_amount', 'status', 'generated_at', 'settled_at', 'voucher_no'
+            ]].rename(columns={
+                'batch_id': '批次号', 'period_start': '开始月', 'period_end': '结束月',
+                'branch_name': '付款地市', 'payee_name': '收款主体',
+                'total_amount': '应结金额', 'settled_amount': '已结金额',
+                'status': '状态', 'generated_at': '生成时间', 'settled_at': '到账时间',
+                'voucher_no': '凭证号'
+            }),
+            use_container_width=True,
+            hide_index=True,
+        )
+        with st.expander("更新结算到账状态", expanded=False):
+            batch_options = batch_df['batch_id'].tolist()
+            batch_labels = {
+                row['batch_id']: f"{row['period_start']}至{row['period_end']} | {row['branch_name']} → {row['payee_name']}"
+                for _, row in batch_df.iterrows()
+            }
+            with st.form("settlement_status_form"):
+                selected_batch = st.selectbox(
+                    "结算批次", batch_options, format_func=lambda value: batch_labels[value]
+                )
+                selected_source = batch_df[batch_df['batch_id'] == selected_batch].iloc[0]
+                batch_status = st.selectbox("状态", ['generated', 'sent', 'confirmed', 'paid'])
+                settled_amount = st.number_input(
+                    "已结金额", min_value=0.0,
+                    value=float(selected_source['settled_amount'] or 0.0),
+                    step=0.01
+                )
+                voucher_no = st.text_input("到账/会计凭证号", value=str(selected_source['voucher_no'] or ''))
+                if st.form_submit_button("保存批次状态", type="primary"):
+                    ok, msg = update_settlement_batch_status(
+                        selected_batch, batch_status, settled_amount, voucher_no
+                    )
+                    if ok:
+                        st.success(msg)
+                    else:
+                        st.error(msg)
 
 # ------------------------------------------------------------------------------
 # Tab 3: 全局规则与参数配置
@@ -1091,7 +1581,11 @@ with tab4:
                     ))
                     count += 1
                 conn.commit()
-                st.success(f"✅ 历史死账冷启动成功！共覆盖/写入 {count} 条月度固化记录。")
+                snapshot_counts = backfill_relationship_snapshots()
+                st.success(
+                    f"✅ 历史账单成功覆盖/写入 {count} 条；"
+                    f"关系与险种快照已同步 {snapshot_counts['social_items']} 条。"
+                )
             except Exception as e:
                 st.error(f"❌ 导入崩溃: {e}")
             finally:
