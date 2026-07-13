@@ -605,6 +605,39 @@ def ensure_work_arrangement_schema(cursor):
             GROUP BY trim(cost_center)
         ''')
 
+
+def ensure_finance_labor_schema(cursor):
+    """创建财务人工成本预核对审计表，不改变人工成本主表字段。"""
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS finance_labor_import_batches (
+            batch_id TEXT PRIMARY KEY,
+            cost_month TEXT NOT NULL,
+            ledger_file_name TEXT,
+            monthly_file_name TEXT,
+            ytd_file_name TEXT,
+            status TEXT NOT NULL DEFAULT 'previewed',
+            imported_records INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            confirmed_at TIMESTAMP
+        )
+    ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS finance_labor_reconciliation (
+            reconciliation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            batch_id TEXT NOT NULL,
+            reconciliation_scope TEXT NOT NULL,
+            control_item TEXT NOT NULL,
+            account_codes TEXT,
+            finance_amount REAL DEFAULT 0.0,
+            ledger_amount REAL DEFAULT 0.0,
+            difference_amount REAL DEFAULT 0.0,
+            processing_mode TEXT,
+            reconciliation_status TEXT,
+            remarks TEXT,
+            FOREIGN KEY (batch_id) REFERENCES finance_labor_import_batches(batch_id)
+        )
+    ''')
+
 def init_database(db_path=None):
     # 获取当前脚本所在绝对路径，拼接数据库文件路径，防止生成的数据库文件位置错乱
     current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -1363,6 +1396,7 @@ def init_database(db_path=None):
         # --- 表 15+：多形态用工、社保路由与结算兼容层 ---
         # 只新增表和字段，不删除现有人员、社保、薪酬或人工成本数据。
         ensure_work_arrangement_schema(cursor)
+        ensure_finance_labor_schema(cursor)
 
         conn.commit()
         print("✅ V3.6 用工关系、社保路由与结算底座初始化成功！")

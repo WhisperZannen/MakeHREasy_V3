@@ -13,6 +13,7 @@ import pandas as pd
 import sqlite3
 import os
 import io
+import uuid
 
 # 用于 Excel 报表精装修
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -23,7 +24,9 @@ from modules.core_labor_cost import (
     LEDGER_MAP, DB_TO_CN_MAP, NUMERIC_COLS,
     _get_db_connection, cleanse_db_timestamps,
     sort_flat_ledger_df, add_subtotals_and_totals, get_ledger_data,
-    localize_labor_cost_codes,
+    localize_labor_cost_codes, read_labor_ledger_workbook,
+    read_finance_account_workbook, prepare_finance_labor_precheck,
+    recalculate_labor_cost_columns,
 )
 from modules.core_arrangements import get_effective_arrangement
 
@@ -228,6 +231,226 @@ def build_effective_dept_snapshot(conn, target_month):
         )
 
     return effective_dept_name_by_emp
+
+
+def resolve_hr_director_tail_carrier(conn, ledger_df):
+    """从组织和岗位档案识别人力资源部主任，并确认其存在于本月底表。"""
+    director_df = pd.read_sql_query(
+        '''
+        SELECT e.emp_id, e.name
+        FROM employees e
+        JOIN departments d ON e.dept_id = d.dept_id
+        JOIN employee_profiles ep ON e.emp_id = ep.emp_id
+        JOIN positions p ON ep.pos_id = p.pos_id
+        WHERE e.status = '在职'
+          AND trim(d.dept_name) = '人力资源部'
+          AND trim(p.pos_name) = '主任'
+        ORDER BY e.emp_id
+        ''',
+        conn,
+    )
+    if len(director_df) != 1:
+        raise ValueError(
+            f'系统应识别到1名在职人力资源部主任，当前识别到{len(director_df)}名。'
+        )
+
+    director_id = str(director_df.iloc[0]['emp_id']).strip()
+    director_name = str(director_df.iloc[0]['name']).strip()
+    ledger_ids = (
+        ledger_df['工号'].astype(str).str.replace(r'\.0$', '', regex=True).str.strip()
+    )
+    if not ledger_ids.eq(director_id).any():
+        raise ValueError(
+            f'本月底表中没有人力资源部主任{director_name}（{director_id}），不能自动承接经费尾差。'
+        )
+    return director_id, director_name
+
+
+def upsert_labor_cost_dataframe(in_df):
+    """把已经通过预核对的中文人员台账写入数据库。"""
+    normalized_df = recalculate_labor_cost_columns(in_df)
+    conn = _get_db_connection()
+    cursor = conn.cursor()
+    success_count = 0
+    try:
+        for _, row in normalized_df.iterrows():
+            employee_name = str(row.get('姓名', '')).strip()
+            department_name = str(row.get('归属部门', '')).strip()
+            if employee_name in ['【小计】', '【实际成本总计】']:
+                continue
+            if department_name in ['【在职及统筹部分】']:
+                continue
+
+            raw_month = str(row.get('核算月份', '')).strip()
+            raw_id = row.get('工号', '')
+            if pd.isna(raw_id):
+                employee_id = ''
+            elif isinstance(raw_id, float):
+                employee_id = str(int(raw_id))
+            else:
+                employee_id = str(raw_id).replace('.0', '').strip()
+            if not raw_month or not employee_id or raw_month == 'nan' or employee_id == 'nan':
+                continue
+            cost_month = raw_month[:7].replace('/', '-') if len(raw_month) >= 7 else raw_month
+
+            db_data = {}
+            for cn_column, db_column in LEDGER_MAP.items():
+                if db_column == 'cost_month':
+                    db_data[db_column] = cost_month
+                    continue
+                value = row.get(cn_column, None)
+                if cn_column in NUMERIC_COLS:
+                    try:
+                        clean_value = str(value).replace(',', '').strip()
+                        db_data[db_column] = (
+                            float(clean_value)
+                            if pd.notna(value) and clean_value != ''
+                            else 0.0
+                        )
+                    except (TypeError, ValueError):
+                        db_data[db_column] = 0.0
+                else:
+                    db_data[db_column] = str(value).strip() if pd.notna(value) else ''
+
+            if not db_data.get('business_type_snapshot'):
+                arrangement = get_effective_arrangement(employee_id, cost_month, conn)
+                relation_type = arrangement.get('arrangement_type', 'normal')
+                db_data['arrangement_id'] = arrangement.get('arrangement_id')
+                db_data['business_type_snapshot'] = relation_type
+                db_data['actual_work_unit_code'] = arrangement.get('actual_work_unit_code')
+                db_data['accounting_entity_code'] = arrangement.get('accounting_entity_code')
+                db_data['ultimate_cost_bearer_code'] = arrangement.get('ultimate_cost_bearer_code')
+                if relation_type == 'city_transfer':
+                    db_data['reallocation_mode'] = 'annual_labor_cost_reallocation'
+                    db_data['reallocation_status'] = 'pending'
+                elif relation_type == 'down_secondment':
+                    db_data['reallocation_mode'] = 'mixed_by_item'
+                    db_data['reallocation_status'] = 'pending'
+                elif relation_type == 'proxy_social':
+                    db_data['reallocation_mode'] = 'quarterly_social_settlement'
+                    db_data['reallocation_status'] = 'pending'
+                else:
+                    db_data['reallocation_mode'] = 'none'
+                    db_data['reallocation_status'] = 'not_required'
+
+            columns = list(db_data.keys())
+            placeholders = ','.join(['?'] * len(columns))
+            updates = ','.join(
+                f'{column}=excluded.{column}'
+                for column in columns
+                if column not in ['cost_month', 'emp_id']
+            )
+            cursor.execute(
+                f'''
+                    INSERT INTO labor_cost_ledger ({','.join(columns)})
+                    VALUES ({placeholders})
+                    ON CONFLICT(cost_month, emp_id) DO UPDATE SET {updates}
+                ''',
+                tuple(db_data.values()),
+            )
+            success_count += 1
+        conn.commit()
+        return success_count
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def build_finance_precheck_workbook(precheck_result):
+    """生成可继续导入的人员台账，并附带自动处理与双口径核对证据。"""
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        processed = precheck_result['processed_ledger']
+        processed.to_excel(writer, index=False, sheet_name='待导入台账')
+        if not precheck_result['monthly_reconciliation'].empty:
+            precheck_result['monthly_reconciliation'].to_excel(
+                writer, index=False, sheet_name='当月核对'
+            )
+        if not precheck_result['ytd_reconciliation'].empty:
+            precheck_result['ytd_reconciliation'].to_excel(
+                writer, index=False, sheet_name='累计核对'
+            )
+        precheck_result['auto_actions'].to_excel(
+            writer, index=False, sheet_name='自动处理说明'
+        )
+        precheck_result['business_checks'].to_excel(
+            writer, index=False, sheet_name='业务公式核对'
+        )
+        precheck_result['pending_accounts'].to_excel(
+            writer, index=False, sheet_name='待确认科目'
+        )
+
+        format_excel_sheet(writer.sheets['待导入台账'], processed.columns)
+        for sheet_name, worksheet in writer.sheets.items():
+            if sheet_name == '待导入台账':
+                continue
+            worksheet.freeze_panes = 'A2'
+            for column_index in range(1, worksheet.max_column + 1):
+                worksheet.column_dimensions[get_column_letter(column_index)].width = 22
+    return output.getvalue()
+
+
+def save_finance_precheck_audit(
+    cost_month, file_names, precheck_result, imported_records
+):
+    """保存财务源表核对结果；不保存源文件内容，避免数据库膨胀。"""
+    batch_id = f"LC-{cost_month}-{uuid.uuid4().hex[:12]}"
+    conn = _get_db_connection()
+    try:
+        conn.execute(
+            '''
+            INSERT INTO finance_labor_import_batches(
+                batch_id, cost_month, ledger_file_name, monthly_file_name,
+                ytd_file_name, status, imported_records, confirmed_at
+            ) VALUES (?, ?, ?, ?, ?, 'imported', ?, CURRENT_TIMESTAMP)
+            ''',
+            (
+                batch_id,
+                cost_month,
+                file_names.get('ledger'),
+                file_names.get('monthly'),
+                file_names.get('ytd'),
+                imported_records,
+            ),
+        )
+        reconciliation = pd.concat(
+            [
+                precheck_result['monthly_reconciliation'],
+                precheck_result['ytd_reconciliation'],
+            ],
+            ignore_index=True,
+        )
+        for _, row in reconciliation.iterrows():
+            conn.execute(
+                '''
+                INSERT INTO finance_labor_reconciliation(
+                    batch_id, reconciliation_scope, control_item, account_codes,
+                    finance_amount, ledger_amount, difference_amount,
+                    processing_mode, reconciliation_status, remarks
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''',
+                (
+                    batch_id,
+                    row.get('核对范围', ''),
+                    row.get('核对项目', ''),
+                    row.get('财务科目', ''),
+                    float(row.get('财务金额', 0.0)),
+                    float(row.get('台账金额', 0.0)),
+                    float(row.get('差额（台账-财务）', 0.0)),
+                    row.get('处理方式', ''),
+                    row.get('核对状态', ''),
+                    row.get('说明', ''),
+                ),
+            )
+        conn.commit()
+        return batch_id
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 # ==============================================================================
 # 页面主框架
@@ -742,6 +965,259 @@ with tab2:
 with tab3:
     st.subheader("📥 历史财务数据导入引擎")
 
+    st.write("### 🧾 导入前：财务表自动补数与双重核对")
+    st.info(
+        "只上传人员台账底表即可自动计算工会经费、职工教育经费，分摊尾差固定由人力资源部主任承接。"
+        "当月财务表和累计财务表都是可选项：上传哪张就核对哪张，累计差异只报警，不会反过来改本月。"
+    )
+
+    finance_upload_col1, finance_upload_col2, finance_upload_col3 = st.columns(3)
+    with finance_upload_col1:
+        precheck_ledger_file = st.file_uploader(
+            "1. 人员人工成本台账底表",
+            type=["xlsx", "csv"],
+            key="finance_precheck_ledger",
+        )
+    with finance_upload_col2:
+        precheck_monthly_file = st.file_uploader(
+            "2. 财务当月实际人工成本表（可选）",
+            type=["xlsx"],
+            key="finance_precheck_monthly",
+        )
+    with finance_upload_col3:
+        precheck_ytd_file = st.file_uploader(
+            "3. 财务本年累计人工成本表（可选）",
+            type=["xlsx"],
+            key="finance_precheck_ytd",
+        )
+
+    all_precheck_files_ready = precheck_ledger_file is not None
+    if st.button(
+        "🔍 自动补数并生成核对结果",
+        type="primary",
+        disabled=not all_precheck_files_ready,
+    ):
+        try:
+            draft_ledger = read_labor_ledger_workbook(
+                precheck_ledger_file,
+                file_name=precheck_ledger_file.name,
+            )
+            month_values = (
+                draft_ledger['核算月份']
+                .dropna()
+                .astype(str)
+                .str[:7]
+                .str.replace('/', '-', regex=False)
+                .unique()
+                .tolist()
+            )
+            if len(month_values) != 1:
+                raise ValueError(
+                    f"人员台账必须且只能包含一个核算月份，当前识别到：{month_values}"
+                )
+            precheck_month = month_values[0]
+
+            monthly_finance = (
+                read_finance_account_workbook(precheck_monthly_file)
+                if precheck_monthly_file is not None
+                else None
+            )
+            ytd_finance = (
+                read_finance_account_workbook(precheck_ytd_file)
+                if precheck_ytd_file is not None
+                else None
+            )
+            if monthly_finance is not None and ytd_finance is not None:
+                monthly_wage = monthly_finance.loc[
+                    monthly_finance['科目编号'].eq('6400010100'),
+                    '本期借方发生额',
+                ].sum()
+                ytd_wage = ytd_finance.loc[
+                    ytd_finance['科目编号'].eq('6400010100'),
+                    '本期借方发生额',
+                ].sum()
+                if ytd_wage + 0.01 < monthly_wage:
+                    raise ValueError(
+                        "累计表的工资发生额小于当月表，两个财务文件可能传反了。"
+                    )
+
+            history_conn = _get_db_connection()
+            history_start = f"{precheck_month[:4]}-01"
+            historical_ledger = pd.read_sql_query(
+                '''
+                SELECT * FROM labor_cost_ledger
+                WHERE cost_month >= ? AND cost_month < ?
+                ORDER BY cost_month, emp_id
+                ''',
+                history_conn,
+                params=[history_start, precheck_month],
+            )
+            hr_director_id, hr_director_name = resolve_hr_director_tail_carrier(
+                history_conn,
+                draft_ledger,
+            )
+            history_conn.close()
+
+            precheck_result = prepare_finance_labor_precheck(
+                draft_ledger,
+                monthly_finance,
+                ytd_finance_df=ytd_finance,
+                historical_ledger_df=historical_ledger,
+                tail_carrier_emp_id=hr_director_id,
+            )
+            st.session_state['finance_labor_precheck'] = {
+                'cost_month': precheck_month,
+                'result': precheck_result,
+                'file_names': {
+                    'ledger': precheck_ledger_file.name,
+                    'monthly': precheck_monthly_file.name if precheck_monthly_file else None,
+                    'ytd': precheck_ytd_file.name if precheck_ytd_file else None,
+                },
+                'tail_carrier': f'{hr_director_name}（{hr_director_id}）',
+            }
+            completed_tasks = ['自动补数']
+            if monthly_finance is not None:
+                completed_tasks.append('当月核对')
+            if ytd_finance is not None:
+                completed_tasks.append('累计核对')
+            st.success(
+                f"✅ {precheck_month} {'、'.join(completed_tasks)}已完成；"
+                f"经费尾差承接人：{hr_director_name}（{hr_director_id}）。"
+            )
+        except Exception as error:
+            st.session_state.pop('finance_labor_precheck', None)
+            st.error(f"预核对失败：{error}")
+
+    precheck_state = st.session_state.get('finance_labor_precheck')
+    if precheck_state:
+        precheck_result = precheck_state['result']
+        monthly_reconciliation = precheck_result['monthly_reconciliation']
+        ytd_reconciliation = precheck_result['ytd_reconciliation']
+
+        monthly_issue_count = int(
+            monthly_reconciliation['核对状态'].ne('一致').sum()
+        ) if not monthly_reconciliation.empty else 0
+        ytd_issue_count = int(
+            ytd_reconciliation['核对状态'].ne('一致').sum()
+        ) if not ytd_reconciliation.empty else 0
+        formula_status = precheck_result['business_checks'].iloc[0]['核对状态']
+
+        summary_col1, summary_col2, summary_col3, summary_col4 = st.columns(4)
+        summary_col1.metric("自动处理项目", len(precheck_result['auto_actions']))
+        summary_col2.metric(
+            "当月待处理项",
+            monthly_issue_count if not monthly_reconciliation.empty else "未核对",
+        )
+        summary_col3.metric(
+            "累计历史差异项",
+            ytd_issue_count if not ytd_reconciliation.empty else "未核对",
+        )
+        summary_col4.metric("女工劳保实发公式", formula_status)
+
+        if not precheck_result['auto_actions'].empty:
+            st.write("#### 自动处理明细")
+            st.dataframe(
+                precheck_result['auto_actions'],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        if not monthly_reconciliation.empty:
+            st.write("#### 当月财务核对")
+            st.dataframe(
+                monthly_reconciliation,
+                use_container_width=True,
+                hide_index=True,
+            )
+        if not ytd_reconciliation.empty:
+            st.write("#### 本年累计核对")
+            st.caption(
+                "累计表用于发现以前月份留下的差异。这里有差异时，系统不会把差额硬塞进本月。"
+            )
+            st.dataframe(
+                ytd_reconciliation,
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        if not precheck_result['pending_accounts'].empty:
+            st.warning("财务表中还有待确认或未建立映射的非零费用科目，请先确认业务性质。")
+            st.dataframe(
+                precheck_result['pending_accounts'],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        processed_workbook = build_finance_precheck_workbook(precheck_result)
+        st.download_button(
+            "📥 下载自动处理后的台账及核对报告",
+            data=processed_workbook,
+            file_name=f"{precheck_state['cost_month']}_人工成本自动补数及核对.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
+        pending_confirmation_rows = (
+            monthly_reconciliation[
+                monthly_reconciliation['处理方式'].eq('待业务确认')
+                & monthly_reconciliation['财务金额'].abs().ge(0.005)
+            ]
+            if not monthly_reconciliation.empty
+            else pd.DataFrame()
+        )
+        pending_amounts_balanced = (
+            True
+            if pending_confirmation_rows.empty
+            else bool(
+                pending_confirmation_rows['差额（台账-财务）']
+                .abs()
+                .le(0.01)
+                .all()
+            )
+        )
+        pending_business_confirmed = pending_confirmation_rows.empty
+        if not pending_confirmation_rows.empty:
+            pending_business_confirmed = st.checkbox(
+                "我已确认待确认科目的费用性质、台账字段和人员归属",
+                disabled=not pending_amounts_balanced,
+                key="finance_pending_business_confirmed",
+            )
+        unresolved_amount_rows = (
+            monthly_reconciliation[
+                monthly_reconciliation['差额（台账-财务）'].abs().gt(0.01)
+            ]
+            if not monthly_reconciliation.empty
+            else pd.DataFrame()
+        )
+        can_import_prechecked = (
+            unresolved_amount_rows.empty
+            and formula_status == '一致'
+            and pending_business_confirmed
+        )
+        if can_import_prechecked:
+            if st.button("✅ 核对无误，直接导入人工成本台账", type="primary"):
+                try:
+                    imported_count = upsert_labor_cost_dataframe(
+                        precheck_result['processed_ledger']
+                    )
+                    batch_id = save_finance_precheck_audit(
+                        precheck_state['cost_month'],
+                        precheck_state['file_names'],
+                        precheck_result,
+                        imported_count,
+                    )
+                    st.success(
+                        f"✅ 已导入 {imported_count} 条台账，并保存核对批次 {batch_id}。"
+                    )
+                except Exception as error:
+                    st.error(f"核对结果导入失败：{error}")
+        else:
+            st.warning(
+                "当前月仍有未处理差异或待确认科目，系统暂不允许直接入账。"
+                "请在下载的台账中补充业务明细后重新核对。"
+            )
+
+    st.divider()
+
     # ==========================================================
     # 小工具：刷新已导入台账的部门归属
     # ==========================================================
@@ -915,7 +1391,8 @@ with tab3:
 
     tc1, tc2 = st.columns(2)
     with tc1:
-        st.write("请先下载标准模板。系统依靠 **`核算月份`** 和 **`工号`** 确认数据。如果发现错漏，直接在 Excel 修改后重新上传，系统将自动覆盖。")
+        st.write("### 历史台账兼容导入")
+        st.write("此入口不读取财务控制表，适合补录旧月份。新月份请优先使用上方的自动补数与双重核对。系统依靠 **`核算月份`** 和 **`工号`** 确认数据。")
         template_df = pd.DataFrame(columns=list(LEDGER_MAP.keys()))
         tout = io.BytesIO()
         with pd.ExcelWriter(tout, engine='openpyxl') as w: template_df.to_excel(w, index=False)
@@ -924,12 +1401,9 @@ with tab3:
     with tc2:
         up_file = st.file_uploader("上传已填写的台账 Excel", type=["xlsx", "csv"])
         if up_file and st.button("🚀 执行导入与数据库覆盖"):
+            conn = None
             try:
-                if up_file.name.endswith('.csv'):
-                    in_df = pd.read_csv(up_file)
-                else:
-                    xls_dict = pd.read_excel(up_file, sheet_name=None)
-                    in_df = pd.concat(xls_dict.values(), ignore_index=True)
+                in_df = read_labor_ledger_workbook(up_file, file_name=up_file.name)
 
                 conn = _get_db_connection()
                 cursor = conn.cursor()
@@ -1191,7 +1665,9 @@ with tab3:
                 # [修复点 2：UI 防跳跃] 彻底抛弃强制重新加载整个页面的 st.rerun()
                 st.success(f"✅ 台账导入/覆盖完成！成功处理 {success_count} 条记录。")
             except Exception as e:
-                conn.rollback()
+                if conn is not None:
+                    conn.rollback()
                 st.error(f"导入底层崩溃: {e}")
             finally:
-                if 'conn' in locals(): conn.close()
+                if conn is not None:
+                    conn.close()
