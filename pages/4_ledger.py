@@ -232,6 +232,13 @@ def build_effective_dept_snapshot(conn, target_month):
 # ==============================================================================
 st.title("💰 人工成本台账管理中心")
 st.caption("🔒 财务数据合规要求：台账一旦生成不可在系统内手动篡改。如需修正，请在 Excel 中修改后重新导入，系统将自动覆盖重置原账目。")
+st.info(
+    "📌 女工劳保费特殊口径："
+    "女工劳保费继续单独记录，并计入员工实际发放；"
+    "但不计入人工成本模块的【工资应发合计】、"
+    "【其他人工成本合计】和【人工成本合计】。"
+)
+
 
 tab1, tab2, tab3 = st.tabs(["📊 台账多维看板", "📤 领导审阅导出 (范围框选)", "📥 财务底表导入"])
 
@@ -258,16 +265,51 @@ with tab1:
     if not raw_df.empty:
         active_metric_df = raw_df[~( (raw_df['emp_status'] == '退休') | (raw_df['dept_name'].str.contains('离退休', na=False)) )]
 
+        # 人工成本口径总成本。
+        # 女工劳保费不计入。
         total_cost = active_metric_df['total_labor_cost'].sum()
+
+        # 人工成本口径工资应发。
+        # 女工劳保费不计入。
         total_gross = active_metric_df['gross_salary_total'].sum()
+
+        # 其他人工成本。
+        # 女工劳保费也不计入。
         total_other = active_metric_df['other_cost_total'].sum()
+
+        # 女工劳保费继续单独记录和展示，
+        # 但不进入上面三个省公司人工成本指标。
+        women_labor_total = active_metric_df['allowance_women'].sum()
+
         total_headcount = len(active_metric_df)
 
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("在职及统筹总成本 (元)", f"{total_cost:,.2f}")
-        m2.metric("工资应发合计 (元)", f"{total_gross:,.2f}")
-        m3.metric("其他人工成本合计 (元)", f"{total_other:,.2f}")
-        m4.metric("在职及统筹核算人次", f"{total_headcount} 人次")
+        m1, m2, m3, m4, m5 = st.columns(5)
+
+        m1.metric(
+            "在职及统筹总成本 (元)",
+            f"{total_cost:,.2f}"
+        )
+
+        m2.metric(
+            "工资应发合计 (元)",
+            f"{total_gross:,.2f}"
+        )
+
+        m3.metric(
+            "其他人工成本合计 (元)",
+            f"{total_other:,.2f}"
+        )
+
+        m4.metric(
+            "女工劳保费·仅记录 (元)",
+            f"{women_labor_total:,.2f}",
+            help="随工资发放，但不计入省公司人工成本口径。"
+        )
+
+        m5.metric(
+            "在职及统筹核算人次",
+            f"{total_headcount} 人次"
+        )
 
         disp_df = raw_df.rename(columns=DB_TO_CN_MAP)
         disp_cols = [col for col in LEDGER_MAP.keys() if col in disp_df.columns]
@@ -773,30 +815,191 @@ with tab3:
                         else:
                             db_data[db_col] = str(val).strip() if pd.notna(val) else ""
 
+                    # =============================================================
+                    # 女工劳保费特殊口径
+                    # =============================================================
+                    #
+                    # 正式系统名称统一为：
+                    # 女工劳保费
+                    #
+                    # 数据库字段统一为：
+                    # allowance_women
+                    #
+                    # 业务规则：
+                    # 1. 女工劳保费随工资发放；
+                    # 2. 继续在人工成本台账中单独记录；
+                    # 3. 不计入人工成本口径工资应发；
+                    # 4. 不计入其他人工成本；
+                    # 5. 不计入人工成本合计；
+                    # 6. 计入员工个人实际实发。
+
                     # -------------------------------------------------------------
-                    # [修复点 1：拦截孤立统筹资金，防止实发被覆盖，并严格捍卫总成本铁律]
+                    # 一、读取女工劳保费
                     # -------------------------------------------------------------
-                    gross_cols = ['base_salary', 'seniority_pay', 'comp_subsidy', 'perf_float_subsidy', 'telecom_subsidy', 'other_base_pay', 'intern_subsidy', 'grad_allowance', 'eval_perf_pay', 'commission_pay', 'other_month_perf', 'special_award', 'year_end_bonus', 'other_special_award']
-                    calc_gross = sum(db_data.get(col, 0.0) for col in gross_cols)
+                    women_labor_fee = float(
+                        db_data.get('allowance_women', 0.0) or 0.0
+                    )
 
-                    deduct_cols = ['pension_personal', 'medical_personal', 'unemployment_personal', 'provident_fund_personal', 'annuity_personal', 'tax_personal_month', 'tax_personal_bonus']
-                    calc_net = calc_gross - sum(db_data.get(col, 0.0) for col in deduct_cols)
+                    # -------------------------------------------------------------
+                    # 二、计算人工成本口径工资应发
+                    # -------------------------------------------------------------
+                    #
+                    # 注意：
+                    # 这里故意不放 allowance_women。
+                    #
+                    # 因此 labor_cost_ledger.gross_salary_total
+                    # 表示省公司人工成本口径的工资应发，
+                    # 不等同于薪酬模块工资条上的完整应发。
+                    gross_cols = [
+                        'base_salary',
+                        'seniority_pay',
+                        'comp_subsidy',
+                        'perf_float_subsidy',
+                        'telecom_subsidy',
+                        'other_base_pay',
+                        'intern_subsidy',
+                        'grad_allowance',
+                        'eval_perf_pay',
+                        'commission_pay',
+                        'other_month_perf',
+                        'special_award',
+                        'year_end_bonus',
+                        'other_special_award'
+                    ]
 
-                    company_cost_cols = ['pension_company', 'medical_company', 'unemployment_company', 'work_injury_company', 'maternity_company', 'provident_fund_company', 'annuity_company', 'meal_daily', 'meal_ot', 'welfare_condolence', 'welfare_single_child', 'welfare_health_check', 'welfare_entry_check', 'welfare_other', 'allowance_heat', 'allowance_women', 'medical_supplement', 'union_funds', 'edu_funds', 'cost_adjustment']
-                    calc_other = sum(db_data.get(col, 0.0) for col in company_cost_cols)
+                    calc_gross = sum(
+                        db_data.get(col, 0.0)
+                        for col in gross_cols
+                    )
 
-                    # 判断是否为“股票增值权/孤立公共池”发钱（只有实发有金额，所有应发项均为0）
-                    if calc_gross == 0.0 and db_data.get('net_salary', 0.0) != 0.0:
+                    # -------------------------------------------------------------
+                    # 三、计算个人代扣
+                    # -------------------------------------------------------------
+                    deduct_cols = [
+                        'pension_personal',
+                        'medical_personal',
+                        'unemployment_personal',
+                        'provident_fund_personal',
+                        'annuity_personal',
+                        'tax_personal_month',
+                        'tax_personal_bonus'
+                    ]
+
+                    total_personal_deduction = sum(
+                        db_data.get(col, 0.0)
+                        for col in deduct_cols
+                    )
+
+                    # -------------------------------------------------------------
+                    # 四、计算个人实际实发
+                    # -------------------------------------------------------------
+                    #
+                    # 女工劳保费虽然不计入人工成本，
+                    # 但它确实随工资发给员工，
+                    # 所以个人实发必须加上女工劳保费。
+                    #
+                    # 个人实发 =
+                    # 人工成本口径工资应发
+                    # + 女工劳保费
+                    # - 五险两金个人扣款
+                    # - 个税
+                    calc_net = (
+                            calc_gross
+                            + women_labor_fee
+                            - total_personal_deduction
+                    )
+
+                    # -------------------------------------------------------------
+                    # 五、计算其他人工成本
+                    # -------------------------------------------------------------
+                    #
+                    # 原代码把 allowance_women 放在这里，
+                    # 所以女工劳保费会进入其他人工成本。
+                    #
+                    # 现在必须移除。
+                    company_cost_cols = [
+                        'pension_company',
+                        'medical_company',
+                        'unemployment_company',
+                        'work_injury_company',
+                        'maternity_company',
+                        'provident_fund_company',
+                        'annuity_company',
+                        'meal_daily',
+                        'meal_ot',
+                        'welfare_condolence',
+                        'welfare_single_child',
+                        'welfare_health_check',
+                        'welfare_entry_check',
+                        'welfare_other',
+                        'allowance_heat',
+
+                        # 注意：
+                        # allowance_women 不再计入其他人工成本。
+
+                        'medical_supplement',
+                        'union_funds',
+                        'edu_funds',
+                        'cost_adjustment'
+                    ]
+
+                    calc_other = sum(
+                        db_data.get(col, 0.0)
+                        for col in company_cost_cols
+                    )
+
+                    # -------------------------------------------------------------
+                    # 六、特殊公共账目保护
+                    # -------------------------------------------------------------
+                    #
+                    # 有些股票增值权、公共统筹记录，
+                    # 可能只有个人实发，没有工资应发明细。
+                    #
+                    # 只有当：
+                    # 1. 工资应发为 0；
+                    # 2. 女工劳保费也为 0；
+                    # 3. Excel 原实发不为 0；
+                    #
+                    # 才保留 Excel 原始实发。
+                    if (
+                            calc_gross == 0.0
+                            and women_labor_fee == 0.0
+                            and db_data.get('net_salary', 0.0) != 0.0
+                    ):
+                        # 人工成本口径工资应发保持为 0。
                         db_data['gross_salary_total'] = 0.0
-                        # 保持 db_data['net_salary'] 不变，绝对尊重你填的 Excel 实发数值！
+
+                        # 保留 Excel 中原始个人实发。
                         db_data['other_cost_total'] = calc_other
-                        # 【绝对铁律】人工成本合计永远等于：应发合计 + 其他成本。绝不乱加实发！
-                        db_data['total_labor_cost'] = db_data['gross_salary_total'] + db_data['other_cost_total']
+
+                        # 人工成本合计：
+                        # 工资应发 + 其他人工成本。
+                        #
+                        # 女工劳保费不进入。
+                        db_data['total_labor_cost'] = (
+                                db_data['gross_salary_total']
+                                + db_data['other_cost_total']
+                        )
+
                     else:
+                        # 人工成本口径工资应发：
+                        # 不含女工劳保费。
                         db_data['gross_salary_total'] = calc_gross
+
+                        # 个人实际实发：
+                        # 包含女工劳保费。
                         db_data['net_salary'] = calc_net
+
+                        # 其他人工成本：
+                        # 不含女工劳保费。
                         db_data['other_cost_total'] = calc_other
-                        db_data['total_labor_cost'] = calc_gross + calc_other
+
+                        # 人工成本合计：
+                        # 不含女工劳保费。
+                        db_data['total_labor_cost'] = (
+                                calc_gross
+                                + calc_other
+                        )
 
                     columns = list(db_data.keys())
                     placeholders = ",".join(["?"] * len(columns))
