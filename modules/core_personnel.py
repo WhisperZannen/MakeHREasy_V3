@@ -11,6 +11,107 @@ import sqlite3
 import os
 from datetime import datetime
 
+
+def _normalize_text(value):
+    """统一空值及普通文本的比较口径。"""
+    if value is None:
+        return ""
+    text = str(value).strip()
+    return "" if text in {"", "None", "nan", "NaN", "NaT"} else text
+
+
+def _normalize_rank_value(value):
+    """将 11、11.0 和字符串“11.0”统一为同一个岗级值。"""
+    text = _normalize_text(value)
+    if not text:
+        return ""
+    try:
+        number = float(text)
+        return str(int(number)) if number.is_integer() else format(number, ".12g")
+    except (TypeError, ValueError):
+        return text
+
+
+def build_personnel_change_tags(old, emp_data, profile_data):
+    """根据更新前后的真实字段值生成变动标签。"""
+    tags = []
+    if _normalize_text(old.get('status')) != _normalize_text(emp_data.get('status')):
+        tags.append(f"变为{emp_data.get('status')}")
+    if _normalize_rank_value(old.get('dept_id')) != _normalize_rank_value(emp_data.get('dept_id')):
+        tags.append("跨部门调动")
+    if _normalize_rank_value(old.get('pos_id')) != _normalize_rank_value(profile_data.get('pos_id')):
+        tags.append("实习转正" if _normalize_text(old.get('old_pos_name')) == "实习岗" else "岗位调整")
+    if _normalize_text(old.get('tech_grade')) != _normalize_text(profile_data.get('tech_grade')):
+        tags.append("T级变动")
+    if _normalize_rank_value(old.get('post_rank')) != _normalize_rank_value(emp_data.get('post_rank')):
+        tags.append("岗级调整")
+    if _normalize_text(old.get('post_grade')) != _normalize_text(emp_data.get('post_grade')):
+        tags.append("档次调整")
+    return tags
+
+
+def rebuild_history_change_type(row):
+    """依据历史行保存的新旧快照重建标签，保留无法从快照推导的状态类标签。"""
+    original = _normalize_text(row.get('change_type'))
+    if not original or any(keyword in original for keyword in ("入职", "建档")):
+        return original
+
+    parts = [part.strip() for part in original.split("+") if part.strip()]
+    recognized = {"跨部门调动", "岗位调整", "实习转正", "T级变动", "岗级调整", "档次调整"}
+    tags = [part for part in parts if part.startswith("变为") or part not in recognized]
+
+    if _normalize_rank_value(row.get('old_dept_id')) != _normalize_rank_value(row.get('new_dept_id')):
+        tags.append("跨部门调动")
+    if _normalize_rank_value(row.get('old_pos_id')) != _normalize_rank_value(row.get('new_pos_id')):
+        tags.append("实习转正" if _normalize_text(row.get('old_pos_name')) == "实习岗" else "岗位调整")
+    if _normalize_text(row.get('old_tech_grade')) != _normalize_text(row.get('new_tech_grade')):
+        tags.append("T级变动")
+    if _normalize_rank_value(row.get('old_post_rank')) != _normalize_rank_value(row.get('new_post_rank')):
+        tags.append("岗级调整")
+    if _normalize_text(row.get('old_post_grade')) != _normalize_text(row.get('new_post_grade')):
+        tags.append("档次调整")
+
+    # 去重但保持业务展示顺序。
+    return " + ".join(dict.fromkeys(tags)) or "档案更新"
+
+
+def repair_personnel_change_types(conn=None):
+    """修复历史流水中与新旧快照不一致的标签，不改动任何人员档案值。"""
+    own_conn = conn is None
+    conn = conn or _get_db_connection()
+    try:
+        rows = conn.execute(
+            """
+            SELECT h.*, p.pos_name AS old_pos_name
+            FROM personnel_changes h
+            LEFT JOIN positions p ON h.old_pos_id = p.pos_id
+            ORDER BY h.change_id
+            """
+        ).fetchall()
+        changes = []
+        for source in rows:
+            row = dict(source)
+            corrected = rebuild_history_change_type(row)
+            if corrected and corrected != row.get('change_type'):
+                conn.execute(
+                    "UPDATE personnel_changes SET change_type = ? WHERE change_id = ?",
+                    (corrected, row['change_id']),
+                )
+                changes.append({
+                    'change_id': row['change_id'],
+                    'emp_id': row['emp_id'],
+                    'before': row.get('change_type'),
+                    'after': corrected,
+                })
+        conn.commit()
+        return True, changes
+    except Exception as exc:
+        conn.rollback()
+        return False, str(exc)
+    finally:
+        if own_conn:
+            conn.close()
+
 def _get_db_connection():
     current_dir = os.path.dirname(os.path.abspath(__file__))
     project_root = os.path.dirname(current_dir)
@@ -77,112 +178,11 @@ def update_employee(emp_id, emp_data, profile_data, reason="档案更新", chang
         """, (emp_id,))
         old = cursor.fetchone()
 
-        trigger_snapshot = False
-        change_tags = []
         if old:
-            # ==========================================================
-            # 人员变动差异比较工具
-            # ==========================================================
-            # 为什么不能直接 str(v1) != str(v2)？
-            # ----------------------------------------------------------
-            # 因为数据库里可能是 13，页面传回来的可能是 13.0。
-            # 这两个在人事业务上是同一个岗级，但字符串比较会误判：
-            # "13" != "13.0"
-            #
-            # 这会导致你明明只是把员工状态改成“离职”，
-            # 历史流水却显示“变为离职 + 岗级调整”。
-            #
-            # 所以这里要分字段类型比较：
-            # 1. 岗级用数字比较；
-            # 2. 档次、状态、岗位、部门、T级用清洗后的文本比较。
-            def normalize_text(value):
-                """
-                把普通文本字段清洗成可比较的字符串。
-
-                None、空值、nan 都统一处理成空字符串。
-                """
-                if value is None:
-                    return ""
-
-                text = str(value).strip()
-
-                if text in ["None", "nan", "NaN"]:
-                    return ""
-
-                return text
-
-            def normalize_rank_value(value):
-                """
-                把岗级字段清洗成可比较的数字文本。
-
-                例子：
-                13      -> "13"
-                13.0    -> "13"
-                "13.0"  -> "13"
-                21.5    -> "21.5"
-
-                注意：
-                这里不能简单 int()，因为你有 21.5 这种用于领导排序的小数岗级。
-                所以规则是：
-                - 如果是整数小数，比如 13.0，转成 13；
-                - 如果是真小数，比如 21.5，保留 21.5。
-                """
-                if value is None:
-                    return ""
-
-                text = str(value).strip()
-
-                if text in ["", "None", "nan", "NaN"]:
-                    return ""
-
-                try:
-                    number = float(text)
-
-                    # 如果是 13.0 这种整数小数，就转成 13。
-                    if number.is_integer():
-                        return str(int(number))
-
-                    # 如果是 21.5 这种真实小数，就保留小数。
-                    return str(number)
-
-                except Exception:
-                    return text
-
-            def is_text_diff(v1, v2):
-                """
-                普通字段比较。
-                """
-                return normalize_text(v1) != normalize_text(v2)
-
-            def is_rank_diff(v1, v2):
-                """
-                岗级字段比较。
-                """
-                return normalize_rank_value(v1) != normalize_rank_value(v2)
-
-            if is_text_diff(old['status'], emp_data.get('status')):
-                change_tags.append(f"变为{emp_data.get('status')}")
-
-            if is_text_diff(old['dept_id'], emp_data['dept_id']):
-                change_tags.append("跨部门调动")
-
-            if is_text_diff(old['pos_id'], profile_data.get('pos_id')):
-                if str(old['old_pos_name']) == '实习岗':
-                    change_tags.append("实习转正")
-                else:
-                    change_tags.append("岗位调整")
-
-            if is_text_diff(old['tech_grade'], profile_data.get('tech_grade')):
-                change_tags.append("T级变动")
-
-            if is_rank_diff(old['post_rank'], emp_data['post_rank']):
-                change_tags.append("岗级调整")
-
-            if is_text_diff(old['post_grade'], emp_data['post_grade']):
-                change_tags.append("档次调整")
+            old_snapshot = dict(old)
+            change_tags = build_personnel_change_tags(old_snapshot, emp_data, profile_data)
 
             if change_tags:
-                trigger_snapshot = True
                 cursor.execute("""
                     INSERT INTO personnel_changes 
                     (emp_id, change_type, old_dept_id, new_dept_id, old_pos_id, new_pos_id, old_tech_grade, new_tech_grade, old_post_rank, new_post_rank, old_post_grade, new_post_grade, change_date, change_reason)
