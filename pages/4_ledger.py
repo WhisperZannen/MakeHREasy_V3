@@ -22,7 +22,8 @@ from openpyxl.utils import get_column_letter
 from modules.core_labor_cost import (
     LEDGER_MAP, DB_TO_CN_MAP, NUMERIC_COLS,
     _get_db_connection, cleanse_db_timestamps,
-    sort_flat_ledger_df, add_subtotals_and_totals, get_ledger_data
+    sort_flat_ledger_df, add_subtotals_and_totals, get_ledger_data,
+    localize_labor_cost_codes,
 )
 from modules.core_arrangements import get_effective_arrangement
 
@@ -322,7 +323,7 @@ with tab1:
                     f"涉及台账人工成本 {reallocation_df['total_labor_cost'].sum():,.2f} 元。"
                 )
 
-        disp_df = raw_df.rename(columns=DB_TO_CN_MAP)
+        disp_df = localize_labor_cost_codes(raw_df.rename(columns=DB_TO_CN_MAP))
         disp_cols = [col for col in LEDGER_MAP.keys() if col in disp_df.columns]
 
         disp_final = sort_flat_ledger_df(disp_df[disp_cols].copy())
@@ -431,7 +432,7 @@ with tab2:
                     for month in sorted(selected_months):
                         month_df = raw_export_df[raw_export_df['cost_month'] == month].copy()
                         if not month_df.empty:
-                            month_cn = month_df.rename(columns=DB_TO_CN_MAP)
+                            month_cn = localize_labor_cost_codes(month_df.rename(columns=DB_TO_CN_MAP))
                             month_cols = [c for c in LEDGER_MAP.keys() if c in month_cn.columns]
                             month_cn = month_cn[month_cols]
 
@@ -452,8 +453,59 @@ with tab2:
         "用于“正式转入但仍在地市工作”等人员的年度全口径人工成本上报；"
         "只提取已标记需要划转的台账，不混入普通本级人员。"
     )
+
+    reallocation_months = sorted(available_months)
+    reallocation_start = None
+    reallocation_end = None
+    if reallocation_months:
+        period_mode = st.radio(
+            "专项表统计时间",
+            options=["单月", "自定义区间", "年度累计"],
+            horizontal=True,
+            key="reallocation_period_mode",
+        )
+        if period_mode == "单月":
+            selected_month = st.selectbox(
+                "选择核算月份",
+                options=reallocation_months,
+                index=len(reallocation_months) - 1,
+                key="reallocation_single_month",
+            )
+            reallocation_start = reallocation_end = selected_month
+        elif period_mode == "自定义区间":
+            rc1, rc2 = st.columns(2)
+            with rc1:
+                reallocation_start = st.selectbox(
+                    "划转表起始月份",
+                    options=reallocation_months,
+                    index=len(reallocation_months) - 1,
+                    key="reallocation_start_month",
+                )
+            with rc2:
+                reallocation_end = st.selectbox(
+                    "划转表结束月份",
+                    options=reallocation_months,
+                    index=len(reallocation_months) - 1,
+                    key="reallocation_end_month",
+                )
+        else:
+            available_years = sorted({month[:4] for month in reallocation_months}, reverse=True)
+            selected_year = st.selectbox(
+                "选择核算年度",
+                options=available_years,
+                key="reallocation_year",
+            )
+            year_months = [month for month in reallocation_months if month.startswith(selected_year)]
+            reallocation_start, reallocation_end = min(year_months), max(year_months)
+            st.caption(f"将导出 {reallocation_start} 至 {reallocation_end} 的现有台账数据。")
+    else:
+        st.info("暂无可供选择的人工成本月份。")
+
     if st.button("生成所选期间地市人工成本划转表", type="secondary"):
-        s_m, e_m = min(start_month, end_month), max(start_month, end_month)
+        if not reallocation_start or not reallocation_end:
+            st.warning("暂无可导出的数据！")
+            st.stop()
+        s_m, e_m = min(reallocation_start, reallocation_end), max(reallocation_start, reallocation_end)
         conn_reallocation = _get_db_connection()
         reallocation_export = pd.read_sql_query(
             """
@@ -480,6 +532,7 @@ with tab2:
             params=[s_m, e_m]
         )
         conn_reallocation.close()
+        reallocation_export = localize_labor_cost_codes(reallocation_export)
         if reallocation_export.empty:
             st.info("所选期间没有已标记的地市人工成本划转记录。")
         else:

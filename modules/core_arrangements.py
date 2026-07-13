@@ -20,6 +20,22 @@ ARRANGEMENT_LABELS = {
     "down_secondment": "下沉人员",
 }
 
+REALLOCATION_MODE_LABELS = {
+    "none": "无需划转",
+    "annual_labor_cost_reallocation": "年度全口径人工成本划转",
+    "mixed_by_item": "按项目分别结算",
+    "quarterly_social_settlement": "季度社保代缴结算",
+}
+
+REALLOCATION_STATUS_LABELS = {
+    "not_required": "无需划转",
+    "pending": "待划转",
+    "generated": "已生成",
+    "submitted": "已报送",
+    "confirmed": "已确认",
+    "settled": "已结算",
+}
+
 INSURANCE_LABELS = {
     "pension": "养老",
     "medical": "基本医疗",

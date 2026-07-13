@@ -7,6 +7,12 @@ import sqlite3
 import os
 import pandas as pd
 
+from modules.core_arrangements import (
+    ARRANGEMENT_LABELS,
+    REALLOCATION_MODE_LABELS,
+    REALLOCATION_STATUS_LABELS,
+)
+
 # ------------------------------------------------------------------------------
 # 核心字典：负责前端中文表头与底层英文列名的双向翻译
 # ------------------------------------------------------------------------------
@@ -44,6 +50,27 @@ TEXT_DB_COLUMNS = {
     'reallocation_mode', 'reallocation_status',
 }
 NUMERIC_COLS = [cn for cn, db in LEDGER_MAP.items() if db not in TEXT_DB_COLUMNS]
+
+
+def localize_labor_cost_codes(df):
+    """将台账中的稳定英文代码转换为面向业务人员的中文名称。"""
+    localized = df.copy()
+    mappings = {
+        'business_type_snapshot': ARRANGEMENT_LABELS,
+        '业务关系类型': ARRANGEMENT_LABELS,
+        'reallocation_mode': REALLOCATION_MODE_LABELS,
+        '成本划转方式': REALLOCATION_MODE_LABELS,
+        '划转方式': REALLOCATION_MODE_LABELS,
+        'reallocation_status': REALLOCATION_STATUS_LABELS,
+        '成本划转状态': REALLOCATION_STATUS_LABELS,
+        '划转状态': REALLOCATION_STATUS_LABELS,
+    }
+    for column, mapping in mappings.items():
+        if column in localized.columns:
+            localized[column] = localized[column].map(
+                lambda value: mapping.get(value, value) if pd.notna(value) else value
+            )
+    return localized
 
 # ------------------------------------------------------------------------------
 # 数据库连接池初始化

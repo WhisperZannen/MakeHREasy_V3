@@ -168,6 +168,21 @@ class ArrangementRoutingTest(unittest.TestCase):
         ok, _ = self.social.save_monthly_ss_records(pd.DataFrame([bill]), "2026-06")
         self.assertFalse(ok)
 
+    def test_labor_cost_report_codes_are_localized(self):
+        import pandas as pd
+
+        from modules.core_labor_cost import localize_labor_cost_codes
+
+        report = localize_labor_cost_codes(pd.DataFrame([{
+            "业务关系类型": "city_transfer",
+            "划转方式": "annual_labor_cost_reallocation",
+            "划转状态": "pending",
+        }]))
+
+        self.assertEqual(report.loc[0, "业务关系类型"], "地市工作转入")
+        self.assertEqual(report.loc[0, "划转方式"], "年度全口径人工成本划转")
+        self.assertEqual(report.loc[0, "划转状态"], "待划转")
+
 
 if __name__ == "__main__":
     unittest.main()
