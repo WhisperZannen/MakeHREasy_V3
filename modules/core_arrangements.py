@@ -20,6 +20,80 @@ ARRANGEMENT_LABELS = {
     "down_secondment": "下沉人员",
 }
 
+SPECIAL_ARRANGEMENT_TYPES = {
+    key: value for key, value in ARRANGEMENT_LABELS.items() if key != "normal"
+}
+
+PAYER_RULE_LABELS = {
+    "legacy": "沿用原参保配置",
+    "fixed": "固定单位",
+    "contract_entity": "劳动合同主体",
+    "payroll_entity": "工资发放主体",
+    "actual_work_unit": "实际工作单位",
+    "related_branch": "关联地市",
+}
+
+COST_BEARER_RULE_LABELS = {
+    "legacy": "沿用原成本归属",
+    "fixed": "固定单位",
+    "accounting_entity": "当前记账单位",
+    "ultimate_cost_bearer": "最终成本承担单位",
+    "related_branch": "关联地市",
+}
+
+SETTLEMENT_MODE_LABELS = {
+    "none": "无需结算",
+    "proxy_social": "挂靠代缴结算",
+    "central_chargeback": "集中缴费后内部结算",
+    "annual_reimbursement": "年度费用结算",
+    "local_direct": "属地直接缴纳",
+    "record_only": "只记录、不收付款",
+    "annual_labor_cost_reallocation": "年度全口径人工成本划转",
+    "mixed_by_item": "按项目分别结算",
+}
+
+SETTLEMENT_CYCLE_LABELS = {
+    "none": "不结算",
+    "monthly": "每月",
+    "quarterly": "每季度",
+    "annual": "每年",
+    "mixed": "按不同项目分别处理",
+}
+
+AMOUNT_SOURCE_LABELS = {
+    "system_calculated": "系统按政策计算",
+    "external_actual": "外部实缴金额",
+    "manual_confirmed": "人工确认金额",
+}
+
+ACTIVE_LABELS = {1: "启用", 0: "停用"}
+ENABLED_LABELS = {1: "参保", 0: "不参保", None: "沿用上级配置"}
+
+ARRANGEMENT_STATUS_LABELS = {
+    "active": "执行中",
+    "returned": "已返回",
+    "transferred": "已正式转入",
+    "extended_replaced": "已延期并建立新关系",
+    "closed": "已结束",
+    "cancelled": "已取消",
+}
+
+ARRANGEMENT_CLOSE_RESULT_LABELS = {
+    "returned": "返回原单位",
+    "transferred": "正式转入当前单位",
+    "extended_replaced": "延期并另建新关系",
+    "closed": "其他原因结束",
+}
+
+SETTLEMENT_BATCH_STATUS_LABELS = {
+    "draft": "草稿",
+    "generated": "已生成",
+    "sent": "已发送",
+    "confirmed": "对方已确认",
+    "paid": "已到账",
+    "settled": "已结清",
+}
+
 REALLOCATION_MODE_LABELS = {
     "none": "无需划转",
     "annual_labor_cost_reallocation": "年度全口径人工成本划转",
@@ -351,6 +425,7 @@ def get_arrangements_dataframe(include_closed: bool = True) -> pd.DataFrame:
                    be_payroll.entity_name AS payroll_entity_name,
                    be_work.entity_name AS actual_work_unit_name,
                    be_branch.entity_name AS related_branch_name,
+                   be_accounting.entity_name AS accounting_entity_name,
                    be_cost.entity_name AS ultimate_cost_bearer_name
             FROM employee_arrangements a
             JOIN employees e ON a.emp_id = e.emp_id
@@ -359,6 +434,7 @@ def get_arrangements_dataframe(include_closed: bool = True) -> pd.DataFrame:
             LEFT JOIN business_entities be_payroll ON a.payroll_entity_code = be_payroll.entity_code
             LEFT JOIN business_entities be_work ON a.actual_work_unit_code = be_work.entity_code
             LEFT JOIN business_entities be_branch ON a.related_branch_code = be_branch.entity_code
+            LEFT JOIN business_entities be_accounting ON a.accounting_entity_code = be_accounting.entity_code
             LEFT JOIN business_entities be_cost ON a.ultimate_cost_bearer_code = be_cost.entity_code
             {where}
             ORDER BY a.start_date DESC, a.arrangement_id DESC
@@ -372,22 +448,120 @@ def get_arrangements_dataframe(include_closed: bool = True) -> pd.DataFrame:
 def get_entities_dataframe(active_only: bool = True) -> pd.DataFrame:
     conn = _get_db_connection()
     try:
-        where = "WHERE active = 1" if active_only else ""
+        where = "WHERE e.active = 1" if active_only else ""
         return pd.read_sql_query(
             f"""
-            SELECT entity_code, entity_name, entity_type, active
-            FROM business_entities
+            SELECT e.entity_code, e.entity_name, e.entity_type,
+                   e.parent_entity_code, parent.entity_name AS parent_entity_name,
+                   e.active
+            FROM business_entities e
+            LEFT JOIN business_entities parent
+              ON e.parent_entity_code = parent.entity_code
             {where}
-            ORDER BY CASE entity_type
+            ORDER BY CASE e.entity_type
                          WHEN '法人' THEN 1
                          WHEN '上级单位' THEN 2
                          WHEN '地市分公司' THEN 3
                          ELSE 9
                      END,
-                     entity_name
+                     e.entity_name
             """,
             conn,
         )
+    finally:
+        conn.close()
+
+
+def create_business_entity(
+    entity_name: str,
+    entity_type: str,
+    parent_entity_code: Optional[str] = None,
+) -> Tuple[bool, str]:
+    """新增可参与缴费、工作归属和结算的业务单位。"""
+    name = str(entity_name or "").strip()
+    allowed_types = {"法人", "上级单位", "地市分公司", "其他承接单位"}
+    if not name:
+        return False, "单位名称必填"
+    if entity_type not in allowed_types:
+        return False, "单位类型无效"
+
+    conn = _get_db_connection()
+    try:
+        existing = conn.execute(
+            "SELECT entity_code, active FROM business_entities WHERE entity_name = ?",
+            (name,),
+        ).fetchone()
+        if existing:
+            if int(existing["active"] or 0) == 0:
+                conn.execute(
+                    """
+                    UPDATE business_entities
+                    SET active = 1, entity_type = ?, parent_entity_code = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE entity_code = ?
+                    """,
+                    (entity_type, parent_entity_code, existing["entity_code"]),
+                )
+                conn.commit()
+                return True, f"{name} 已重新启用"
+            return False, f"{name} 已存在，无需重复新增"
+
+        prefix = {
+            "地市分公司": "branch:",
+            "法人": "legal:",
+            "上级单位": "parent:",
+            "其他承接单位": "partner:",
+        }[entity_type]
+        entity_code = f"{prefix}{name}"
+        code_owner = conn.execute(
+            "SELECT entity_name FROM business_entities WHERE entity_code = ?",
+            (entity_code,),
+        ).fetchone()
+        if code_owner:
+            suffix = hashlib.sha1(name.encode("utf-8")).hexdigest()[:8]
+            entity_code = f"{prefix}{suffix}"
+
+        conn.execute(
+            """
+            INSERT INTO business_entities(
+                entity_code, entity_name, entity_type, parent_entity_code, active
+            ) VALUES (?, ?, ?, ?, 1)
+            """,
+            (entity_code, name, entity_type, parent_entity_code),
+        )
+        conn.commit()
+        return True, f"业务单位“{name}”已新增"
+    except Exception as exc:
+        conn.rollback()
+        return False, str(exc)
+    finally:
+        conn.close()
+
+
+def set_business_entity_active(entity_code: str, active: bool) -> Tuple[bool, str]:
+    """启用或停用单位；历史关系仍保留名称和关联。"""
+    conn = _get_db_connection()
+    try:
+        row = conn.execute(
+            "SELECT entity_name FROM business_entities WHERE entity_code = ?",
+            (entity_code,),
+        ).fetchone()
+        if not row:
+            return False, "未找到该业务单位"
+        conn.execute(
+            """
+            UPDATE business_entities
+            SET active = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE entity_code = ?
+            """,
+            (1 if active else 0, entity_code),
+        )
+        conn.commit()
+        action = "启用" if active else "停用"
+        return True, f"{row['entity_name']} 已{action}；历史记录未删除"
+    except Exception as exc:
+        conn.rollback()
+        return False, str(exc)
     finally:
         conn.close()
 
@@ -400,11 +574,13 @@ def get_route_policies_dataframe(active_only: bool = True) -> pd.DataFrame:
             f"""
             SELECT p.*,
                    ec.entity_name AS contract_entity_name,
+                   ecalc.entity_name AS calculation_policy_entity_name,
                    ep.entity_name AS payer_entity_name,
                    eb.entity_name AS cost_bearer_name,
                    es.entity_name AS settlement_counterparty_name
             FROM social_route_policies p
             LEFT JOIN business_entities ec ON p.contract_entity_code = ec.entity_code
+            LEFT JOIN business_entities ecalc ON p.calculation_policy_entity = ecalc.entity_code
             LEFT JOIN business_entities ep ON p.payer_entity_code = ep.entity_code
             LEFT JOIN business_entities eb ON p.cost_bearer_code = eb.entity_code
             LEFT JOIN business_entities es ON p.settlement_counterparty_code = es.entity_code
@@ -429,9 +605,9 @@ def create_route_policy(data: Dict[str, Any]) -> Tuple[bool, str]:
     ):
         return False, "失效月份必须为 YYYY-MM"
     if data.get("payer_entity_rule") == "fixed" and not data.get("payer_entity_code"):
-        return False, "缴费主体规则为 fixed 时必须选择固定主体"
+        return False, "缴费主体规则选择“固定单位”时，必须指定固定缴费主体"
     if data.get("cost_bearer_rule") == "fixed" and not data.get("cost_bearer_code"):
-        return False, "成本承担规则为 fixed 时必须选择固定单位"
+        return False, "成本承担规则选择“固定单位”时，必须指定固定成本单位"
     conn = _get_db_connection()
     try:
         columns = [
@@ -463,11 +639,13 @@ def get_social_overrides_dataframe(active_only: bool = True) -> pd.DataFrame:
         return pd.read_sql_query(
             f"""
             SELECT o.*, e.name AS emp_name,
+                   ecalc.entity_name AS calculation_policy_entity_name,
                    ep.entity_name AS payer_entity_name,
                    eb.entity_name AS cost_bearer_name,
                    es.entity_name AS settlement_counterparty_name
             FROM employee_social_overrides o
             JOIN employees e ON o.emp_id = e.emp_id
+            LEFT JOIN business_entities ecalc ON o.calculation_policy_entity = ecalc.entity_code
             LEFT JOIN business_entities ep ON o.payer_entity_code = ep.entity_code
             LEFT JOIN business_entities eb ON o.cost_bearer_code = eb.entity_code
             LEFT JOIN business_entities es ON o.settlement_counterparty_code = es.entity_code

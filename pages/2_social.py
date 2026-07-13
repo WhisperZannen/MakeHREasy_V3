@@ -43,8 +43,16 @@ from modules.core_social_security import (
     batch_update_emp_matrix
 )
 from modules.core_arrangements import (
+    ACTIVE_LABELS,
+    AMOUNT_SOURCE_LABELS,
     ARRANGEMENT_LABELS,
+    COST_BEARER_RULE_LABELS,
+    ENABLED_LABELS,
     INSURANCE_LABELS,
+    PAYER_RULE_LABELS,
+    SETTLEMENT_BATCH_STATUS_LABELS,
+    SETTLEMENT_CYCLE_LABELS,
+    SETTLEMENT_MODE_LABELS,
     backfill_relationship_snapshots,
     create_route_policy,
     create_social_override,
@@ -126,7 +134,7 @@ st.caption("核心业务流向：当月基数备料 ➡️ 理论核算与补缴
 
 tab1, tab2, tab3, tab4, tab5 = st.tabs(
     ["🧮 当月社保沙盘 (含补缴)", "📤 财务提款与公对公结算函", "⚙️ 全局规则与参数配置",
-     "📥 历史账单导入 (冷启动)", "🔀 缴费路由与个人例外"])
+     "📥 历史账单导入 (冷启动)", "🔀 社保险种缴费规则"])
 
 # ------------------------------------------------------------------------------
 # Tab 1: 当月社保沙盘与对账池
@@ -519,10 +527,10 @@ with tab1:
 # Tab 5: 带生效期的缴费路由与个人例外
 # ------------------------------------------------------------------------------
 with tab5:
-    st.subheader("🔀 缴费主体、计算政策与成本结算分离")
+    st.subheader("🔀 社保险种缴费规则与个人特殊处理")
     st.info(
-        "公共政策只定义某类关系从哪个月开始如何缴；挂靠人员具体缴哪些险种、"
-        "李峰林等个人特例在“个人例外”中按险种维护。新增版本不会改写历史账单。"
+        "系统按“单个人员特殊规则 ＞ 同类人员统一规则 ＞ 原参保配置”的顺序判断每个人、每个险种。"
+        "这里只决定由谁计算、谁缴费、成本由谁承担以及是否结算，不直接修改已经封账的历史账单。"
     )
 
     entity_df = get_entities_dataframe(active_only=True)
@@ -530,25 +538,37 @@ with tab5:
     entity_options = [None] + entity_df['entity_code'].tolist()
     item_options = list(INSURANCE_LABELS.keys())
 
-    route_tab, override_tab = st.tabs(["📘 公共路由政策", "👤 个人险种例外"])
+    route_tab, override_tab = st.tabs([
+        "📘 同类人员统一规则（公共政策）", "👤 单个人员特殊规则（个人例外）"
+    ])
 
     with route_tab:
+        st.caption(
+            "用于一批人共同遵循的规则。例如：从某月开始，全部下沉人员的基本医疗由派出单位缴纳，"
+            "费用年末与所在分公司结算。相同规则只需按险种配置一次。"
+        )
         policy_df = get_route_policies_dataframe(active_only=False)
         if not policy_df.empty:
             display_policy = policy_df.copy()
-            display_policy['关系类型'] = display_policy['arrangement_type'].map(ARRANGEMENT_LABELS)
-            display_policy['险种'] = display_policy['insurance_item'].map(INSURANCE_LABELS)
+            display_policy['关系类型'] = display_policy['arrangement_type'].map(ARRANGEMENT_LABELS).fillna(display_policy['arrangement_type'])
+            display_policy['险种'] = display_policy['insurance_item'].map(INSURANCE_LABELS).fillna(display_policy['insurance_item'])
+            display_policy['payer_entity_rule'] = display_policy['payer_entity_rule'].map(PAYER_RULE_LABELS).fillna(display_policy['payer_entity_rule'])
+            display_policy['cost_bearer_rule'] = display_policy['cost_bearer_rule'].map(COST_BEARER_RULE_LABELS).fillna(display_policy['cost_bearer_rule'])
+            display_policy['settlement_mode'] = display_policy['settlement_mode'].map(SETTLEMENT_MODE_LABELS).fillna(display_policy['settlement_mode'])
+            display_policy['settlement_cycle'] = display_policy['settlement_cycle'].map(SETTLEMENT_CYCLE_LABELS).fillna(display_policy['settlement_cycle'])
+            display_policy['amount_source'] = display_policy['amount_source'].map(AMOUNT_SOURCE_LABELS).fillna(display_policy['amount_source'])
+            display_policy['active'] = display_policy['active'].map(ACTIVE_LABELS).fillna(display_policy['active'])
             st.dataframe(
                 display_policy[[
                     'route_policy_id', 'policy_name', '关系类型', 'contract_entity_name', '险种',
-                    'effective_from_month', 'effective_to_month', 'calculation_policy_entity',
+                    'effective_from_month', 'effective_to_month', 'calculation_policy_entity_name',
                     'payer_entity_rule', 'payer_entity_name', 'cost_bearer_rule',
                     'cost_bearer_name', 'settlement_mode', 'settlement_cycle',
                     'amount_source', 'priority', 'active'
                 ]].rename(columns={
                     'route_policy_id': '政策ID', 'policy_name': '政策名称',
                     'contract_entity_name': '适用牌子', 'effective_from_month': '生效月',
-                    'effective_to_month': '失效月', 'calculation_policy_entity': '计算政策',
+                    'effective_to_month': '失效月', 'calculation_policy_entity_name': '计算政策主体',
                     'payer_entity_rule': '缴费主体规则', 'payer_entity_name': '固定缴费主体',
                     'cost_bearer_rule': '成本承担规则', 'cost_bearer_name': '固定成本单位',
                     'settlement_mode': '结算方式', 'settlement_cycle': '结算周期',
@@ -588,15 +608,20 @@ with tab5:
                         format_func=lambda value: "沿用原缴费主体" if value is None else entity_names[value]
                     )
                     amount_source = st.selectbox(
-                        "金额来源", ['system_calculated', 'external_actual', 'manual_confirmed']
+                        "金额来源", list(AMOUNT_SOURCE_LABELS),
+                        format_func=lambda value: AMOUNT_SOURCE_LABELS[value],
                     )
-                    priority = st.number_input("优先级", min_value=1, max_value=9999, value=100)
+                    priority = st.number_input(
+                        "优先级", min_value=1, max_value=9999, value=100,
+                        help="同一人员、险种和月份匹配多条规则时，数字越大越优先。",
+                    )
 
                 pr1, pr2 = st.columns(2)
                 with pr1:
                     payer_rule = st.selectbox(
                         "实际缴费主体规则",
-                        ['legacy', 'fixed', 'contract_entity', 'payroll_entity', 'actual_work_unit', 'related_branch']
+                        list(PAYER_RULE_LABELS),
+                        format_func=lambda value: PAYER_RULE_LABELS[value],
                     )
                     payer_entity = st.selectbox(
                         "固定缴费主体", entity_options,
@@ -606,7 +631,8 @@ with tab5:
                 with pr2:
                     cost_rule = st.selectbox(
                         "最终成本承担规则",
-                        ['legacy', 'fixed', 'accounting_entity', 'ultimate_cost_bearer', 'related_branch']
+                        list(COST_BEARER_RULE_LABELS),
+                        format_func=lambda value: COST_BEARER_RULE_LABELS[value],
                     )
                     cost_entity = st.selectbox(
                         "固定成本承担单位", entity_options,
@@ -620,11 +646,12 @@ with tab5:
                 ps1, ps2 = st.columns(2)
                 with ps1:
                     settlement_mode = st.selectbox(
-                        "结算方式", ['none', 'proxy_social', 'central_chargeback',
-                                     'annual_reimbursement', 'local_direct', 'record_only']
+                        "结算方式", list(SETTLEMENT_MODE_LABELS),
+                        format_func=lambda value: SETTLEMENT_MODE_LABELS[value],
                     )
                     settlement_cycle = st.selectbox(
-                        "结算周期", ['none', 'monthly', 'quarterly', 'annual', 'mixed']
+                        "结算周期", list(SETTLEMENT_CYCLE_LABELS),
+                        format_func=lambda value: SETTLEMENT_CYCLE_LABELS[value],
                     )
                 with ps2:
                     policy_remarks = st.text_area("政策说明")
@@ -657,22 +684,34 @@ with tab5:
                         st.error(msg)
 
     with override_tab:
+        st.caption(
+            "用于只针对某个人、某个险种的例外，优先级最高。例如李峰林只有工伤由省公众缴纳，"
+            "就只新增一条“李峰林－工伤”例外，不影响他的其他险种，也不影响其他人。"
+        )
         override_df = get_social_overrides_dataframe(active_only=False)
         if not override_df.empty:
             display_override = override_df.copy()
-            display_override['险种'] = display_override['insurance_item'].map(INSURANCE_LABELS)
+            display_override['险种'] = display_override['insurance_item'].map(INSURANCE_LABELS).fillna(display_override['insurance_item'])
+            display_override['enabled'] = display_override['enabled'].map(ENABLED_LABELS).fillna(display_override['enabled'])
+            display_override['settlement_mode'] = display_override['settlement_mode'].map(SETTLEMENT_MODE_LABELS).fillna(display_override['settlement_mode'])
+            display_override['settlement_cycle'] = display_override['settlement_cycle'].map(SETTLEMENT_CYCLE_LABELS).fillna(display_override['settlement_cycle'])
+            display_override['amount_source'] = display_override['amount_source'].map(AMOUNT_SOURCE_LABELS).fillna(display_override['amount_source'])
+            display_override['active'] = display_override['active'].map(ACTIVE_LABELS).fillna(display_override['active'])
             st.dataframe(
                 display_override[[
                     'override_id', 'emp_name', 'emp_id', '险种', 'effective_from_month',
-                    'effective_to_month', 'enabled', 'calculation_policy_entity',
-                    'payer_entity_name', 'cost_bearer_name', 'settlement_mode',
-                    'settlement_cycle', 'special_reason', 'source_document_no', 'active'
+                    'effective_to_month', 'enabled', 'calculation_policy_entity_name',
+                    'payer_entity_name', 'cost_bearer_name', 'settlement_counterparty_name',
+                    'settlement_mode', 'settlement_cycle', 'amount_source',
+                    'special_reason', 'source_document_no', 'active'
                 ]].rename(columns={
                     'override_id': '例外ID', 'emp_name': '姓名', 'emp_id': '工号',
                     'effective_from_month': '生效月', 'effective_to_month': '失效月',
-                    'enabled': '参保', 'calculation_policy_entity': '计算政策',
+                    'enabled': '参保', 'calculation_policy_entity_name': '计算政策主体',
                     'payer_entity_name': '缴费主体', 'cost_bearer_name': '成本承担',
+                    'settlement_counterparty_name': '结算对象',
                     'settlement_mode': '结算方式', 'settlement_cycle': '结算周期',
+                    'amount_source': '金额来源',
                     'special_reason': '特殊原因', 'source_document_no': '依据', 'active': '启用'
                 }),
                 use_container_width=True,
@@ -729,14 +768,16 @@ with tab5:
                 oo1, oo2 = st.columns(2)
                 with oo1:
                     override_settlement = st.selectbox(
-                        "结算方式", ['沿用关系', 'none', 'proxy_social', 'central_chargeback',
-                                     'annual_reimbursement', 'local_direct', 'record_only']
+                        "结算方式", [None] + list(SETTLEMENT_MODE_LABELS),
+                        format_func=lambda value: "沿用人员关系/公共政策" if value is None else SETTLEMENT_MODE_LABELS[value],
                     )
                     override_cycle = st.selectbox(
-                        "结算周期", ['沿用关系', 'none', 'monthly', 'quarterly', 'annual', 'mixed']
+                        "结算周期", [None] + list(SETTLEMENT_CYCLE_LABELS),
+                        format_func=lambda value: "沿用人员关系/公共政策" if value is None else SETTLEMENT_CYCLE_LABELS[value],
                     )
                     override_amount_source = st.selectbox(
-                        "金额来源", ['沿用公共政策', 'system_calculated', 'external_actual', 'manual_confirmed']
+                        "金额来源", [None] + list(AMOUNT_SOURCE_LABELS),
+                        format_func=lambda value: "沿用公共政策" if value is None else AMOUNT_SOURCE_LABELS[value],
                     )
                 with oo2:
                     special_reason = st.text_input("特殊原因*")
@@ -754,9 +795,9 @@ with tab5:
                         'payer_entity_code': override_payer,
                         'cost_bearer_code': override_cost,
                         'settlement_counterparty_code': override_counterparty,
-                        'settlement_mode': None if override_settlement == '沿用关系' else override_settlement,
-                        'settlement_cycle': None if override_cycle == '沿用关系' else override_cycle,
-                        'amount_source': None if override_amount_source == '沿用公共政策' else override_amount_source,
+                        'settlement_mode': override_settlement,
+                        'settlement_cycle': override_cycle,
+                        'amount_source': override_amount_source,
                         'payment_channel_code': override_channel.strip() or None,
                         'special_reason': special_reason,
                         'source_document_no': override_document,
@@ -1277,8 +1318,12 @@ with tab2:
     if batch_df.empty:
         st.caption("生成结算函后，系统会在这里登记唯一批次，避免同一期间重复结算。")
     else:
+        batch_display = batch_df.copy()
+        batch_display['status'] = batch_display['status'].map(
+            SETTLEMENT_BATCH_STATUS_LABELS
+        ).fillna(batch_display['status'])
         st.dataframe(
-            batch_df[[
+            batch_display[[
                 'batch_id', 'period_start', 'period_end', 'branch_name', 'payee_name',
                 'total_amount', 'settled_amount', 'status', 'generated_at', 'settled_at', 'voucher_no'
             ]].rename(columns={
@@ -1302,7 +1347,11 @@ with tab2:
                     "结算批次", batch_options, format_func=lambda value: batch_labels[value]
                 )
                 selected_source = batch_df[batch_df['batch_id'] == selected_batch].iloc[0]
-                batch_status = st.selectbox("状态", ['generated', 'sent', 'confirmed', 'paid'])
+                batch_status_options = ['generated', 'sent', 'confirmed', 'paid']
+                batch_status = st.selectbox(
+                    "状态", batch_status_options,
+                    format_func=lambda value: SETTLEMENT_BATCH_STATUS_LABELS[value],
+                )
                 settled_amount = st.number_input(
                     "已结金额", min_value=0.0,
                     value=float(selected_source['settled_amount'] or 0.0),

@@ -18,11 +18,19 @@ from modules.core_dept import get_all_departments, add_department, update_depart
 from modules.core_position import get_all_positions, add_position, update_position
 from modules.core_personnel import get_all_employees, add_employee, update_employee, update_employee_status, get_all_history, rollback_history
 from modules.core_arrangements import (
+    ACTIVE_LABELS,
+    ARRANGEMENT_CLOSE_RESULT_LABELS,
     ARRANGEMENT_LABELS,
+    ARRANGEMENT_STATUS_LABELS,
+    SETTLEMENT_CYCLE_LABELS,
+    SETTLEMENT_MODE_LABELS,
+    SPECIAL_ARRANGEMENT_TYPES,
     close_arrangement,
+    create_business_entity,
     create_arrangement,
     get_arrangements_dataframe,
     get_entities_dataframe,
+    set_business_entity_active,
 )
 
 st.set_page_config(page_title="组织人事中枢", layout="wide")
@@ -109,7 +117,7 @@ st.sidebar.title("🎛️ 组织人事中枢")
 # 严格按照你的要求调整了次序：人员 -> 流水 -> 部门 -> 岗位
 current_page = st.sidebar.radio(
     "请选择操作模块:",
-    ["👥 人员档案", "🔄 用工与结算关系", "🕰️ 历史变动流水", "🏢 部门管理", "🎯 岗位字典"]
+    ["👥 人员档案", "🔄 特殊用工与结算关系", "🕰️ 历史变动流水", "🏢 部门管理", "🎯 岗位字典"]
 )
 st.title(current_page)
 
@@ -583,11 +591,15 @@ elif current_page == "👥 人员档案":
 # ==============================================================================
 # 模块 D: 🔄 用工与结算关系
 # ==============================================================================
-elif current_page == "🔄 用工与结算关系":
-    st.subheader("🔄 用工、实际工作与成本结算关系")
+elif current_page == "🔄 特殊用工与结算关系":
+    st.subheader("🔄 特殊用工、实际工作与成本结算关系")
     st.info(
-        "这里不改变员工的在职/离职状态。挂靠代缴、地市工作转入、下沉等关系"
-        "按生效日期独立留痕，用于决定工资范围、社保路由和成本结算。"
+        "这里只维护挂靠代缴、地市工作转入和下沉人员，不维护普通员工。"
+        "关系按生效日期留痕，用于决定是否由本系统发工资、各险种由谁缴费，以及费用最终由谁承担。"
+    )
+    st.caption(
+        "魏巍属于“地市工作转入”；三名下沉人员属于“下沉人员”；"
+        "李峰林如果只有工伤特殊，不在这里建关系，而是在社保页面建立个人险种例外。"
     )
 
     relation_df = get_arrangements_dataframe(include_closed=True)
@@ -595,7 +607,9 @@ elif current_page == "🔄 用工与结算关系":
     entity_options = [None] + entity_df['entity_code'].tolist()
     entity_names = dict(zip(entity_df['entity_code'], entity_df['entity_name']))
 
-    tab_list, tab_add, tab_close = st.tabs(["📋 关系台账", "➕ 新建关系", "✅ 到期/结束关系"])
+    tab_list, tab_add, tab_close, tab_entities = st.tabs([
+        "📋 关系台账", "➕ 新建特殊关系", "✅ 到期/结束关系", "🏢 业务单位管理"
+    ])
 
     with tab_list:
         if relation_df.empty:
@@ -604,6 +618,8 @@ elif current_page == "🔄 用工与结算关系":
             show_df = relation_df.copy()
             show_df['关系类型'] = show_df['arrangement_type'].map(ARRANGEMENT_LABELS).fillna(show_df['arrangement_type'])
             show_df['工资范围'] = show_df['payroll_included'].map({1: '本系统发薪', 0: '本系统不发薪'})
+            show_df['settlement_mode'] = show_df['settlement_mode'].map(SETTLEMENT_MODE_LABELS).fillna(show_df['settlement_mode'])
+            show_df['settlement_cycle'] = show_df['settlement_cycle'].map(SETTLEMENT_CYCLE_LABELS).fillna(show_df['settlement_cycle'])
             show_df['计划结束'] = pd.to_datetime(show_df['planned_end_date'], errors='coerce')
 
             today_ts = pd.Timestamp(date.today())
@@ -623,14 +639,18 @@ elif current_page == "🔄 用工与结算关系":
             if not expiring.empty:
                 st.warning(f"有 {len(expiring)} 条关系将在90天内到期。")
 
+            show_df['status'] = show_df['status'].map(ARRANGEMENT_STATUS_LABELS).fillna(show_df['status'])
+
             display_columns = {
                 'arrangement_id': '关系ID', 'emp_name': '姓名', 'emp_id': '工号',
                 '关系类型': '关系类型', 'contract_entity_name': '劳动合同主体',
                 'payroll_entity_name': '工资主体', 'actual_work_unit_name': '实际工作单位',
-                'related_branch_name': '关联地市', 'ultimate_cost_bearer_name': '最终成本承担',
+                'related_branch_name': '关联地市', 'accounting_entity_name': '当前记账单位',
+                'ultimate_cost_bearer_name': '最终成本承担',
                 'start_date': '开始日期', 'planned_end_date': '计划结束',
                 'actual_end_date': '实际结束', '工资范围': '工资范围',
-                'settlement_cycle': '结算周期', 'status': '状态', 'remarks': '备注'
+                'settlement_mode': '结算方式', 'settlement_cycle': '结算周期',
+                'status': '状态', 'remarks': '备注'
             }
             st.dataframe(
                 show_df[[c for c in display_columns if c in show_df.columns]].rename(columns=display_columns),
@@ -641,22 +661,28 @@ elif current_page == "🔄 用工与结算关系":
     with tab_add:
         relation_type = st.selectbox(
             "关系类型",
-            list(ARRANGEMENT_LABELS.keys()),
-            format_func=lambda value: ARRANGEMENT_LABELS[value],
+            list(SPECIAL_ARRANGEMENT_TYPES),
+            format_func=lambda value: SPECIAL_ARRANGEMENT_TYPES[value],
         )
         default_payroll = relation_type not in {'proxy_social', 'down_secondment'}
         default_mode = {
-            'normal': 'none',
             'proxy_social': 'proxy_social',
             'city_transfer': 'annual_labor_cost_reallocation',
             'down_secondment': 'mixed_by_item',
         }[relation_type]
         default_cycle = {
-            'normal': 'none', 'proxy_social': 'quarterly',
+            'proxy_social': 'quarterly',
             'city_transfer': 'annual', 'down_secondment': 'mixed'
         }[relation_type]
 
-        active_people = df_emps[df_emps['status'].isin(['在职', '挂靠人员'])].copy()
+        if relation_type == 'proxy_social':
+            active_people = df_emps[df_emps['status'] == '挂靠人员'].copy()
+            employee_field_label = "挂靠人员*"
+            st.caption("挂靠代缴只允许选择人员档案中状态为“挂靠人员”的人员。")
+        else:
+            active_people = df_emps[df_emps['status'] == '在职'].copy()
+            employee_field_label = "人员*"
+            st.caption("地市工作转入和下沉人员本来就是本单位在职人员，因此这里会显示本单位人员供选择。")
         emp_options = active_people['emp_id'].astype(str).tolist()
         emp_label = dict(zip(
             active_people['emp_id'].astype(str),
@@ -664,7 +690,12 @@ elif current_page == "🔄 用工与结算关系":
         ))
 
         with st.form("arrangement_create_form"):
-            target_emp_id = st.selectbox("员工*", emp_options, format_func=lambda value: emp_label[value])
+            target_emp_id = st.selectbox(
+                employee_field_label, emp_options,
+                format_func=lambda value: emp_label[value],
+                index=0 if emp_options else None,
+                placeholder="没有符合当前关系类型的候选人员",
+            )
             c1, c2, c3 = st.columns(3)
             with c1:
                 contract_entity = st.selectbox(
@@ -705,10 +736,16 @@ elif current_page == "🔄 用工与结算关系":
 
             s1, s2 = st.columns(2)
             with s1:
-                settlement_mode = st.text_input("结算方式", value=default_mode)
+                settlement_mode_options = list(SETTLEMENT_MODE_LABELS)
+                settlement_mode = st.selectbox(
+                    "结算方式", settlement_mode_options,
+                    index=settlement_mode_options.index(default_mode),
+                    format_func=lambda value: SETTLEMENT_MODE_LABELS[value],
+                )
                 settlement_cycle = st.selectbox(
-                    "结算周期", ['none', 'monthly', 'quarterly', 'annual', 'mixed'],
-                    index=['none', 'monthly', 'quarterly', 'annual', 'mixed'].index(default_cycle)
+                    "结算周期", list(SETTLEMENT_CYCLE_LABELS),
+                    index=list(SETTLEMENT_CYCLE_LABELS).index(default_cycle),
+                    format_func=lambda value: SETTLEMENT_CYCLE_LABELS[value],
                 )
             with s2:
                 source_document_no = st.text_input("政策/协议文号")
@@ -716,6 +753,9 @@ elif current_page == "🔄 用工与结算关系":
 
             submitted = st.form_submit_button("保存关系", type="primary")
             if submitted:
+                if target_emp_id is None:
+                    st.error("当前没有可建立该类关系的候选人员")
+                    st.stop()
                 employee_row = active_people[active_people['emp_id'].astype(str) == str(target_emp_id)].iloc[0]
                 ok, msg = create_arrangement({
                     'emp_id': str(target_emp_id),
@@ -758,7 +798,10 @@ elif current_page == "🔄 用工与结算关系":
             with st.form("arrangement_close_form"):
                 close_id = st.selectbox("选择关系", relation_options, format_func=lambda value: relation_labels[value])
                 close_date_value = st.date_input("实际结束日期", value=date.today())
-                close_status = st.selectbox("结束结果", ['returned', 'transferred', 'extended_replaced', 'closed'])
+                close_status = st.selectbox(
+                    "结束结果", list(ARRANGEMENT_CLOSE_RESULT_LABELS),
+                    format_func=lambda value: ARRANGEMENT_CLOSE_RESULT_LABELS[value],
+                )
                 close_remarks = st.text_area("处理说明")
                 if st.form_submit_button("确认结束关系", type="primary"):
                     ok, msg = close_arrangement(close_id, close_date_value, close_status, close_remarks)
@@ -766,6 +809,69 @@ elif current_page == "🔄 用工与结算关系":
                         set_msg_and_rerun(msg)
                     else:
                         st.error(msg)
+
+    with tab_entities:
+        st.caption(
+            "这里维护所有可能参与劳动合同、工资发放、实际工作、社保缴费和费用结算的单位。"
+            "新增地市或其他承接单位后，会自动出现在关系和缴费路由的单位下拉框中。"
+        )
+        all_entities = get_entities_dataframe(active_only=False)
+        if not all_entities.empty:
+            entity_display = all_entities.copy()
+            entity_display['active'] = entity_display['active'].map(ACTIVE_LABELS).fillna(entity_display['active'])
+            st.dataframe(
+                entity_display[[
+                    'entity_name', 'entity_type', 'parent_entity_name', 'active'
+                ]].rename(columns={
+                    'entity_name': '单位名称', 'entity_type': '单位类型',
+                    'parent_entity_name': '上级单位', 'active': '状态',
+                }),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        with st.expander("➕ 新增业务单位", expanded=False):
+            with st.form("business_entity_create_form"):
+                ec1, ec2, ec3 = st.columns(3)
+                with ec1:
+                    new_entity_name = st.text_input("单位名称*")
+                with ec2:
+                    new_entity_type = st.selectbox(
+                        "单位类型*", ["地市分公司", "其他承接单位", "法人", "上级单位"]
+                    )
+                with ec3:
+                    parent_options = [None] + entity_df['entity_code'].tolist()
+                    new_parent_entity = st.selectbox(
+                        "上级单位（可选）", parent_options,
+                        format_func=lambda value: "不设置" if value is None else entity_names[value],
+                    )
+                if st.form_submit_button("保存业务单位", type="primary"):
+                    ok, msg = create_business_entity(
+                        new_entity_name, new_entity_type, new_parent_entity
+                    )
+                    if ok:
+                        set_msg_and_rerun(msg)
+                    else:
+                        st.error(msg)
+
+        if not all_entities.empty:
+            with st.expander("启用或停用业务单位", expanded=False):
+                all_entity_options = all_entities['entity_code'].tolist()
+                all_entity_names = dict(zip(all_entities['entity_code'], all_entities['entity_name']))
+                with st.form("business_entity_status_form"):
+                    target_entity_code = st.selectbox(
+                        "选择单位", all_entity_options,
+                        format_func=lambda value: all_entity_names[value],
+                    )
+                    entity_action = st.radio("操作", ["启用", "停用"], horizontal=True)
+                    if st.form_submit_button("确认操作"):
+                        ok, msg = set_business_entity_active(
+                            target_entity_code, entity_action == "启用"
+                        )
+                        if ok:
+                            set_msg_and_rerun(msg)
+                        else:
+                            st.error(msg)
 
 # ==============================================================================
 # 模块 E: 🕰️ 历史变动流水 (全量归位侧边栏审计)

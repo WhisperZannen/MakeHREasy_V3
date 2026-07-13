@@ -130,6 +130,29 @@ class ArrangementRoutingTest(unittest.TestCase):
         self.assertEqual(route["cost_bearer_name"], "测试分公司")
         self.assertEqual(route["settlement_mode"], "annual_reimbursement")
 
+    def test_business_entity_dictionary_can_be_maintained(self):
+        ok, message = self.arrangements.create_business_entity(
+            "新增测试地市分公司", "地市分公司", "province_company"
+        )
+        self.assertTrue(ok, message)
+
+        entities = self.arrangements.get_entities_dataframe(active_only=True)
+        created = entities[entities["entity_name"] == "新增测试地市分公司"]
+        self.assertEqual(len(created), 1)
+        entity_code = created.iloc[0]["entity_code"]
+        self.assertEqual(created.iloc[0]["parent_entity_name"], "省公司")
+
+        ok, message = self.arrangements.set_business_entity_active(entity_code, False)
+        self.assertTrue(ok, message)
+        active_entities = self.arrangements.get_entities_dataframe(active_only=True)
+        self.assertNotIn("新增测试地市分公司", active_entities["entity_name"].tolist())
+
+        ok, message = self.arrangements.create_business_entity(
+            "新增测试地市分公司", "地市分公司", "province_company"
+        )
+        self.assertTrue(ok, message)
+        self.assertIn("重新启用", message)
+
     def test_monthly_save_dual_writes_and_respects_close(self):
         roster = {
             "工号": "E001", "姓名": "测试员工", "财务归属": "本级",
