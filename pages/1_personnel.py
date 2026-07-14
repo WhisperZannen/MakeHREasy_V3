@@ -511,7 +511,7 @@ elif current_page == "👥 人员档案":
         st.info("💡 若状态填为【离职/退休】，部门岗位可留空，系统将自动编入【离退休公共池】；若状态为【挂靠人员】，工号可填入社保编号。")
         t1, t2 = st.columns(2)
         with t1:
-            icols = ['工号', '姓名', '状态', '所属部门', '岗位', '技术等级(T级)', '身份证号', '岗级', '档次', '入职日期', '参加工作日期', '学历', '学位', '毕业院校', '专业', '毕业日期']
+            icols = ['工号', '姓名', '状态', '所属部门', '岗位', '技术等级(T级)', '身份证号', '岗级', '档次', '入职日期', '参加工作日期', '首次就业(是/否)', '学历', '学位', '毕业院校', '专业', '毕业日期']
             tmp = pd.DataFrame(columns=icols); tout = io.BytesIO()
             with pd.ExcelWriter(tout) as w: tmp.to_excel(w, index=False)
             st.download_button("下载人员模板", data=tout.getvalue(), file_name="人员导入模板.xlsx")
@@ -560,7 +560,9 @@ elif current_page == "👥 人员档案":
                         'school_name': clean_str(row.get('毕业院校')),
                         'major': clean_str(row.get('专业')),
                         'graduation_date': clean_date(row.get('毕业日期')),
-                        'first_job_date': clean_date(row.get('参加工作日期'))
+                        'first_job_date': clean_date(row.get('参加工作日期')),
+                        'employment_stage': 'intern' if ipn == '实习岗' else 'regular',
+                        'first_employment': 1 if clean_str(row.get('首次就业(是/否)')) in {'是', '1', 'true', 'True'} else 0,
                     }
 
                     if eid in ex_ids:
@@ -643,6 +645,23 @@ elif current_page == "👥 人员档案":
                     f_first_work_val = pd.to_datetime(first_work_raw).date() if pd.notna(first_work_raw) and str(first_work_raw).strip() != '' else None
                     f_first_work = st.date_input("参加工作时间*", value=f_first_work_val, min_value=date(1950, 1, 1))
 
+                is_intern_position = pm.get(fpos) == '实习岗' if fpos else False
+                existing_first_employment = bool(
+                    int(t_emp_sel.get('first_employment', 0) or 0)
+                ) if t_emp_sel is not None else False
+                f_first_employment = st.checkbox(
+                    "首次参加工作（公积金从入职次月开始）",
+                    value=existing_first_employment,
+                    help="只针对首次就业的新入职人员；有过工作经历的人员不要勾选。",
+                )
+                if is_intern_position:
+                    months = 3 if f_edu in {'硕士', '研究生'} else 6
+                    expected_regular = fjoin + relativedelta(months=months)
+                    st.info(
+                        f"系统识别为实习期：预计 {expected_regular:%Y-%m-%d} 转正。"
+                        "到期只提醒，不会自动转正；将岗位改为正式岗位并保存后，才记录实际转正。"
+                    )
+
             st.write("**--- 状态与快照控制 ---**")
             cs1, cs2, cs3 = st.columns(3)
             with cs1:
@@ -669,7 +688,17 @@ elif current_page == "👥 人员档案":
                         'school_name': f_school,
                         'major': f_major,
                         'graduation_date': f_grad_date.strftime('%Y-%m-%d') if f_grad_date else None,
-                        'first_job_date': f_first_work.strftime('%Y-%m-%d') if f_first_work else None
+                        'first_job_date': f_first_work.strftime('%Y-%m-%d') if f_first_work else None,
+                        'employment_stage': 'intern' if is_intern_position else 'regular',
+                        'first_employment': 1 if f_first_employment else 0,
+                        'expected_regularization_date': (
+                            t_emp_sel.get('expected_regularization_date')
+                            if t_emp_sel is not None else None
+                        ),
+                        'actual_regularization_date': (
+                            t_emp_sel.get('actual_regularization_date')
+                            if t_emp_sel is not None else None
+                        ),
                     }
                     ad_str = fcd.strftime('%Y-%m-%d %H:%M:%S')
                     if t_emp_sel is not None: ok, msg = update_employee(fid, ed, pd_i, reason=frsn, change_date=ad_str)
@@ -682,7 +711,7 @@ elif current_page == "👥 人员档案":
 # ==============================================================================
 elif current_page == "🧭 特殊人员与待遇":
     person_settings_tab, default_rules_tab = st.tabs([
-        "人员设置", "下沉/地市转入默认规则"
+        "人员情形与个人待遇例外", "下沉/地市转入默认规则"
     ])
     with person_settings_tab:
         st.subheader("🧭 特殊人员与待遇设置")
@@ -893,7 +922,7 @@ elif current_page == "🧭 特殊人员与待遇":
             hide_index=True,
         )
 
-        with st.expander("只修改一个特殊项目", expanded=False):
+        with st.expander("③ 个人待遇例外（只改与默认规则不同的项目）", expanded=False):
             st.caption(
                 "只有和普通规则不同的项目才在这里设置。例如李峰林只需要设置“工伤保险”。"
                 "没有设置的项目自动沿用普通人员或该类人员规则。"

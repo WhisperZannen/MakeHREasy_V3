@@ -259,8 +259,9 @@ with tab1:
     st.divider()
 
     st.subheader("第二步：生成本月社保明细")
-    rule_year_to_use = st.selectbox("⚙️ 选择本次套用的【规则年度】(如次年6月前沿用上年规则)",
-                                    ["2024", "2025", "2026", "2027", "2028"], index=1)
+    active_rule = get_policy_rules(calc_month, "省公众")
+    active_rule_month = active_rule.get('effective_from_month', active_rule.get('rule_year', '未配置'))
+    st.caption(f"本月自动采用 {active_rule_month} 起生效的最近一版缴费参数，无需选择年度。")
 
     if st.button("生成本月社保明细", type="primary"):
         missing_count = len(roster_df[roster_df['已录入原始基数'] == 0.0])
@@ -271,7 +272,7 @@ with tab1:
             from modules.core_social_security import calculate_complete_bill
 
             for _, row in roster_df.iterrows():
-                all_bills.append(calculate_complete_bill(row.to_dict(), rule_year_to_use, calc_month))
+                all_bills.append(calculate_complete_bill(row.to_dict(), calc_month[:4], calc_month))
             st.session_state['temp_bills'] = pd.DataFrame(all_bills)
 
     if 'temp_bills' in st.session_state:
@@ -1450,18 +1451,19 @@ with tab2:
 # Tab 3: 全局规则与参数配置
 # ------------------------------------------------------------------------------
 with tab3:
-    st.subheader("🛠️ 全局算力引擎参数设置")
-    st.info("💡 此处的设置将直接决定全公司数千条社保数据的最终核算金额。")
+    st.subheader("缴费金额参数")
+    st.info("填写生效月份并保存即可。从该月开始使用新规则，旧月份和已封账账单保持不变。")
 
     c_y, c_e = st.columns(2)
-    with c_y: target_year = st.selectbox("📅 规则生效年度", ["2024", "2025", "2026", "2027", "2028"], index=1)
+    with c_y: effective_month = st.text_input("规则生效月份", value=datetime.date.today().strftime('%Y-%m'), max_chars=7)
     with c_e: target_entity = st.selectbox("🏢 适用法人主体", ["全量设置", "省公众", "中电数智", "省公司"])
 
     fetch_entity = "省公众" if "全量" in target_entity else target_entity
-    curr = get_policy_rules(target_year, fetch_entity)
+    curr = get_policy_rules(effective_month, fetch_entity)
 
-    if curr: st.success(f"已加载 {target_year} 年度 【{fetch_entity}】 的历史配置，可直接修改。")
-    else: st.info(f"【{fetch_entity}】 在 {target_year} 年度尚无配置记录，请录入参数后保存。")
+    if curr:
+        st.success(f"已加载【{fetch_entity}】最近生效的配置（{curr.get('effective_from_month', curr.get('rule_year', '历史规则'))}）。保存后从 {effective_month} 起使用新版本。")
+    else: st.info(f"【{fetch_entity}】尚无配置记录，请录入参数后保存。")
 
     if st.session_state.get('show_confirm', False):
         st.warning("⚠️ 警告：您即将修改底层财务参数，请核对变更情况！")
@@ -1480,27 +1482,43 @@ with tab3:
         st.divider()
 
     with st.form("policy_rules_form"):
-        st.write(f"**【{target_year} 年度】算法控制总开关**")
-        c_mode, c_fund, c_med = st.columns(3)
+        st.write(f"**从 {effective_month} 起执行**")
+        c_mode, c_generate, c_fund, c_med = st.columns(4)
         with c_mode:
             # [核心修复3] 补充中文翻译映射字典，彻底告别底层代码暴露
-            r_keys = ['exact', 'round_to_yuan', 'round_to_ten', 'floor_to_ten']
+            r_keys = ['round_to_ten', 'round_to_yuan', 'exact']
             r_map = {
-                'exact': '精确到分 (不取整)',
-                'round_to_yuan': '四舍五入到元',
-                'round_to_ten': '四舍五入到十元',
-                'floor_to_ten': '向下取整到十元 (见角进元等)'
+                'exact': '按导入的核定基数直接计算（推荐）',
+                'round_to_yuan': '将导入基数再四舍五入到元',
+                'round_to_ten': '将导入基数再四舍五入到十元',
             }
-            cur_round = curr.get('rounding_mode', 'round_to_yuan')
+            cur_round = curr.get('rounding_mode', 'round_to_ten')
             # 引入 format_func 让界面显示中文，底层仍传英文
-            sel_round = st.selectbox("社保取整规则", options=r_keys, format_func=lambda x: r_map[x], index=r_keys.index(cur_round) if cur_round in r_keys else 1)
+            sel_round = st.selectbox("已导入社保基数如何处理", options=r_keys, format_func=lambda x: r_map[x], index=r_keys.index(cur_round) if cur_round in r_keys else 2)
+
+        with c_generate:
+            generation_keys = ['round_to_ten', 'round_to_yuan', 'exact']
+            generation_map = {
+                'round_to_ten': '月均应发四舍五入到十元（当前口径）',
+                'round_to_yuan': '月均应发四舍五入到元',
+                'exact': '月均应发保留到分',
+            }
+            current_generation = curr.get('base_generation_rounding_mode', 'round_to_ten')
+            generation_rounding = st.selectbox(
+                "未来按应发测算新基数时",
+                options=generation_keys,
+                format_func=lambda value: generation_map[value],
+                index=(generation_keys.index(current_generation)
+                       if current_generation in generation_keys else 0),
+                help="本项先保存业务口径，未来新增自动测算基数功能时直接使用；不会重算当前已导入基数。",
+            )
 
         with c_fund:
             # [核心修复4] 公积金算法的中文翻译字典
             f_keys = ['independent', 'reverse_from_ss']
             f_map = {
-                'independent': '独立计算 (基数×比例)',
-                'reverse_from_ss': '反推法 (企个相加逢元进十等)'
+                'independent': '全部按独立公积金基数×比例',
+                'reverse_from_ss': '随社保基数：单边缴交额取整到十元后反推执行基数'
             }
             cur_fund = curr.get('fund_calc_method', 'reverse_from_ss')
             sel_fund = st.selectbox("公积金特殊算法", options=f_keys, format_func=lambda x: f_map[x], index=f_keys.index(cur_fund) if cur_fund in f_keys else 1)
@@ -1532,13 +1550,31 @@ with tab3:
 
         _, _, a_cr, a_pr = render_ins_row("企业年金", "annuity", has_limit=False)
 
+        st.divider()
+        st.write("**新入职与转正控制**")
+        lc1, lc2 = st.columns(2)
+        with lc1:
+            fund_delay = st.number_input(
+                "首次就业人员公积金延后（月）",
+                min_value=0, max_value=12,
+                value=int(curr.get('new_hire_fund_delay_months', 1) or 0),
+                help="填1表示入职次月开始缴纳。个人待遇例外仍然优先。",
+            )
+        with lc2:
+            annuity_after_regular = st.checkbox(
+                "实习人员确认转正后才缴企业年金",
+                value=bool(int(curr.get('annuity_requires_regularization', 1) or 0)),
+            )
+
         if st.form_submit_button("🔍 对比并预览修改", type="primary"):
             st.session_state['pending_params'] = (
-                target_year, target_entity, sel_round, sel_fund, med_serious,
+                effective_month, target_entity, sel_round, sel_fund, med_serious,
                 p_up, p_lw, p_cr, p_pr, m_up, m_lw, m_cr, m_pr,
                 u_up, u_lw, u_cr, u_pr, i_up, i_lw, i_cr,
                 mat_up, mat_lw, mat_cr, f_up, f_lw, f_cr, f_pr,
-                a_cr, a_pr, f_soe_up, f_soe_lw
+                a_cr, a_pr, f_soe_up, f_soe_lw,
+                int(fund_delay), 1 if annuity_after_regular else 0,
+                generation_rounding
             )
             st.session_state['show_confirm'] = True
             st.rerun()

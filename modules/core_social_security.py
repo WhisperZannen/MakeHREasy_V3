@@ -10,6 +10,9 @@ import sqlite3
 import os
 import pandas as pd
 import math
+import re
+from datetime import date
+from decimal import Decimal, ROUND_HALF_UP
 
 from modules.core_arrangements import resolve_social_route
 
@@ -98,15 +101,36 @@ _ensure_multi_entity_schema()
 # ------------------------------------------------------------------------------
 # 业务接口 1: 规则读取引擎
 # ------------------------------------------------------------------------------
-def get_policy_rules(year: str, entity: str) -> dict:
+def _normalize_effective_month(value: str) -> str:
+    text = str(value or '').strip()
+    if re.fullmatch(r'\d{4}', text):
+        return f'{text}-12'
+    if re.fullmatch(r'\d{4}-(0[1-9]|1[0-2])', text):
+        return text
+    return date.today().strftime('%Y-%m')
+
+
+def get_policy_rules(period: str, entity: str) -> dict:
+    """读取目标月份之前最近一次生效的规则；兼容旧代码传入年度。"""
+    target_month = _normalize_effective_month(period)
     conn = _get_db_connection()
     try:
-        query = "SELECT * FROM ss_policy_rules WHERE rule_year = ? AND manage_entity = ?"
-        df = pd.read_sql_query(query, conn, params=[year, entity])
+        query = """
+            SELECT * FROM ss_policy_versions
+            WHERE effective_from_month <= ? AND manage_entity = ?
+            ORDER BY effective_from_month DESC LIMIT 1
+        """
+        df = pd.read_sql_query(query, conn, params=[target_month, entity])
         if not df.empty:
             return df.iloc[0].to_dict()
-        else:
-            return {}
+        # 老数据库或尚未迁移的测试库仍可使用原年度表。
+        year = target_month[:4]
+        legacy = pd.read_sql_query(
+            "SELECT * FROM ss_policy_rules WHERE rule_year <= ? AND manage_entity = ? "
+            "ORDER BY rule_year DESC LIMIT 1",
+            conn, params=[year, entity],
+        )
+        return legacy.iloc[0].to_dict() if not legacy.empty else {}
     except Exception as e:
         print(f"读取规则失败: {e}")
         return {}
@@ -117,22 +141,25 @@ def get_policy_rules(year: str, entity: str) -> dict:
 # 业务接口 2: 规则写入引擎
 # ------------------------------------------------------------------------------
 def upsert_policy_rules(params_tuple: tuple, is_all_entities: bool = False) -> tuple:
+    """按生效月份保存新版本；旧版本和已封账月份不被覆盖。"""
     entities = ["省公众", "中电数智", "省公司"] if is_all_entities else [params_tuple[1]]
     conn = _get_db_connection()
     cursor = conn.cursor()
     try:
         sql = """
-            INSERT INTO ss_policy_rules (
-                rule_year, manage_entity, rounding_mode, fund_calc_method, medical_serious_fix,
+            INSERT INTO ss_policy_versions (
+                effective_from_month, manage_entity, rounding_mode, fund_calc_method, medical_serious_fix,
                 pension_upper, pension_lower, pension_comp_rate, pension_pers_rate,
                 medical_upper, medical_lower, medical_comp_rate, medical_pers_rate,
                 unemp_upper, unemp_lower, unemp_comp_rate, unemp_pers_rate,
                 injury_upper, injury_lower, injury_comp_rate,
                 maternity_upper, maternity_lower, maternity_comp_rate,
                 fund_upper, fund_lower, fund_comp_rate, fund_pers_rate,
-                annuity_comp_rate, annuity_pers_rate, fund_soe_upper, fund_soe_lower
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(rule_year, manage_entity) DO UPDATE SET
+                annuity_comp_rate, annuity_pers_rate, fund_soe_upper, fund_soe_lower,
+                new_hire_fund_delay_months, annuity_requires_regularization,
+                base_generation_rounding_mode
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(effective_from_month, manage_entity) DO UPDATE SET
                 rounding_mode=excluded.rounding_mode, fund_calc_method=excluded.fund_calc_method, medical_serious_fix=excluded.medical_serious_fix,
                 pension_upper=excluded.pension_upper, pension_lower=excluded.pension_lower, pension_comp_rate=excluded.pension_comp_rate, pension_pers_rate=excluded.pension_pers_rate,
                 medical_upper=excluded.medical_upper, medical_lower=excluded.medical_lower, medical_comp_rate=excluded.medical_comp_rate, medical_pers_rate=excluded.medical_pers_rate,
@@ -141,7 +168,11 @@ def upsert_policy_rules(params_tuple: tuple, is_all_entities: bool = False) -> t
                 maternity_upper=excluded.maternity_upper, maternity_lower=excluded.maternity_lower, maternity_comp_rate=excluded.maternity_comp_rate,
                 fund_upper=excluded.fund_upper, fund_lower=excluded.fund_lower, fund_comp_rate=excluded.fund_comp_rate, fund_pers_rate=excluded.fund_pers_rate,
                 annuity_comp_rate=excluded.annuity_comp_rate, annuity_pers_rate=excluded.annuity_pers_rate,
-                fund_soe_upper=excluded.fund_soe_upper, fund_soe_lower=excluded.fund_soe_lower
+                fund_soe_upper=excluded.fund_soe_upper, fund_soe_lower=excluded.fund_soe_lower,
+                new_hire_fund_delay_months=excluded.new_hire_fund_delay_months,
+                annuity_requires_regularization=excluded.annuity_requires_regularization,
+                base_generation_rounding_mode=excluded.base_generation_rounding_mode,
+                updated_at=CURRENT_TIMESTAMP
         """
         for ent in entities:
             current_params = list(params_tuple)
@@ -275,16 +306,20 @@ def batch_update_social_bases(df: pd.DataFrame) -> tuple:
     finally:
         conn.close()
 
+def _round_half_up(value: float, quantum: str) -> float:
+    return float(Decimal(str(value)).quantize(Decimal(quantum), rounding=ROUND_HALF_UP))
+
+
 def apply_rounding(value: float, mode: str) -> float:
     if mode == 'exact':
-        return round(value, 2)
+        return _round_half_up(value, '0.01')
     elif mode == 'round_to_yuan':
-        return float(round(value))
+        return _round_half_up(value, '1')
     elif mode == 'round_to_ten':
-        return float(round(value / 10.0) * 10)
+        return _round_half_up(Decimal(str(value)) / Decimal('10'), '1') * 10
     elif mode == 'floor_to_ten':
         return float(math.floor(value / 10.0) * 10)
-    return round(value, 2)
+    return _round_half_up(value, '0.01')
 
 # ------------------------------------------------------------------------------
 # 核心算子 2: 单个险种金额计算 (彻底废除公积金强制抹零机制)
@@ -295,8 +330,12 @@ def calc_insurance_item(item_type: str, raw_base: float, upper: float, lower: fl
     if raw_base <= 0:
         return 0.0, 0.0, 0.0
 
-    actual_base = raw_base
+    actual_base = float(raw_base)
     is_capped = False
+
+    # 独立公积金基数是人工/外部系统核定值，不套社保基数整十规则。
+    if item_type != 'fund' or fund_method != 'independent':
+        actual_base = apply_rounding(actual_base, round_mode)
 
     # 如果是公积金，且有内部执行线，优先用内部线判定封顶保底
     if item_type == 'fund' and (soe_upper > 0 or soe_lower > 0):
@@ -314,33 +353,66 @@ def calc_insurance_item(item_type: str, raw_base: float, upper: float, lower: fl
             actual_base = lower
             is_capped = True
 
-    # 基数取整规则
-    def apply_rounding(val, mode):
-        if mode == 'exact': return val
-        elif mode == 'round_to_yuan': return round(val)
-        elif mode == 'round_to_ten': return round(val / 10.0) * 10
-        elif mode == 'floor_to_ten': return float(int(val / 10.0) * 10)
-        return val
-
     if item_type != 'fund':
-        actual_base = apply_rounding(actual_base, round_mode)
-        comp_amount = round(actual_base * comp_rate, 2)
-        pers_amount = round(actual_base * pers_rate, 2)
+        comp_amount = _round_half_up(actual_base * comp_rate, '0.01')
+        pers_amount = _round_half_up(actual_base * pers_rate, '0.01')
     else:
         if fund_method == 'reverse_from_ss' and not is_capped:
-            # 只有在明确开启了“反推法”且没有碰触封顶线时，才执行特殊的逢元进十
-            raw_comp = actual_base * comp_rate
-            raw_pers = actual_base * pers_rate
-            comp_amount = float(round(raw_comp / 10.0) * 10)
-            pers_amount = float(round(raw_pers / 10.0) * 10)
+            # 正常人员：先把单边缴交额按十元四舍五入，再用最终缴交额反推执行基数。
+            comp_amount = apply_rounding(actual_base * comp_rate, 'round_to_ten') if comp_rate else 0.0
+            pers_amount = apply_rounding(actual_base * pers_rate, 'round_to_ten') if pers_rate else 0.0
+            reference_amount = comp_amount if comp_rate else pers_amount
+            reference_rate = comp_rate if comp_rate else pers_rate
+            actual_base = _round_half_up(reference_amount / reference_rate, '0.01') if reference_rate else 0.0
         else:
-            # 【绝对核心修复】：剥夺公积金的强制抹零特权！
-            # 独立计算模式下，严格遵守 21977 * 0.12 = 2637.24 的数学铁律，绝不擅自取整！
-            actual_base = apply_rounding(actual_base, round_mode)
-            comp_amount = round(actual_base * comp_rate, 2)
-            pers_amount = round(actual_base * pers_rate, 2)
+            # 独立基数及封顶/保底值严格按比例计算到分。
+            comp_amount = _round_half_up(actual_base * comp_rate, '0.01')
+            pers_amount = _round_half_up(actual_base * pers_rate, '0.01')
 
     return actual_base, comp_amount, pers_amount
+
+
+def _add_months(month_text: str, months: int) -> str:
+    year, month = map(int, month_text.split('-'))
+    value = year * 12 + month - 1 + int(months or 0)
+    return f'{value // 12:04d}-{value % 12 + 1:02d}'
+
+
+def get_lifecycle_participation(emp_id: str, item: str, target_month: str, rules: dict) -> tuple:
+    """返回人员生命周期是否允许参保及业务说明；个人例外在调用方优先。"""
+    if item not in {'fund', 'annuity'}:
+        return True, ''
+    conn = _get_db_connection()
+    try:
+        row = conn.execute(
+            """
+            SELECT e.join_company_date, p.first_employment, p.employment_stage,
+                   p.actual_regularization_date
+            FROM employees e
+            LEFT JOIN employee_profiles p ON p.emp_id = e.emp_id
+            WHERE e.emp_id = ?
+            """,
+            (str(emp_id),),
+        ).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return True, ''
+    row = dict(row)
+    if item == 'fund' and int(row.get('first_employment') or 0) == 1:
+        join_month = str(row.get('join_company_date') or '')[:7]
+        delay = int(rules.get('new_hire_fund_delay_months', 1) or 0)
+        if re.fullmatch(r'\d{4}-(0[1-9]|1[0-2])', join_month):
+            start_month = _add_months(join_month, delay)
+            if target_month < start_month:
+                return False, f'首次就业人员公积金从{start_month}开始缴纳'
+    if item == 'annuity' and int(rules.get('annuity_requires_regularization', 1) or 0) == 1:
+        if str(row.get('employment_stage') or 'regular') == 'intern':
+            return False, '实习期不缴企业年金，确认转正后自动启用'
+        regularized = str(row.get('actual_regularization_date') or '')[:7]
+        if regularized and target_month < regularized:
+            return False, f'企业年金从实际转正月{regularized}开始缴纳'
+    return True, ''
 
 
 # ------------------------------------------------------------------------------
@@ -361,6 +433,9 @@ def calculate_complete_bill(emp_row: dict, target_year: str, target_month: str =
     }
 
     total_comp, total_pers = 0.0, 0.0
+    social_actual_base = 0.0
+    fund_actual_base = 0.0
+    participation_notes = []
 
     # [核心防护] 提前初始化大病医疗字段，防止后端报 KeyError
     res['medical_serious_个'] = 0.0
@@ -388,16 +463,27 @@ def calculate_complete_bill(emp_row: dict, target_year: str, target_month: str =
         if context.get('cost_bearer_name'):
             res['财务归属'] = context['cost_bearer_name']
 
-        # 如果个人未开启参保开关，强制全部归零
-        if int(context.get('enabled', 0)) == 0:
-            res[f'{item}_企'] = res[f'{item}_个'] = 0.0
-            res[f'{item}_route'] = '不参保'
-            res[f'__{item}_base_amount'] = 0.0
-            continue
-
         route_entity = context.get('payer_entity_name') or emp_row.get(acc_col, "省公众")
         res[f'{item}_route'] = route_entity
         policy_entity = context.get('calculation_policy_entity') or route_entity
+        rules = get_policy_rules(target_month, policy_entity)
+
+        # 个人例外优先；没有个人例外时才应用新入职/实习期自动规则。
+        lifecycle_enabled, lifecycle_reason = True, ''
+        if not context.get('override_id') and rules:
+            lifecycle_enabled, lifecycle_reason = get_lifecycle_participation(
+                str(emp_row['工号']), item, target_month, rules
+            )
+
+        # 如果个人未开启参保，或尚未到自动启用月份，强制全部归零。
+        if int(context.get('enabled', 0)) == 0 or not lifecycle_enabled:
+            res[f'{item}_企'] = res[f'{item}_个'] = 0.0
+            res[f'{item}_route'] = '不参保'
+            res[f'__{item}_base_amount'] = 0.0
+            if lifecycle_reason:
+                res[f'__{item}_participation_note'] = lifecycle_reason
+                participation_notes.append(lifecycle_reason)
+            continue
 
         # 地市属地直缴等项目需要回传实缴金额，不允许套省内规则伪算。
         if context.get('amount_source') != 'system_calculated':
@@ -405,7 +491,6 @@ def calculate_complete_bill(emp_row: dict, target_year: str, target_month: str =
             res[f'__{item}_base_amount'] = 0.0
             continue
 
-        rules = get_policy_rules(target_year, policy_entity)
         if not rules:
             res[f'{item}_企'] = res[f'{item}_个'] = 0.0
             res[f'__{item}_base_amount'] = 0.0
@@ -437,6 +522,10 @@ def calculate_complete_bill(emp_row: dict, target_year: str, target_month: str =
             rules.get('fund_soe_lower', 0)
         )
         res[f'__{item}_base_amount'] = actual_base
+        if item == 'fund':
+            fund_actual_base = actual_base
+        elif item in {'pension', 'medical', 'unemp', 'injury', 'maternity'} and social_actual_base == 0:
+            social_actual_base = actual_base
 
         # [核心解毒] 大病医疗 7 块钱绝对独立出来，绝不再塞进基本医疗里！
         if item == 'medical':
@@ -460,6 +549,9 @@ def calculate_complete_bill(emp_row: dict, target_year: str, target_month: str =
 
     res['合计企业缴纳'] = total_comp
     res['合计个人扣款'] = total_pers
+    res['社保执行基数'] = social_actual_base
+    res['公积金执行基数'] = fund_actual_base
+    res['待遇生效说明'] = '；'.join(dict.fromkeys(participation_notes))
     return res
 
 # ------------------------------------------------------------------------------
@@ -561,6 +653,21 @@ def save_monthly_ss_records(df: pd.DataFrame, month: str) -> tuple:
                 close_status
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, item_insert_data)
+        cursor.executemany(
+            """
+            UPDATE ss_emp_matrix
+            SET ss_base_actual = ?, fund_base_actual = ?
+            WHERE emp_id = ?
+            """,
+            [
+                (
+                    safe_float(row.get('社保执行基数')),
+                    safe_float(row.get('公积金执行基数')),
+                    str(row['工号']),
+                )
+                for _, row in df.iterrows()
+            ],
+        )
         conn.commit()
         return True, (
             f"✅ {month} 共固化 {len(insert_data)} 人、{len(item_insert_data)} 条险种明细；"

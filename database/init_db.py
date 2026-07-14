@@ -6,6 +6,7 @@
 
 import sqlite3
 import os
+import uuid
 
 def ensure_payroll_schema_patch(cursor):
     """
@@ -329,6 +330,99 @@ def _add_columns_if_missing(cursor, table_name, required_columns):
             cursor.execute(
                 f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_sql}"
             )
+
+
+def ensure_person_lifecycle_schema(cursor):
+    """为人员增加稳定内部标识和实习/转正生命周期，不改变旧工号关联。"""
+    _add_columns_if_missing(cursor, 'employees', {
+        'person_id': 'TEXT',
+    })
+    rows = cursor.execute(
+        "SELECT emp_id FROM employees WHERE person_id IS NULL OR TRIM(person_id) = ''"
+    ).fetchall()
+    for (emp_id,) in rows:
+        cursor.execute(
+            "UPDATE employees SET person_id = ? WHERE emp_id = ?",
+            (str(uuid.uuid4()), emp_id),
+        )
+    cursor.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_employees_person_id ON employees(person_id)"
+    )
+
+    _add_columns_if_missing(cursor, 'employee_profiles', {
+        'employment_stage': "TEXT DEFAULT 'regular'",
+        'first_employment': 'INTEGER DEFAULT 0',
+        'expected_regularization_date': 'DATE',
+        'actual_regularization_date': 'DATE',
+    })
+    cursor.execute("""
+        UPDATE employee_profiles
+        SET employment_stage = CASE
+            WHEN EXISTS (
+                SELECT 1 FROM positions p
+                WHERE p.pos_id = employee_profiles.pos_id AND p.pos_name = '实习岗'
+            ) THEN 'intern'
+            ELSE COALESCE(NULLIF(employment_stage, ''), 'regular')
+        END
+    """)
+
+
+def ensure_social_policy_versions_schema(cursor):
+    """建立按生效月份取最新版本的参数表；旧年度规则只做初始化来源。"""
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS ss_policy_versions (
+            effective_from_month TEXT NOT NULL,
+            manage_entity TEXT NOT NULL,
+            pension_upper REAL, pension_lower REAL, pension_comp_rate REAL, pension_pers_rate REAL,
+            medical_upper REAL, medical_lower REAL, medical_comp_rate REAL, medical_pers_rate REAL,
+            medical_serious_fix REAL DEFAULT 7.0,
+            unemp_upper REAL, unemp_lower REAL, unemp_comp_rate REAL, unemp_pers_rate REAL,
+            injury_upper REAL, injury_lower REAL, injury_comp_rate REAL,
+            maternity_upper REAL, maternity_lower REAL, maternity_comp_rate REAL,
+            fund_upper REAL, fund_lower REAL, fund_comp_rate REAL, fund_pers_rate REAL,
+            annuity_comp_rate REAL, annuity_pers_rate REAL,
+            rounding_mode TEXT DEFAULT 'round_to_ten',
+            fund_calc_method TEXT DEFAULT 'reverse_from_ss',
+            fund_soe_upper REAL DEFAULT 0.0,
+            fund_soe_lower REAL DEFAULT 0.0,
+            new_hire_fund_delay_months INTEGER DEFAULT 1,
+            annuity_requires_regularization INTEGER DEFAULT 1,
+            base_generation_rounding_mode TEXT DEFAULT 'round_to_ten',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (effective_from_month, manage_entity)
+        )
+    ''')
+    _add_columns_if_missing(cursor, 'ss_policy_versions', {
+        'base_generation_rounding_mode': "TEXT DEFAULT 'round_to_ten'",
+    })
+    version_count = cursor.execute("SELECT COUNT(*) FROM ss_policy_versions").fetchone()[0]
+    if version_count == 0:
+        cursor.execute('''
+            INSERT OR IGNORE INTO ss_policy_versions (
+                effective_from_month, manage_entity,
+                pension_upper, pension_lower, pension_comp_rate, pension_pers_rate,
+                medical_upper, medical_lower, medical_comp_rate, medical_pers_rate,
+                medical_serious_fix,
+                unemp_upper, unemp_lower, unemp_comp_rate, unemp_pers_rate,
+                injury_upper, injury_lower, injury_comp_rate,
+                maternity_upper, maternity_lower, maternity_comp_rate,
+                fund_upper, fund_lower, fund_comp_rate, fund_pers_rate,
+                annuity_comp_rate, annuity_pers_rate, rounding_mode, fund_calc_method,
+                fund_soe_upper, fund_soe_lower
+            )
+            SELECT rule_year || '-01', manage_entity,
+                pension_upper, pension_lower, pension_comp_rate, pension_pers_rate,
+                medical_upper, medical_lower, medical_comp_rate, medical_pers_rate,
+                medical_serious_fix,
+                unemp_upper, unemp_lower, unemp_comp_rate, unemp_pers_rate,
+                injury_upper, injury_lower, injury_comp_rate,
+                maternity_upper, maternity_lower, maternity_comp_rate,
+                fund_upper, fund_lower, fund_comp_rate, fund_pers_rate,
+                annuity_comp_rate, annuity_pers_rate, rounding_mode, fund_calc_method,
+                fund_soe_upper, fund_soe_lower
+            FROM ss_policy_rules
+        ''')
 
 
 def ensure_work_arrangement_schema(cursor):
@@ -1537,6 +1631,8 @@ def init_database(db_path=None):
 
         # --- 表 15+：多形态用工、社保路由与结算兼容层 ---
         # 只新增表和字段，不删除现有人员、社保、薪酬或人工成本数据。
+        ensure_person_lifecycle_schema(cursor)
+        ensure_social_policy_versions_schema(cursor)
         ensure_work_arrangement_schema(cursor)
         ensure_finance_labor_schema(cursor)
 

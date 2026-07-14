@@ -9,6 +9,8 @@
 
 import sqlite3
 import os
+import uuid
+import calendar
 from datetime import datetime
 
 
@@ -124,6 +126,29 @@ def _get_db_connection():
     return conn
 
 
+def _add_calendar_months(date_text, months):
+    try:
+        source = datetime.strptime(str(date_text)[:10], '%Y-%m-%d').date()
+    except (TypeError, ValueError):
+        return None
+    index = source.year * 12 + source.month - 1 + int(months)
+    year, month = divmod(index, 12)
+    day = min(source.day, calendar.monthrange(year, month + 1)[1])
+    return f'{year:04d}-{month + 1:02d}-{day:02d}'
+
+
+def _prepare_lifecycle(profile_data, join_date, actual_date=None, was_intern=False):
+    result = dict(profile_data)
+    stage = result.get('employment_stage') or 'regular'
+    education = _normalize_text(result.get('education_level'))
+    if stage == 'intern' and not result.get('expected_regularization_date'):
+        months = 3 if education in {'硕士', '研究生'} else 6
+        result['expected_regularization_date'] = _add_calendar_months(join_date, months)
+    if was_intern and stage == 'regular' and not result.get('actual_regularization_date'):
+        result['actual_regularization_date'] = str(actual_date or datetime.now())[:10]
+    return result
+
+
 def add_employee(emp_data, profile_data, reason="新员工入职", change_date=None):
     join_date = emp_data.get('join_company_date')
     if join_date:
@@ -136,21 +161,40 @@ def add_employee(emp_data, profile_data, reason="新员工入职", change_date=N
     conn = _get_db_connection()
     cursor = conn.cursor()
     try:
+        profile_data = _prepare_lifecycle(
+            profile_data, emp_data.get('join_company_date'), change_date
+        )
         cursor.execute("""
-                       INSERT INTO employees (emp_id, name, id_card, dept_id, post_rank, post_grade, status,
+                       INSERT INTO employees (emp_id, person_id, name, id_card, dept_id, post_rank, post_grade, status,
                                               join_company_date)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                       """, (emp_data['emp_id'], emp_data['name'], emp_data['id_card'], emp_data['dept_id'],
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                       """, (emp_data['emp_id'], str(uuid.uuid4()), emp_data['name'], emp_data['id_card'], emp_data['dept_id'],
                              emp_data['post_rank'], emp_data['post_grade'], emp_data.get('status', '在职'),
                              emp_data.get('join_company_date')))
         cursor.execute("""
                        INSERT INTO employee_profiles (emp_id, pos_id, tech_grade, title_order, education_level, degree,
-                                                      school_name, major, graduation_date, first_job_date)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                                      school_name, major, graduation_date, first_job_date,
+                                                      employment_stage, first_employment,
+                                                      expected_regularization_date, actual_regularization_date)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                        """, (emp_data['emp_id'], profile_data.get('pos_id'), profile_data.get('tech_grade'),
                              profile_data.get('title_order', 999), profile_data.get('education_level'),
                              profile_data.get('degree'), profile_data.get('school_name'), profile_data.get('major'),
-                             profile_data.get('graduation_date'), profile_data.get('first_job_date')))
+                             profile_data.get('graduation_date'), profile_data.get('first_job_date'),
+                             profile_data.get('employment_stage', 'regular'),
+                             int(profile_data.get('first_employment', 0) or 0),
+                             profile_data.get('expected_regularization_date'),
+                             profile_data.get('actual_regularization_date')))
+        cursor.execute("""
+            INSERT OR IGNORE INTO ss_emp_matrix (
+                emp_id, cost_center,
+                pension_enabled, pension_account, medical_enabled, medical_account,
+                unemp_enabled, unemp_account, injury_enabled, injury_account,
+                maternity_enabled, maternity_account, fund_enabled, fund_account,
+                annuity_enabled, annuity_account
+            ) VALUES (?, '本级', 1, '省公众', 1, '省公司', 1, '省公众',
+                      1, '省公司', 1, '省公司', 1, '省公众', 1, '省公司')
+        """, (emp_data['emp_id'],))
         cursor.execute("""
                        INSERT INTO personnel_changes (emp_id, change_type, new_dept_id, new_pos_id, new_tech_grade,
                                                       new_post_rank, new_post_grade, change_date, change_reason)
@@ -172,7 +216,10 @@ def update_employee(emp_id, emp_data, profile_data, reason="档案更新", chang
     cursor = conn.cursor()
     try:
         cursor.execute("""
-            SELECT e.dept_id, e.post_rank, e.post_grade, e.status, p.pos_id, p.tech_grade, pos.pos_name as old_pos_name
+            SELECT e.dept_id, e.post_rank, e.post_grade, e.status,
+                   p.pos_id, p.tech_grade, p.employment_stage, p.first_employment,
+                   p.expected_regularization_date, p.actual_regularization_date,
+                   pos.pos_name as old_pos_name
             FROM employees e
             LEFT JOIN employee_profiles p ON e.emp_id = p.emp_id
             LEFT JOIN positions pos ON p.pos_id = pos.pos_id
@@ -182,6 +229,17 @@ def update_employee(emp_id, emp_data, profile_data, reason="档案更新", chang
 
         if old:
             old_snapshot = dict(old)
+            for field in (
+                'employment_stage', 'first_employment',
+                'expected_regularization_date', 'actual_regularization_date',
+            ):
+                if field not in profile_data:
+                    profile_data[field] = old_snapshot.get(field)
+            was_intern = _normalize_text(old_snapshot.get('old_pos_name')) == '实习岗'
+            profile_data = _prepare_lifecycle(
+                profile_data, emp_data.get('join_company_date'), actual_date,
+                was_intern=was_intern,
+            )
             change_tags = build_personnel_change_tags(old_snapshot, emp_data, profile_data)
 
             if change_tags:
@@ -197,7 +255,23 @@ def update_employee(emp_id, emp_data, profile_data, reason="档案更新", chang
             WHERE emp_id=?
         """, (emp_data['name'], emp_data['id_card'], emp_data['dept_id'], emp_data['post_rank'], emp_data['post_grade'], emp_data.get('status'), emp_data.get('join_company_date'), emp_id))
 
-        cursor.execute("UPDATE employee_profiles SET pos_id=?, tech_grade=?, title_order=?, education_level=?, degree=?, school_name=?, major=?, graduation_date=?, first_job_date=? WHERE emp_id=?", (profile_data.get('pos_id'), profile_data.get('tech_grade'), profile_data.get('title_order', 999), profile_data.get('education_level'), profile_data.get('degree'), profile_data.get('school_name'), profile_data.get('major'), profile_data.get('graduation_date'), profile_data.get('first_job_date'), emp_id))
+        cursor.execute("""
+            UPDATE employee_profiles
+            SET pos_id=?, tech_grade=?, title_order=?, education_level=?, degree=?,
+                school_name=?, major=?, graduation_date=?, first_job_date=?,
+                employment_stage=?, first_employment=?, expected_regularization_date=?,
+                actual_regularization_date=?
+            WHERE emp_id=?
+        """, (
+            profile_data.get('pos_id'), profile_data.get('tech_grade'),
+            profile_data.get('title_order', 999), profile_data.get('education_level'),
+            profile_data.get('degree'), profile_data.get('school_name'),
+            profile_data.get('major'), profile_data.get('graduation_date'),
+            profile_data.get('first_job_date'), profile_data.get('employment_stage', 'regular'),
+            int(profile_data.get('first_employment', 0) or 0),
+            profile_data.get('expected_regularization_date'),
+            profile_data.get('actual_regularization_date'), emp_id,
+        ))
 
         conn.commit()
         return True, "人员档案及状态已成功更新。"
