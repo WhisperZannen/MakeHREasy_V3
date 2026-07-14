@@ -95,6 +95,7 @@ class ArrangementRoutingTest(unittest.TestCase):
         self.assertTrue(ok, message)
         self.assertTrue(self.arrangements.is_payroll_included("E001", "2026-06"))
         self.assertFalse(self.arrangements.is_payroll_included("E001", "2026-07"))
+        self.assertFalse(self.arrangements.is_labor_cost_included("E001", "2026-07"))
 
         ok, message = self.arrangements.create_route_policy({
             "policy_name": "下沉医疗由派出单位代缴",
@@ -202,9 +203,116 @@ class ArrangementRoutingTest(unittest.TestCase):
             "划转状态": "pending",
         }]))
 
-        self.assertEqual(report.loc[0, "业务关系类型"], "地市工作转入")
+        self.assertEqual(report.loc[0, "业务关系类型"], "地市正式转入")
         self.assertEqual(report.loc[0, "划转方式"], "年度全口径人工成本划转")
         self.assertEqual(report.loc[0, "划转状态"], "待划转")
+
+    def test_simple_person_override_derives_cost_and_settlement(self):
+        ok, message = self.arrangements.save_person_social_override(
+            "E001", "fund", "2026-08", True,
+            "province_company", True, None,
+            "测试个人公积金集中代缴",
+        )
+        self.assertTrue(ok, message)
+        route = self.arrangements.resolve_social_route(
+            "E001", "fund", "2026-08",
+            legacy_enabled=0,
+            legacy_payer_name="省公众",
+            legacy_cost_center="测试分公司",
+        )
+        self.assertEqual(route["payer_entity_name"], "省公司")
+        self.assertEqual(route["cost_bearer_name"], "省公众")
+        self.assertEqual(route["settlement_mode"], "central_chargeback")
+        self.assertEqual(route["settlement_cycle"], "monthly")
+
+    def test_special_arrangement_defaults_follow_business_rules(self):
+        city_defaults = self.arrangements.get_arrangement_route_defaults(
+            "city_transfer", "2026-07"
+        ).set_index("项目")
+        for item in ["养老", "基本医疗", "失业", "工伤", "生育"]:
+            self.assertEqual(city_defaults.loc[item, "办理单位"], "省公众")
+        for item in ["住房公积金", "企业年金"]:
+            self.assertEqual(
+                city_defaults.loc[item, "办理单位"], "关联地市/原单位"
+            )
+        self.assertTrue(
+            (city_defaults["成本归属"] == "省公众").all()
+        )
+
+        down_routes = self.arrangements.get_person_treatment_dataframe(
+            "E001", "2026-07"
+        ).set_index("项目")
+        self.assertEqual(down_routes.loc["养老", "办理单位"], "省公司")
+        self.assertEqual(down_routes.loc["基本医疗", "办理单位"], "省公众")
+        self.assertEqual(down_routes.loc["失业", "办理单位"], "测试分公司")
+        self.assertEqual(down_routes.loc["工伤", "办理单位"], "测试分公司")
+        self.assertEqual(down_routes.loc["住房公积金", "办理单位"], "省公众")
+        self.assertTrue(
+            (down_routes["成本归属"] == "测试分公司").all()
+        )
+
+        ok, message = self.arrangements.save_arrangement_route_default(
+            "down_secondment", "medical", True, "province_company", False,
+            "2026-08", "测试新版本",
+        )
+        self.assertTrue(ok, message)
+        july = self.arrangements.resolve_social_route(
+            "E001", "medical", "2026-07", legacy_enabled=1,
+            legacy_payer_name="省公众", legacy_cost_center="本级",
+        )
+        august = self.arrangements.resolve_social_route(
+            "E001", "medical", "2026-08", legacy_enabled=1,
+            legacy_payer_name="省公众", legacy_cost_center="本级",
+        )
+        self.assertEqual(july["payer_entity_name"], "省公众")
+        self.assertEqual(august["payer_entity_name"], "省公司")
+        self.assertEqual(august["cost_bearer_name"], "测试分公司")
+
+    def test_schema_rerun_does_not_overwrite_people_rules(self):
+        conn = sqlite3.connect(self.db_path)
+        dept_id = conn.execute(
+            "SELECT dept_id FROM departments WHERE dept_name='测试部门'"
+        ).fetchone()[0]
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO employees(emp_id, name, dept_id, status)
+            VALUES ('E002', '迁移幂等测试', ?, '在职')
+            """,
+            (dept_id,),
+        )
+        conn.execute(
+            """
+            INSERT INTO employee_arrangements(
+                emp_id, arrangement_type, home_dept_id,
+                actual_work_unit_code, related_branch_code,
+                accounting_entity_code, ultimate_cost_bearer_code,
+                start_date, payroll_included, labor_cost_included,
+                settlement_mode, settlement_cycle, status
+            ) VALUES (
+                'E002', 'city_transfer', ?,
+                'branch:测试分公司', 'branch:测试分公司',
+                'province_public', 'branch:测试分公司',
+                '2026-09-01', 1, 0,
+                'annual_labor_cost_reallocation', 'annual', 'active'
+            )
+            """,
+            (dept_id,),
+        )
+        conn.commit()
+        conn.close()
+
+        from database.init_db import init_database
+        init_database(self.db_path)
+
+        conn = sqlite3.connect(self.db_path)
+        stored = conn.execute(
+            """
+            SELECT labor_cost_included, ultimate_cost_bearer_code
+            FROM employee_arrangements WHERE emp_id='E002'
+            """
+        ).fetchone()
+        conn.close()
+        self.assertEqual(stored, (0, 'branch:测试分公司'))
 
 
 if __name__ == "__main__":

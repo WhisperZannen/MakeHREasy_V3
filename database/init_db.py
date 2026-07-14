@@ -372,6 +372,7 @@ def ensure_work_arrangement_schema(cursor):
             planned_end_date DATE,
             actual_end_date DATE,
             payroll_included INTEGER NOT NULL DEFAULT 1,
+            labor_cost_included INTEGER NOT NULL DEFAULT 1,
             settlement_mode TEXT NOT NULL DEFAULT 'none',
             settlement_cycle TEXT NOT NULL DEFAULT 'none',
             status TEXT NOT NULL DEFAULT 'active',
@@ -556,7 +557,92 @@ def ensure_work_arrangement_schema(cursor):
         VALUES (?, ?, ?)
     ''', default_entities)
 
+    # 特殊人员默认待遇。这里只负责初始化一次；页面以后保存的新版本会按
+    # 生效月份接替旧版本，数据库初始化不会覆盖用户已经维护过的规则。
+    default_special_routes = [
+        # 下沉人员：工资及全部人工成本由地市承担，办理单位按省公司文件执行。
+        ('down_secondment', 'pension', 'fixed', 'province_company', 'related_branch', None,
+         'province_company', 'mixed_by_item', 'annual', '省公司集中缴纳，成本由下沉地市承担'),
+        ('down_secondment', 'medical', 'fixed', 'province_public', 'related_branch', None,
+         'province_public', 'annual_reimbursement', 'annual', '派出单位代缴，年末与下沉地市结算'),
+        ('down_secondment', 'unemp', 'related_branch', None, 'related_branch', None,
+         'province_public', 'none', 'none', '下沉地市属地缴纳并承担'),
+        ('down_secondment', 'injury', 'related_branch', None, 'related_branch', None,
+         'province_public', 'none', 'none', '下沉地市属地缴纳并承担'),
+        ('down_secondment', 'maternity', 'fixed', 'province_public', 'related_branch', None,
+         'province_public', 'annual_reimbursement', 'annual', '派出单位代缴，年末与下沉地市结算'),
+        ('down_secondment', 'fund', 'fixed', 'province_public', 'related_branch', None,
+         'province_public', 'annual_reimbursement', 'annual', '派出单位代缴，年末与下沉地市结算'),
+        ('down_secondment', 'annuity', 'fixed', 'province_company', 'related_branch', None,
+         'province_company', 'mixed_by_item', 'annual', '省公司集中缴纳，成本由下沉地市承担'),
+        # 地市正式转入：五险转入省公众，两金暂由原单位办理，成本仍归本单位。
+        ('city_transfer', 'pension', 'fixed', 'province_public', 'fixed', 'province_public',
+         'province_public', 'none', 'none', '五险由省公众办理'),
+        ('city_transfer', 'medical', 'fixed', 'province_public', 'fixed', 'province_public',
+         'province_public', 'none', 'none', '五险由省公众办理'),
+        ('city_transfer', 'unemp', 'fixed', 'province_public', 'fixed', 'province_public',
+         'province_public', 'none', 'none', '五险由省公众办理'),
+        ('city_transfer', 'injury', 'fixed', 'province_public', 'fixed', 'province_public',
+         'province_public', 'none', 'none', '五险由省公众办理'),
+        ('city_transfer', 'maternity', 'fixed', 'province_public', 'fixed', 'province_public',
+         'province_public', 'none', 'none', '五险由省公众办理'),
+        ('city_transfer', 'fund', 'related_branch', None, 'fixed', 'province_public',
+         'province_public', 'annual_labor_cost_reallocation', 'annual', '原单位办理，成本划转至本单位'),
+        ('city_transfer', 'annuity', 'related_branch', None, 'fixed', 'province_public',
+         'province_public', 'annual_labor_cost_reallocation', 'annual', '原单位办理，成本划转至本单位'),
+    ]
+    for (
+        arrangement_type, insurance_item, payer_rule, payer_code,
+        cost_rule, cost_code, calculation_entity, settlement_mode,
+        settlement_cycle, remarks,
+    ) in default_special_routes:
+        arrangement_name = {
+            'down_secondment': '下沉人员', 'city_transfer': '地市正式转入'
+        }[arrangement_type]
+        insurance_name = {
+            'pension': '养老', 'medical': '基本医疗', 'unemp': '失业',
+            'injury': '工伤', 'maternity': '生育', 'fund': '住房公积金',
+            'annuity': '企业年金',
+        }[insurance_item]
+        cursor.execute('''
+            INSERT INTO social_route_policies(
+                policy_name, arrangement_type, insurance_item,
+                effective_from_month, enabled_default,
+                calculation_policy_entity, payer_entity_rule, payer_entity_code,
+                cost_bearer_rule, cost_bearer_code,
+                settlement_mode, settlement_cycle, amount_source,
+                priority, active, remarks
+            )
+            SELECT ?, ?, ?, '1900-01', 1, ?, ?, ?, ?, ?, ?, ?,
+                   'system_calculated', 100, 1, ?
+            WHERE NOT EXISTS (
+                SELECT 1 FROM social_route_policies
+                WHERE arrangement_type = ? AND insurance_item = ?
+            )
+        ''', (
+            f"系统初始：{arrangement_name}{insurance_name}",
+            arrangement_type, insurance_item, calculation_entity,
+            payer_rule, payer_code, cost_rule, cost_code,
+            settlement_mode, settlement_cycle, remarks,
+            arrangement_type, insurance_item,
+        ))
+
     # 以下字段都是加法迁移。已有数据保持原值，新数据开始写入快照。
+    cursor.execute("PRAGMA table_info(employee_arrangements)")
+    arrangement_columns_before_patch = {row[1] for row in cursor.fetchall()}
+    _add_columns_if_missing(cursor, 'employee_arrangements', {
+        'labor_cost_included': 'INTEGER NOT NULL DEFAULT 1',
+    })
+    if 'labor_cost_included' not in arrangement_columns_before_patch:
+        # 只在首次补字段时迁移旧口径，之后尊重页面上的人工调整。
+        cursor.execute('''
+            UPDATE employee_arrangements
+            SET labor_cost_included = CASE
+                WHEN arrangement_type IN ('proxy_social', 'down_secondment') THEN 0
+                ELSE 1
+            END
+        ''')
+
     _add_columns_if_missing(cursor, 'ss_monthly_records', {
         'arrangement_id': 'INTEGER',
         'business_type_snapshot': "TEXT DEFAULT 'normal'",
@@ -584,8 +670,10 @@ def ensure_work_arrangement_schema(cursor):
         'salary_source': "TEXT DEFAULT '本单位发放'",
     })
     _add_columns_if_missing(cursor, 'labor_cost_ledger', {
+        'dept_id': 'INTEGER',
         'arrangement_id': 'INTEGER',
         'business_type_snapshot': "TEXT DEFAULT 'normal'",
+        'labor_cost_included_snapshot': 'INTEGER NOT NULL DEFAULT 1',
         'actual_work_unit_code': 'TEXT',
         'accounting_entity_code': 'TEXT',
         'ultimate_cost_bearer_code': 'TEXT',
@@ -593,6 +681,50 @@ def ensure_work_arrangement_schema(cursor):
         'reallocation_status': "TEXT DEFAULT 'not_required'",
         'settlement_batch_id': 'TEXT',
     })
+    cursor.execute('''
+        UPDATE labor_cost_ledger
+        SET dept_id = (
+            SELECT d.dept_id FROM departments d
+            WHERE trim(d.dept_name) = trim(labor_cost_ledger.dept_name)
+            LIMIT 1
+        )
+        WHERE dept_id IS NULL
+    ''')
+
+    # “地市正式转入”已经属于本单位人员：成本属于省公众，地市只作为
+    # 来源单位、实际工作地点和年度划转来源。仅在首次增加新口径字段时
+    # 修正一次旧数据，避免系统以后每次启动都覆盖页面上的人工设置。
+    if 'labor_cost_included' not in arrangement_columns_before_patch:
+        cursor.execute('''
+            UPDATE employee_arrangements
+            SET accounting_entity_code = COALESCE(accounting_entity_code, 'province_public'),
+                ultimate_cost_bearer_code = 'province_public',
+                labor_cost_included = 1,
+                payroll_included = 1,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE arrangement_type = 'city_transfer'
+        ''')
+        cursor.execute('''
+            UPDATE labor_cost_ledger
+            SET accounting_entity_code = 'province_public',
+                ultimate_cost_bearer_code = 'province_public',
+                labor_cost_included_snapshot = 1
+            WHERE business_type_snapshot = 'city_transfer'
+        ''')
+        cursor.execute('''
+            UPDATE social_monthly_items
+            SET cost_bearer_code = 'province_public',
+                updated_at = CURRENT_TIMESTAMP
+            WHERE business_type_snapshot = 'city_transfer'
+              AND override_id IS NULL
+        ''')
+    cursor.execute('''
+        UPDATE social_monthly_items
+        SET cost_bearer_code = 'province_public',
+            updated_at = CURRENT_TIMESTAMP
+        WHERE business_type_snapshot = 'normal'
+          AND cost_bearer_code IS NULL
+    ''')
 
     # 当前数据库里的地市名称也纳入主体字典，供关系表使用。
     cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='ss_emp_matrix'")
@@ -664,10 +796,19 @@ def init_database(db_path=None):
             dept_category TEXT NOT NULL,                -- 部门属性分类 (如: 管理支撑类、经营发展类)
             sort_order INTEGER DEFAULT 999,             -- 排序号 (数字越小，导出Excel时排得越靠前，比如领导部门写1)
             status INTEGER DEFAULT 1,                   -- 部门死活状态 (1代表部门还在，0代表已经被撤销了)
+            is_virtual_pool INTEGER DEFAULT 0,          -- 1代表离退休/挂靠等系统人员池，不属于正式组织架构
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, -- 这个部门是哪天在系统里建的
             FOREIGN KEY (parent_dept_id) REFERENCES departments(dept_id)
         )
         """)
+        _add_columns_if_missing(cursor, 'departments', {
+            'is_virtual_pool': 'INTEGER DEFAULT 0',
+        })
+        cursor.execute('''
+            UPDATE departments
+            SET is_virtual_pool = 1
+            WHERE dept_name IN ('离退休公共池', '挂靠代缴社保', '外部代缴人员池')
+        ''')
 
         # --- 表 2: 岗位核心表 (positions) ---
         cursor.execute("""
@@ -767,6 +908,7 @@ def init_database(db_path=None):
                 emp_id TEXT NOT NULL,                    -- 员工工号
                 emp_name TEXT NOT NULL,                  -- 生成这笔台账时，这个人叫什么名字 (快照防改名)
                 dept_name TEXT NOT NULL,                 -- 生成这笔台账时，这个人在哪个部门 (极其重要，防后期调动账目乱窜)
+                dept_id INTEGER,                         -- 内部部门ID锚点；名称继续作为当月快照保留
                 emp_status TEXT NOT NULL,                -- 生成这笔台账时，这个人的状态是在职还是离职
                 
                 -- [工资应发项：发到员工口袋里的钱的明细]

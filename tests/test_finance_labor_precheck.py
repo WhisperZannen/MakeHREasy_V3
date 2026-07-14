@@ -145,7 +145,11 @@ class FinanceLaborPrecheckTest(unittest.TestCase):
         reconciliation = result['monthly_reconciliation'].set_index('核对项目')
         self.assertAlmostEqual(reconciliation.loc['补充医疗保险', '台账金额'], 100.00)
         self.assertAlmostEqual(reconciliation.loc['退休人员养老金补贴', '台账金额'], 50.00)
-        self.assertIn('6602690299', result['pending_accounts']['科目编号'].tolist())
+        self.assertNotIn('6602690299', result['pending_accounts']['科目编号'].tolist())
+        self.assertIn(
+            '退休人员积分兑换',
+            result['monthly_reconciliation']['核对项目'].tolist(),
+        )
 
     def test_database_schema_keeps_original_labor_columns(self):
         from database.init_db import init_database

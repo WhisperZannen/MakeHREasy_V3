@@ -115,7 +115,9 @@ def repair_personnel_change_types(conn=None):
 def _get_db_connection():
     current_dir = os.path.dirname(os.path.abspath(__file__))
     project_root = os.path.dirname(current_dir)
-    db_path = os.path.join(project_root, 'database', 'hr_core.db')
+    db_path = os.environ.get(
+        'MAKE_HR_DB_PATH', os.path.join(project_root, 'database', 'hr_core.db')
+    )
     conn = sqlite3.connect(db_path)
     conn.execute("PRAGMA foreign_keys = ON;")
     conn.row_factory = sqlite3.Row
@@ -293,5 +295,152 @@ def update_employee_status(emp_id, new_status, reason="手动状态调整", chan
         conn.commit(); return True, f"状态已切换为: {new_status}"
     except Exception as e:
         conn.rollback(); return False, str(e)
+    finally:
+        conn.close()
+
+
+def get_effective_department_snapshot(target_month, conn=None):
+    """按15日规则返回某月每个人应归属的部门ID和当时部门名称。"""
+    own_conn = conn is None
+    conn = conn or _get_db_connection()
+    try:
+        if len(str(target_month)) < 7:
+            raise ValueError("目标月份必须为 YYYY-MM")
+        departments = {
+            int(row['dept_id']): str(row['dept_name'])
+            for row in conn.execute("SELECT dept_id, dept_name FROM departments").fetchall()
+        }
+        effective = {
+            str(row['emp_id']).strip(): int(row['dept_id'])
+            for row in conn.execute("SELECT emp_id, dept_id FROM employees").fetchall()
+        }
+        deadline = f"{str(target_month)[:7]}-15 23:59:59"
+        changes = conn.execute(
+            """
+            SELECT emp_id, old_dept_id
+            FROM personnel_changes
+            WHERE change_date > ?
+              AND old_dept_id IS NOT NULL AND new_dept_id IS NOT NULL
+            ORDER BY change_date DESC, change_id DESC
+            """,
+            (deadline,),
+        ).fetchall()
+        for row in changes:
+            emp_id = str(row['emp_id']).strip()
+            if emp_id in effective:
+                effective[emp_id] = int(row['old_dept_id'])
+        return {
+            emp_id: {
+                'dept_id': dept_id,
+                'dept_name': departments.get(dept_id, '未分配部门'),
+            }
+            for emp_id, dept_id in effective.items()
+        }
+    finally:
+        if own_conn:
+            conn.close()
+
+
+def batch_transfer_department_members(
+    emp_ids,
+    target_dept_id,
+    effective_date,
+    reason,
+    source_dept_id=None,
+    deactivate_empty_source=False,
+):
+    """批量完成部门合并、撤销承接或拆分中的一组人员转移。"""
+    selected_ids = [str(emp_id).strip() for emp_id in emp_ids if str(emp_id).strip()]
+    if not selected_ids:
+        return False, "请至少选择一名需要调整的人员"
+    if not str(reason or '').strip():
+        return False, "请填写组织调整说明"
+    try:
+        actual_date = datetime.strptime(
+            str(effective_date)[:10], '%Y-%m-%d'
+        ).strftime('%Y-%m-%d 00:00:00')
+    except ValueError:
+        return False, "生效日期必须为 YYYY-MM-DD"
+
+    conn = _get_db_connection()
+    try:
+        target = conn.execute(
+            "SELECT dept_name, status FROM departments WHERE dept_id = ?",
+            (int(target_dept_id),),
+        ).fetchone()
+        if not target or int(target['status']) != 1:
+            return False, "承接部门不存在或已经撤销"
+
+        placeholders = ','.join(['?'] * len(selected_ids))
+        rows = conn.execute(
+            f"""
+            SELECT e.emp_id, e.dept_id, e.post_rank, e.post_grade,
+                   p.pos_id, p.tech_grade
+            FROM employees e
+            LEFT JOIN employee_profiles p ON e.emp_id = p.emp_id
+            WHERE e.emp_id IN ({placeholders})
+            """,
+            selected_ids,
+        ).fetchall()
+        if len(rows) != len(set(selected_ids)):
+            return False, "部分人员不存在，请刷新页面后重试"
+        if source_dept_id is not None:
+            unexpected = [
+                row['emp_id'] for row in rows
+                if int(row['dept_id']) != int(source_dept_id)
+            ]
+            if unexpected:
+                return False, f"有 {len(unexpected)} 人已不在原部门，请刷新后重试"
+        if any(int(row['dept_id']) == int(target_dept_id) for row in rows):
+            return False, "所选人员中有人已经在承接部门"
+
+        for row in rows:
+            conn.execute(
+                """
+                INSERT INTO personnel_changes(
+                    emp_id, change_type, old_dept_id, new_dept_id,
+                    old_pos_id, new_pos_id, old_tech_grade, new_tech_grade,
+                    old_post_rank, new_post_rank, old_post_grade, new_post_grade,
+                    change_date, change_reason
+                ) VALUES (?, '跨部门调动', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    row['emp_id'], row['dept_id'], int(target_dept_id),
+                    row['pos_id'], row['pos_id'], row['tech_grade'], row['tech_grade'],
+                    row['post_rank'], row['post_rank'], row['post_grade'], row['post_grade'],
+                    actual_date, str(reason).strip(),
+                ),
+            )
+            conn.execute(
+                "UPDATE employees SET dept_id = ? WHERE emp_id = ?",
+                (int(target_dept_id), row['emp_id']),
+            )
+            conn.execute(
+                """
+                UPDATE employee_arrangements
+                SET home_dept_id = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE emp_id = ? AND status = 'active'
+                """,
+                (int(target_dept_id), row['emp_id']),
+            )
+
+        source_deactivated = False
+        if deactivate_empty_source and source_dept_id is not None:
+            remaining = conn.execute(
+                "SELECT COUNT(*) FROM employees WHERE dept_id = ?",
+                (int(source_dept_id),),
+            ).fetchone()[0]
+            if remaining == 0:
+                conn.execute(
+                    "UPDATE departments SET status = 0 WHERE dept_id = ?",
+                    (int(source_dept_id),),
+                )
+                source_deactivated = True
+        conn.commit()
+        suffix = "，原部门已撤销" if source_deactivated else ""
+        return True, f"已调整 {len(rows)} 人到“{target['dept_name']}”{suffix}"
+    except Exception as exc:
+        conn.rollback()
+        return False, str(exc)
     finally:
         conn.close()

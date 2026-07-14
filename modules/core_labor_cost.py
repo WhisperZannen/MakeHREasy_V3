@@ -14,6 +14,8 @@ from modules.core_arrangements import (
     ARRANGEMENT_LABELS,
     REALLOCATION_MODE_LABELS,
     REALLOCATION_STATUS_LABELS,
+    get_effective_arrangement,
+    is_labor_cost_included,
 )
 
 # ------------------------------------------------------------------------------
@@ -177,11 +179,11 @@ FINANCE_LABOR_CONTROL_RULES = [
         'remarks': '系统将退休人员“员工体检费”解释为退休医药费，不修改人工成本主表字段。',
     },
     {
-        'key': 'retiree_other_expense', 'label': '退休人员其他费用（待确认）',
+        'key': 'retiree_other_expense', 'label': '退休人员积分兑换',
         'account_codes': ('6602690299',), 'ledger_columns': ('其他福利',),
         'ledger_scope': 'retired',
-        'monthly_processing': '待业务确认',
-        'remarks': '只提示差异，不自动分摊；确认费用性质后再入账。',
+        'monthly_processing': '系统内映射核对',
+        'remarks': '工会确认科目性质为退休人员积分兑换，系统映射到退休人员“其他福利”。',
     },
     {
         'key': 'pension_personal', 'label': '基本养老保险（个人）',
@@ -243,6 +245,89 @@ def _get_db_connection():
     conn.execute("PRAGMA foreign_keys = ON;")
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def get_company_social_snapshot(target_month, conn=None):
+    """提取真正属于省公众人工成本的社保明细，排除下沉和挂靠代垫。"""
+    own_conn = conn is None
+    conn = conn or _get_db_connection()
+    try:
+        item_df = pd.read_sql_query(
+            """
+            SELECT emp_id, insurance_item, company_amount, personal_amount,
+                   cost_bearer_code, business_type_snapshot
+            FROM social_monthly_items
+            WHERE cost_month = ?
+            """,
+            conn,
+            params=[target_month],
+        )
+        result_by_emp = {}
+        employees_with_item_detail = set()
+        if not item_df.empty:
+            for _, row in item_df.iterrows():
+                emp_id = str(row['emp_id']).replace('.0', '').strip()
+                employees_with_item_detail.add(emp_id)
+                relation_type = str(row.get('business_type_snapshot') or 'normal')
+                cost_code = row.get('cost_bearer_code')
+                belongs_to_company = (
+                    cost_code == 'province_public'
+                    or (
+                        (cost_code is None or pd.isna(cost_code) or str(cost_code).strip() == '')
+                        and relation_type in {'normal', 'city_transfer'}
+                    )
+                )
+                if not belongs_to_company:
+                    continue
+                target = result_by_emp.setdefault(emp_id, {'emp_id': emp_id})
+                item = str(row['insurance_item'])
+                company_amount = float(row.get('company_amount') or 0.0)
+                personal_amount = float(row.get('personal_amount') or 0.0)
+                if item == 'medical_serious':
+                    target['medical_pers'] = target.get('medical_pers', 0.0) + personal_amount
+                else:
+                    target[f'{item}_comp'] = target.get(f'{item}_comp', 0.0) + company_amount
+                    target[f'{item}_pers'] = target.get(f'{item}_pers', 0.0) + personal_amount
+
+        # 兼容尚未生成险种明细的旧月份。只对真正进入本单位人工成本的人回退到旧汇总账。
+        legacy_df = pd.read_sql_query(
+            "SELECT * FROM ss_monthly_records WHERE cost_month = ?",
+            conn,
+            params=[target_month],
+        )
+        legacy_columns = [
+            'pension_comp', 'medical_comp', 'unemp_comp', 'injury_comp',
+            'maternity_comp', 'fund_comp', 'annuity_comp', 'pension_pers',
+            'medical_pers', 'medical_serious_pers', 'unemp_pers', 'fund_pers',
+            'annuity_pers',
+        ]
+        for _, row in legacy_df.iterrows():
+            emp_id = str(row['emp_id']).replace('.0', '').strip()
+            if emp_id in employees_with_item_detail:
+                continue
+            if not is_labor_cost_included(emp_id, target_month, conn):
+                continue
+            target = result_by_emp.setdefault(emp_id, {'emp_id': emp_id})
+            for column in legacy_columns:
+                value = float(row.get(column) or 0.0)
+                if column == 'medical_serious_pers':
+                    target['medical_pers'] = target.get('medical_pers', 0.0) + value
+                else:
+                    target[column] = value
+
+        result = pd.DataFrame(result_by_emp.values())
+        expected_columns = ['emp_id'] + [
+            'pension_comp', 'medical_comp', 'unemp_comp', 'injury_comp',
+            'maternity_comp', 'fund_comp', 'annuity_comp', 'pension_pers',
+            'medical_pers', 'unemp_pers', 'fund_pers', 'annuity_pers',
+        ]
+        for column in expected_columns:
+            if column not in result.columns:
+                result[column] = '' if column == 'emp_id' else 0.0
+        return result[expected_columns]
+    finally:
+        if own_conn:
+            conn.close()
 
 # ------------------------------------------------------------------------------
 # 脏数据静默清洗引擎

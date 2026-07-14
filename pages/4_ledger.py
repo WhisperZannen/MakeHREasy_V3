@@ -26,9 +26,10 @@ from modules.core_labor_cost import (
     sort_flat_ledger_df, add_subtotals_and_totals, get_ledger_data,
     localize_labor_cost_codes, read_labor_ledger_workbook,
     read_finance_account_workbook, prepare_finance_labor_precheck,
-    recalculate_labor_cost_columns,
+    recalculate_labor_cost_columns, get_company_social_snapshot,
 )
-from modules.core_arrangements import get_effective_arrangement
+from modules.core_arrangements import get_effective_arrangement, is_labor_cost_included
+from modules.core_personnel import get_effective_department_snapshot
 
 st.set_page_config(page_title="人工成本台账", layout="wide")
 
@@ -140,97 +141,8 @@ def build_effective_dept_snapshot(conn, target_month):
     }
     """
 
-    # ----------------------------------------------------------
-    # 一、读取部门字典
-    # ----------------------------------------------------------
-    # departments 表里保存 dept_id 和 dept_name。
-    # 后面我们会先算出每个人应归属的 dept_id，
-    # 再通过这个字典翻译成部门名称。
-    dept_df = pd.read_sql_query(
-        "SELECT dept_id, dept_name FROM departments",
-        conn
-    )
-
-    dept_name_by_id = dict(zip(dept_df["dept_id"], dept_df["dept_name"]))
-
-    # ----------------------------------------------------------
-    # 二、读取当前人员表
-    # ----------------------------------------------------------
-    # employees 表里的 dept_id 是“当前最新部门”。
-    # 注意：这不是历史部门。
-    # 但我们可以以它为起点，再通过 personnel_changes 往回倒推。
-    emp_df = pd.read_sql_query(
-        """
-        SELECT emp_id, name, dept_id, status
-        FROM employees
-        """,
-        conn
-    )
-
-    # effective_dept_id_by_emp 初始值 = 员工当前部门。
-    # 后面如果发现目标月 15 日之后还有调动，就逐步回滚到旧部门。
-    effective_dept_id_by_emp = dict(zip(emp_df["emp_id"], emp_df["dept_id"]))
-
-    # ----------------------------------------------------------
-    # 三、设置目标月 15 日切片点
-    # ----------------------------------------------------------
-    # 例：
-    # target_month = 2026-05
-    # target_deadline = 2026-05-15 23:59:59
-    target_deadline = f"{target_month}-15 23:59:59"
-
-    # ----------------------------------------------------------
-    # 四、读取所有发生在切片点之后的部门调动
-    # ----------------------------------------------------------
-    # 为什么只读取 change_date > target_deadline？
-    # ----------------------------------------------------------
-    # 因为 15 日之后的调动，当月仍然应该算旧部门。
-    # 所以我们要把这些调动回滚掉。
-    #
-    # 为什么 ORDER BY change_date DESC？
-    # ----------------------------------------------------------
-    # 如果一个人后续发生多次调动，要从最新调动一层一层往回倒。
-    # 比如：
-    # 5月20日：A -> B
-    # 6月10日：B -> C
-    # 当前表是 C
-    # 要算 5月15日状态，就要先 C 回到 B，再 B 回到 A。
-    rollback_df = pd.read_sql_query(
-        """
-        SELECT emp_id, old_dept_id, new_dept_id, change_date
-        FROM personnel_changes
-        WHERE change_date > ?
-          AND old_dept_id IS NOT NULL
-          AND new_dept_id IS NOT NULL
-        ORDER BY change_date DESC
-        """,
-        conn,
-        params=[target_deadline]
-    )
-
-    # ----------------------------------------------------------
-    # 五、逐条回滚 15 日之后的调动
-    # ----------------------------------------------------------
-    for _, rb_row in rollback_df.iterrows():
-        emp_id = str(rb_row["emp_id"]).strip()
-        old_dept_id = rb_row["old_dept_id"]
-
-        # 如果这个员工还在人员表里，就把他的有效部门回滚到 old_dept_id。
-        if emp_id in effective_dept_id_by_emp:
-            effective_dept_id_by_emp[emp_id] = old_dept_id
-
-    # ----------------------------------------------------------
-    # 六、把 dept_id 翻译成 dept_name
-    # ----------------------------------------------------------
-    effective_dept_name_by_emp = {}
-
-    for emp_id, dept_id in effective_dept_id_by_emp.items():
-        effective_dept_name_by_emp[str(emp_id).strip()] = dept_name_by_id.get(
-            dept_id,
-            "未分配部门"
-        )
-
-    return effective_dept_name_by_emp
+    snapshot = get_effective_department_snapshot(target_month, conn)
+    return {emp_id: values['dept_name'] for emp_id, values in snapshot.items()}
 
 
 def resolve_hr_director_tail_carrier(conn, ledger_df):
@@ -272,6 +184,7 @@ def upsert_labor_cost_dataframe(in_df):
     conn = _get_db_connection()
     cursor = conn.cursor()
     success_count = 0
+    department_snapshots = {}
     try:
         for _, row in normalized_df.iterrows():
             employee_name = str(row.get('姓名', '')).strip()
@@ -293,6 +206,15 @@ def upsert_labor_cost_dataframe(in_df):
                 continue
             cost_month = raw_month[:7].replace('/', '-') if len(raw_month) >= 7 else raw_month
 
+            arrangement = get_effective_arrangement(employee_id, cost_month, conn)
+            if not int(arrangement.get('labor_cost_included', 1)):
+                # 下沉和挂靠的社保仍留在社保账及结算账，但绝不进入本单位人工成本。
+                cursor.execute(
+                    "DELETE FROM labor_cost_ledger WHERE cost_month = ? AND emp_id = ?",
+                    (cost_month, employee_id),
+                )
+                continue
+
             db_data = {}
             for cn_column, db_column in LEDGER_MAP.items():
                 if db_column == 'cost_month':
@@ -312,26 +234,26 @@ def upsert_labor_cost_dataframe(in_df):
                 else:
                     db_data[db_column] = str(value).strip() if pd.notna(value) else ''
 
-            if not db_data.get('business_type_snapshot'):
-                arrangement = get_effective_arrangement(employee_id, cost_month, conn)
-                relation_type = arrangement.get('arrangement_type', 'normal')
-                db_data['arrangement_id'] = arrangement.get('arrangement_id')
-                db_data['business_type_snapshot'] = relation_type
-                db_data['actual_work_unit_code'] = arrangement.get('actual_work_unit_code')
-                db_data['accounting_entity_code'] = arrangement.get('accounting_entity_code')
-                db_data['ultimate_cost_bearer_code'] = arrangement.get('ultimate_cost_bearer_code')
-                if relation_type == 'city_transfer':
-                    db_data['reallocation_mode'] = 'annual_labor_cost_reallocation'
-                    db_data['reallocation_status'] = 'pending'
-                elif relation_type == 'down_secondment':
-                    db_data['reallocation_mode'] = 'mixed_by_item'
-                    db_data['reallocation_status'] = 'pending'
-                elif relation_type == 'proxy_social':
-                    db_data['reallocation_mode'] = 'quarterly_social_settlement'
-                    db_data['reallocation_status'] = 'pending'
-                else:
-                    db_data['reallocation_mode'] = 'none'
-                    db_data['reallocation_status'] = 'not_required'
+            # 人员关系和部门归属以系统有效期为准，不相信Excel里可能过期的技术快照。
+            relation_type = arrangement.get('arrangement_type', 'normal')
+            db_data['arrangement_id'] = arrangement.get('arrangement_id')
+            db_data['business_type_snapshot'] = relation_type
+            db_data['labor_cost_included_snapshot'] = 1
+            db_data['actual_work_unit_code'] = arrangement.get('actual_work_unit_code')
+            db_data['accounting_entity_code'] = arrangement.get('accounting_entity_code') or 'province_public'
+            db_data['ultimate_cost_bearer_code'] = arrangement.get('ultimate_cost_bearer_code') or 'province_public'
+            if cost_month not in department_snapshots:
+                department_snapshots[cost_month] = get_effective_department_snapshot(cost_month, conn)
+            department = department_snapshots[cost_month].get(employee_id)
+            if department:
+                db_data['dept_id'] = department['dept_id']
+                db_data['dept_name'] = department['dept_name']
+            if relation_type == 'city_transfer':
+                db_data['reallocation_mode'] = 'annual_labor_cost_reallocation'
+                db_data['reallocation_status'] = 'pending'
+            else:
+                db_data['reallocation_mode'] = 'none'
+                db_data['reallocation_status'] = 'not_required'
 
             columns = list(db_data.keys())
             placeholders = ','.join(['?'] * len(columns))
@@ -804,39 +726,21 @@ with tab2:
                 base_df = pd.read_sql_query("SELECT * FROM labor_cost_ledger WHERE cost_month = ?", conn, params=[base_month])
                 all_emps = pd.read_sql_query("SELECT emp_id, name, dept_id, status FROM employees", conn)
                 active_emps = all_emps[all_emps['status'] == '在职']
+                active_emps = active_emps[
+                    active_emps['emp_id'].astype(str).map(
+                        lambda emp_id: is_labor_cost_included(emp_id, target_month, conn)
+                    )
+                ]
 
                 dept_df = pd.read_sql_query("SELECT dept_id, dept_name FROM departments", conn)
                 dept_dict = dict(zip(dept_df['dept_id'], dept_df['dept_name']))
 
-                ss_query = """
-                    SELECT 
-                        emp_id, 
-                        pension_comp, medical_comp, unemp_comp, injury_comp, maternity_comp, fund_comp, annuity_comp,
-                        pension_pers, medical_pers, medical_serious_pers, unemp_pers, fund_pers, annuity_pers
-                    FROM ss_monthly_records
-                    WHERE cost_month = ?
-                """
-                ss_df = pd.read_sql_query(ss_query, conn, params=[target_month])
+                ss_df = get_company_social_snapshot(target_month, conn)
 
                 if not base_df.empty:
                     emp_status_dict = dict(zip(all_emps['emp_id'], all_emps['status']))
 
-                    target_deadline = f"{target_month}-15 23:59:59"
-
-                    rollback_query = """
-                        SELECT emp_id, old_dept_id, new_dept_id, change_date
-                        FROM personnel_changes
-                        WHERE change_date > ? AND old_dept_id IS NOT NULL AND new_dept_id IS NOT NULL
-                        ORDER BY change_date DESC
-                    """
-                    rollback_df = pd.read_sql_query(rollback_query, conn, params=[target_deadline])
-
-                    effective_dept_dict = dict(zip(all_emps['emp_id'], all_emps['dept_id']))
-
-                    for _, rb_row in rollback_df.iterrows():
-                        eid_rb = rb_row['emp_id']
-                        if eid_rb in effective_dept_dict:
-                            effective_dept_dict[eid_rb] = rb_row['old_dept_id']
+                    effective_dept_snapshot = get_effective_department_snapshot(target_month, conn)
 
                     keep_mask = []
                     for idx, row in base_df.iterrows():
@@ -846,13 +750,16 @@ with tab2:
 
                         curr_status = emp_status_dict.get(eid, row.get('emp_status', '在职'))
 
-                        if eid in effective_dept_dict:
-                            valid_dept_id = effective_dept_dict[eid]
-                            base_df.at[idx, 'dept_name'] = dept_dict.get(valid_dept_id, '未分配部门')
+                        department = effective_dept_snapshot.get(eid)
+                        if department:
+                            base_df.at[idx, 'dept_id'] = department['dept_id']
+                            base_df.at[idx, 'dept_name'] = department['dept_name']
 
                         base_df.at[idx, 'emp_status'] = curr_status
 
-                        if '离职' in curr_status and cost == 0.0:
+                        if not is_labor_cost_included(eid, target_month, conn):
+                            keep_mask.append(False)
+                        elif '离职' in curr_status and cost == 0.0:
                             keep_mask.append(False)
                         else:
                             keep_mask.append(True)
@@ -868,7 +775,9 @@ with tab2:
                         new_row['cost_month'] = target_month
                         new_row['emp_id'] = r['emp_id']
                         new_row['emp_name'] = r['name']
-                        new_row['dept_name'] = dept_dict.get(r['dept_id'], '未分配部门')
+                        department = effective_dept_snapshot.get(str(r['emp_id']))
+                        new_row['dept_id'] = department['dept_id'] if department else r['dept_id']
+                        new_row['dept_name'] = department['dept_name'] if department else dept_dict.get(r['dept_id'], '未分配部门')
                         new_row['emp_status'] = r['status']
                         new_rows.append(new_row)
 
@@ -885,18 +794,13 @@ with tab2:
                         if relation_type == 'city_transfer':
                             reallocation_mode = 'annual_labor_cost_reallocation'
                             reallocation_status = 'pending'
-                        elif relation_type == 'down_secondment':
-                            reallocation_mode = 'mixed_by_item'
-                            reallocation_status = 'pending'
-                        elif relation_type == 'proxy_social':
-                            reallocation_mode = 'quarterly_social_settlement'
-                            reallocation_status = 'pending'
                         else:
                             reallocation_mode = 'none'
                             reallocation_status = 'not_required'
 
                         base_df.at[idx, 'arrangement_id'] = arrangement.get('arrangement_id')
                         base_df.at[idx, 'business_type_snapshot'] = relation_type
+                        base_df.at[idx, 'labor_cost_included_snapshot'] = 1
                         base_df.at[idx, 'actual_work_unit_code'] = arrangement.get('actual_work_unit_code')
                         base_df.at[idx, 'accounting_entity_code'] = arrangement.get('accounting_entity_code')
                         base_df.at[idx, 'ultimate_cost_bearer_code'] = arrangement.get('ultimate_cost_bearer_code')
@@ -931,8 +835,7 @@ with tab2:
                                 export_cn.at[idx, '养老保险-个人'] = ss_rec.get('pension_pers', 0.0) if pd.notna(ss_rec.get('pension_pers')) else 0.0
 
                                 m_pers = ss_rec.get('medical_pers', 0.0) if pd.notna(ss_rec.get('medical_pers')) else 0.0
-                                m_ser = ss_rec.get('medical_serious_pers', 0.0) if pd.notna(ss_rec.get('medical_serious_pers')) else 0.0
-                                export_cn.at[idx, '医疗保险-个人(含大病)'] = m_pers + m_ser
+                                export_cn.at[idx, '医疗保险-个人(含大病)'] = m_pers
 
                                 export_cn.at[idx, '失业保险-个人'] = ss_rec.get('unemp_pers', 0.0) if pd.notna(ss_rec.get('unemp_pers')) else 0.0
                                 export_cn.at[idx, '住房公积金-个人'] = ss_rec.get('fund_pers', 0.0) if pd.notna(ss_rec.get('fund_pers')) else 0.0
@@ -963,7 +866,7 @@ with tab2:
 # Tab 3: 财务底表导入引擎
 # ------------------------------------------------------------------------------
 with tab3:
-    st.subheader("📥 历史财务数据导入引擎")
+    st.subheader("📥 人工成本底表导入与财务核对")
 
     st.write("### 🧾 导入前：财务表自动补数与双重核对")
     st.info(
@@ -1224,7 +1127,7 @@ with tab3:
     st.write("### 🧭 小工具：按人员变动刷新已导入台账部门归属")
 
     st.info(
-        "这个工具只刷新 labor_cost_ledger 里的【归属部门】，不会改任何金额。"
+        "这个工具只刷新已导入台账的【部门归属快照】，不会改任何金额。"
         "适用于你已经导入人工成本后，才发现人员调动日期漏维护或维护晚了的情况。"
     )
 
@@ -1258,7 +1161,7 @@ with tab3:
         with refresh_col_2:
             st.warning(
                 "执行前请确认：你已经在人员模块补录了正确的调动记录，"
-                "并且已经备份数据库。刷新后会直接更新该月份 labor_cost_ledger.dept_name。"
+                "并且已经备份数据库。刷新后会同时更新该月份的部门编号和部门名称快照。"
             )
 
         # ------------------------------------------------------
@@ -1266,9 +1169,8 @@ with tab3:
         # ------------------------------------------------------
         if st.button("🔍 预览该月份需要调整的部门归属", type="secondary"):
             try:
-                effective_dept_map = build_effective_dept_snapshot(
-                    conn_refresh,
-                    refresh_month
+                effective_dept_map = get_effective_department_snapshot(
+                    refresh_month, conn_refresh
                 )
 
                 ledger_df = pd.read_sql_query(
@@ -1278,6 +1180,7 @@ with tab3:
                         cost_month,
                         emp_id,
                         emp_name,
+                        dept_id,
                         dept_name,
                         emp_status,
                         total_labor_cost
@@ -1296,17 +1199,25 @@ with tab3:
 
                     for _, row in ledger_df.iterrows():
                         emp_id = str(row["emp_id"]).replace(".0", "").strip()
+                        old_dept_id = row.get("dept_id")
                         old_dept_name = str(row["dept_name"]).strip()
-                        new_dept_name = effective_dept_map.get(emp_id, old_dept_name)
+                        target_department = effective_dept_map.get(emp_id)
+                        if not target_department:
+                            continue
+                        new_dept_id = int(target_department['dept_id'])
+                        new_dept_name = target_department['dept_name']
 
-                        if old_dept_name != new_dept_name:
+                        # 用部门ID判断真正的组织调动。仅仅改了部门名称时保留历史名称快照。
+                        if pd.isna(old_dept_id) or int(old_dept_id) != new_dept_id:
                             preview_rows.append({
                                 "流水ID": row["record_id"],
                                 "核算月份": row["cost_month"],
                                 "工号": emp_id,
                                 "姓名": row["emp_name"],
                                 "当前台账部门": old_dept_name,
+                                "当前部门ID": old_dept_id,
                                 "应调整为部门": new_dept_name,
+                                "应调整为部门ID": new_dept_id,
                                 "人员状态": row["emp_status"],
                                 "人工成本合计": row["total_labor_cost"],
                             })
@@ -1360,10 +1271,11 @@ with tab3:
                         cursor.execute(
                             """
                             UPDATE labor_cost_ledger
-                            SET dept_name = ?
+                            SET dept_id = ?, dept_name = ?
                             WHERE record_id = ?
                             """,
                             (
+                                int(row["应调整为部门ID"]),
                                 row["应调整为部门"],
                                 int(row["流水ID"])
                             )
@@ -1423,6 +1335,13 @@ with tab3:
 
                     if not raw_month or not e_id or raw_month == 'nan' or e_id == 'nan': continue
                     c_month = raw_month[:7].replace('/', '-') if len(raw_month) >= 7 else raw_month
+                    arrangement = get_effective_arrangement(e_id, c_month, conn)
+                    if not int(arrangement.get('labor_cost_included', 1)):
+                        cursor.execute(
+                            "DELETE FROM labor_cost_ledger WHERE cost_month = ? AND emp_id = ?",
+                            (c_month, e_id),
+                        )
+                        continue
 
                     db_data = {}
                     for cn_col, db_col in LEDGER_MAP.items():
@@ -1440,27 +1359,23 @@ with tab3:
                         else:
                             db_data[db_col] = str(val).strip() if pd.notna(val) else ""
 
-                    # 兼容旧版Excel：没有新增关系列时，按核算月份自动补齐快照。
-                    if not db_data.get('business_type_snapshot'):
-                        arrangement = get_effective_arrangement(e_id, c_month, conn)
-                        relation_type = arrangement.get('arrangement_type', 'normal')
-                        db_data['arrangement_id'] = arrangement.get('arrangement_id')
-                        db_data['business_type_snapshot'] = relation_type
-                        db_data['actual_work_unit_code'] = arrangement.get('actual_work_unit_code')
-                        db_data['accounting_entity_code'] = arrangement.get('accounting_entity_code')
-                        db_data['ultimate_cost_bearer_code'] = arrangement.get('ultimate_cost_bearer_code')
-                        if relation_type == 'city_transfer':
-                            db_data['reallocation_mode'] = 'annual_labor_cost_reallocation'
-                            db_data['reallocation_status'] = 'pending'
-                        elif relation_type == 'down_secondment':
-                            db_data['reallocation_mode'] = 'mixed_by_item'
-                            db_data['reallocation_status'] = 'pending'
-                        elif relation_type == 'proxy_social':
-                            db_data['reallocation_mode'] = 'quarterly_social_settlement'
-                            db_data['reallocation_status'] = 'pending'
-                        else:
-                            db_data['reallocation_mode'] = 'none'
-                            db_data['reallocation_status'] = 'not_required'
+                    relation_type = arrangement.get('arrangement_type', 'normal')
+                    db_data['arrangement_id'] = arrangement.get('arrangement_id')
+                    db_data['business_type_snapshot'] = relation_type
+                    db_data['labor_cost_included_snapshot'] = 1
+                    db_data['actual_work_unit_code'] = arrangement.get('actual_work_unit_code')
+                    db_data['accounting_entity_code'] = arrangement.get('accounting_entity_code') or 'province_public'
+                    db_data['ultimate_cost_bearer_code'] = arrangement.get('ultimate_cost_bearer_code') or 'province_public'
+                    department = get_effective_department_snapshot(c_month, conn).get(e_id)
+                    if department:
+                        db_data['dept_id'] = department['dept_id']
+                        db_data['dept_name'] = department['dept_name']
+                    if relation_type == 'city_transfer':
+                        db_data['reallocation_mode'] = 'annual_labor_cost_reallocation'
+                        db_data['reallocation_status'] = 'pending'
+                    else:
+                        db_data['reallocation_mode'] = 'none'
+                        db_data['reallocation_status'] = 'not_required'
 
                     # =============================================================
                     # 女工劳保费特殊口径

@@ -237,6 +237,44 @@ def batch_update_emp_matrix(df: pd.DataFrame) -> tuple:
     finally:
         conn.close()
 
+
+def batch_update_social_bases(df: pd.DataFrame) -> tuple:
+    """简化入口只更新基数；参保项目和办理单位继续由人员规则管理。"""
+    if '工号' not in df.columns or '已录入原始基数' not in df.columns:
+        return False, "❌ 文件必须包含【工号】和【已录入原始基数】两列"
+    clean = df.dropna(subset=['工号', '已录入原始基数']).copy()
+    conn = _get_db_connection()
+    try:
+        count = 0
+        for _, row in clean.iterrows():
+            emp_id = str(row['工号']).replace('.0', '').strip()
+            if not emp_id or emp_id == 'nan':
+                continue
+            base_value = safe_float(row.get('已录入原始基数'))
+            fund_value = safe_float(row.get('独立公积金基数(选填)'))
+            cost_center = str(row.get('财务归属') or '本级').strip()
+            conn.execute(
+                """
+                INSERT INTO ss_emp_matrix(emp_id, cost_center, base_salary_avg, fund_base_avg)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(emp_id) DO UPDATE SET
+                    cost_center = CASE
+                        WHEN ? = '' THEN ss_emp_matrix.cost_center ELSE excluded.cost_center
+                    END,
+                    base_salary_avg = excluded.base_salary_avg,
+                    fund_base_avg = excluded.fund_base_avg
+                """,
+                (emp_id, cost_center, base_value, fund_value, cost_center),
+            )
+            count += 1
+        conn.commit()
+        return True, f"✅ 已更新 {count} 人的社保及公积金基数，人员待遇规则未被改动"
+    except Exception as exc:
+        conn.rollback()
+        return False, f"❌ 基数更新失败：{exc}"
+    finally:
+        conn.close()
+
 def apply_rounding(value: float, mode: str) -> float:
     if mode == 'exact':
         return round(value, 2)

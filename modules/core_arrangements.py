@@ -7,7 +7,7 @@ import hashlib
 import os
 import re
 import sqlite3
-from datetime import date
+from datetime import date, datetime, timedelta
 from typing import Any, Dict, Optional, Tuple
 
 import pandas as pd
@@ -16,7 +16,7 @@ import pandas as pd
 ARRANGEMENT_LABELS = {
     "normal": "普通在职",
     "proxy_social": "挂靠代缴",
-    "city_transfer": "地市工作转入",
+    "city_transfer": "地市正式转入",
     "down_secondment": "下沉人员",
 }
 
@@ -122,6 +122,12 @@ INSURANCE_LABELS = {
     "supplemental_medical": "补充医疗",
 }
 
+# 人员页面只展示实际需要逐人判断的七项。大病医疗跟随基本医疗，
+# 补充医疗暂由人工成本/福利模块承接，避免给用户制造一个尚未落地的假开关。
+PERSON_TREATMENT_ITEMS = [
+    "pension", "medical", "unemp", "injury", "maternity", "fund", "annuity"
+]
+
 
 def _get_db_connection() -> sqlite3.Connection:
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -185,7 +191,7 @@ def _implicit_arrangement(conn: sqlite3.Connection, emp_id: str) -> Dict[str, An
     is_proxy = row["status"] == "挂靠人员"
     branch_code = entity_code_from_name(conn, row["cost_center"])
     if row["cost_center"] == "本级":
-        branch_code = None
+        branch_code = None if is_proxy else "province_public"
     return {
         "arrangement_id": None,
         "emp_id": emp_id,
@@ -201,6 +207,7 @@ def _implicit_arrangement(conn: sqlite3.Connection, emp_id: str) -> Dict[str, An
         "planned_end_date": None,
         "actual_end_date": None,
         "payroll_included": 0 if is_proxy else 1,
+        "labor_cost_included": 0 if is_proxy else 1,
         "settlement_mode": "proxy_social" if is_proxy else "none",
         "settlement_cycle": "quarterly" if is_proxy else "none",
         "status": "implicit",
@@ -294,7 +301,11 @@ def resolve_social_route(
     try:
         arrangement = get_effective_arrangement(emp_id, target_month, conn)
         legacy_payer_code = entity_code_from_name(conn, legacy_payer_name)
-        legacy_cost_code = entity_code_from_name(conn, legacy_cost_center)
+        legacy_cost_code = (
+            "province_public"
+            if str(legacy_cost_center or "").strip() in {"", "本级", "省公众"}
+            else entity_code_from_name(conn, legacy_cost_center)
+        )
 
         override = conn.execute(
             """
@@ -393,6 +404,20 @@ def resolve_social_route(
                 if o.get(field) not in {None, ""}:
                     context[field] = o[field]
 
+        # 简化规则允许把“关联地市/原单位”作为动态办理方或成本方。
+        # 当办理方和成本方不一致而规则未写死结算对象时，自动取真正需要
+        # 往来的单位，避免生成只有金额、没有对方单位的结算记录。
+        if (
+            not context.get("settlement_counterparty_code")
+            and context.get("payer_entity_code")
+            and context.get("cost_bearer_code")
+            and context["payer_entity_code"] != context["cost_bearer_code"]
+        ):
+            if context["payer_entity_code"] in {"province_public", "province_company"}:
+                context["settlement_counterparty_code"] = context["cost_bearer_code"]
+            else:
+                context["settlement_counterparty_code"] = context["payer_entity_code"]
+
         payer_name = entity_name_from_code(conn, context.get("payer_entity_code"))
         cost_bearer_name = entity_name_from_code(conn, context.get("cost_bearer_code"))
         policy_value = context.get("calculation_policy_entity") or payer_name
@@ -412,6 +437,142 @@ def resolve_social_route(
 def is_payroll_included(emp_id: str, target_month: str, conn=None) -> bool:
     arrangement = get_effective_arrangement(emp_id, target_month, conn)
     return bool(int(arrangement.get("payroll_included", 1)))
+
+
+def is_labor_cost_included(emp_id: str, target_month: str, conn=None) -> bool:
+    """判断某人某月是否进入本单位人工成本主账。"""
+    arrangement = get_effective_arrangement(emp_id, target_month, conn)
+    default_value = 0 if arrangement.get("arrangement_type") in {
+        "proxy_social", "down_secondment"
+    } else 1
+    return bool(int(arrangement.get("labor_cost_included", default_value)))
+
+
+def _previous_month(month: str) -> str:
+    parsed = datetime.strptime(f"{month}-01", "%Y-%m-%d").date()
+    return (parsed - timedelta(days=1)).strftime("%Y-%m")
+
+
+def _derive_settlement(
+    payer_code: Optional[str],
+    cost_bearer_code: Optional[str],
+    arrangement_type: str,
+) -> Tuple[Optional[str], str, str]:
+    """把业务人员能理解的办理/成本选择翻译成系统结算字段。"""
+    if not payer_code or not cost_bearer_code or payer_code == cost_bearer_code:
+        return None, "none", "none"
+    if payer_code == "province_public":
+        cycle = "quarterly" if arrangement_type == "proxy_social" else "annual"
+        return cost_bearer_code, "proxy_social", cycle
+    if cost_bearer_code == "province_public":
+        return payer_code, "central_chargeback", "monthly"
+    return payer_code, "mixed_by_item", "mixed"
+
+
+def get_person_treatment_dataframe(emp_id: str, target_month: str) -> pd.DataFrame:
+    """返回人员页面使用的中文待遇办理结果，不暴露底层规则编码。"""
+    conn = _get_db_connection()
+    try:
+        matrix_row = conn.execute(
+            "SELECT * FROM ss_emp_matrix WHERE emp_id = ?", (str(emp_id),)
+        ).fetchone()
+        matrix = dict(matrix_row) if matrix_row else {}
+        arrangement = get_effective_arrangement(str(emp_id), target_month, conn)
+        matrix_columns = {
+            "pension": ("pension_enabled", "pension_account", "省公众"),
+            "medical": ("medical_enabled", "medical_account", "省公司"),
+            "unemp": ("unemp_enabled", "unemp_account", "省公众"),
+            "injury": ("injury_enabled", "injury_account", "省公司"),
+            "maternity": ("maternity_enabled", "maternity_account", "省公司"),
+            "fund": ("fund_enabled", "fund_account", "省公众"),
+            "annuity": ("annuity_enabled", "annuity_account", "省公司"),
+        }
+        rows = []
+        for item in PERSON_TREATMENT_ITEMS:
+            enabled_col, account_col, fallback_payer = matrix_columns[item]
+            enabled = int(matrix.get(enabled_col, 1 if item != "annuity" else 0) or 0)
+            payer_name = str(matrix.get(account_col) or fallback_payer)
+            context = resolve_social_route(
+                str(emp_id), item, target_month,
+                legacy_enabled=enabled,
+                legacy_payer_name=payer_name,
+                legacy_cost_center=str(matrix.get("cost_center") or "本级"),
+                conn=conn,
+            )
+            source = "个人特殊设置" if context.get("override_id") else (
+                "同类人员规则" if context.get("route_policy_id") else "原参保设置"
+            )
+            payer = context.get("payer_entity_name") or payer_name
+            cost = context.get("cost_bearer_name") or (
+                "省公众" if arrangement.get("labor_cost_included", 1) else "其他单位"
+            )
+            if not int(context.get("enabled", 0)):
+                result = "不缴纳"
+            elif payer == "省公众" and cost == "省公众":
+                result = "省公众自行缴纳，计入本单位人工成本"
+            elif payer == "省公司" and cost == "省公众":
+                result = "省公司集中代缴，计入本单位人工成本并向省公司结算"
+            elif payer == cost:
+                result = f"由{payer}直接缴纳和承担，不进入本单位人工成本"
+            else:
+                result = f"由{payer}缴纳，费用由{cost}承担，系统生成结算记录"
+            rows.append({
+                "项目": INSURANCE_LABELS[item],
+                "是否缴纳": "是" if int(context.get("enabled", 0)) else "否",
+                "办理单位": payer,
+                "成本归属": cost,
+                "系统处理结果": result,
+                "规则来源": source,
+                "insurance_item": item,
+                "override_id": context.get("override_id"),
+            })
+        return pd.DataFrame(rows)
+    finally:
+        conn.close()
+
+
+def get_people_management_dataframe(target_month: str) -> pd.DataFrame:
+    """生成简洁的人员情形名单，供人员页面搜索和筛选。"""
+    conn = _get_db_connection()
+    try:
+        people = pd.read_sql_query(
+            """
+            SELECT e.emp_id, e.name, e.status, e.dept_id, d.dept_name
+            FROM employees e
+            LEFT JOIN departments d ON e.dept_id = d.dept_id
+            WHERE e.status IN ('在职', '挂靠人员')
+            ORDER BY d.sort_order, e.name
+            """,
+            conn,
+        )
+        override_counts = dict(conn.execute(
+            """
+            SELECT emp_id, COUNT(*)
+            FROM employee_social_overrides
+            WHERE active = 1 AND effective_from_month <= ?
+              AND (effective_to_month IS NULL OR effective_to_month >= ?)
+            GROUP BY emp_id
+            """,
+            (target_month, target_month),
+        ).fetchall())
+        rows = []
+        for _, person in people.iterrows():
+            arrangement = get_effective_arrangement(str(person["emp_id"]), target_month, conn)
+            relation_type = arrangement.get("arrangement_type", "normal")
+            exception_count = int(override_counts.get(str(person["emp_id"]), 0))
+            rows.append({
+                **person.to_dict(),
+                "arrangement_id": arrangement.get("arrangement_id"),
+                "arrangement_type": relation_type,
+                "人员情形": ARRANGEMENT_LABELS.get(relation_type, relation_type),
+                "工资处理": "本系统发放" if int(arrangement.get("payroll_included", 1)) else "其他单位发放",
+                "人工成本处理": "计入本单位" if int(arrangement.get("labor_cost_included", 1)) else "不计入本单位",
+                "个人例外数": exception_count,
+                "特殊标记": "有单项例外" if exception_count else "",
+            })
+        return pd.DataFrame(rows)
+    finally:
+        conn.close()
 
 
 def get_arrangements_dataframe(include_closed: bool = True) -> pd.DataFrame:
@@ -632,6 +793,338 @@ def create_route_policy(data: Dict[str, Any]) -> Tuple[bool, str]:
         conn.close()
 
 
+def get_normal_route_defaults(target_month: str) -> pd.DataFrame:
+    """给社保页面展示普通人员在指定月份实际采用的默认办理方式。"""
+    conn = _get_db_connection()
+    try:
+        matrix_columns = {
+            "pension": "pension_account", "medical": "medical_account",
+            "unemp": "unemp_account", "injury": "injury_account",
+            "maternity": "maternity_account", "fund": "fund_account",
+            "annuity": "annuity_account",
+        }
+        rows = []
+        for item in PERSON_TREATMENT_ITEMS:
+            policy = conn.execute(
+                """
+                SELECT p.*, payer.entity_name AS payer_name
+                FROM social_route_policies p
+                LEFT JOIN business_entities payer ON p.payer_entity_code = payer.entity_code
+                WHERE p.arrangement_type = 'normal' AND p.insurance_item = ?
+                  AND p.active = 1 AND p.effective_from_month <= ?
+                  AND (p.effective_to_month IS NULL OR p.effective_to_month >= ?)
+                ORDER BY p.priority DESC, p.effective_from_month DESC, p.route_policy_id DESC
+                LIMIT 1
+                """,
+                (item, target_month, target_month),
+            ).fetchone()
+            if policy:
+                payer_code = policy["payer_entity_code"]
+                payer_name = policy["payer_name"] or entity_name_from_code(conn, payer_code)
+                source = f"统一规则（{policy['effective_from_month']}起）"
+            else:
+                account_column = matrix_columns[item]
+                legacy = conn.execute(
+                    f"""
+                    SELECT m.{account_column} AS payer_name, COUNT(*) AS people_count
+                    FROM ss_emp_matrix m
+                    JOIN employees e ON e.emp_id = m.emp_id
+                    WHERE e.status = '在职' AND trim(COALESCE(m.{account_column}, '')) <> ''
+                    GROUP BY m.{account_column}
+                    ORDER BY people_count DESC
+                    LIMIT 1
+                    """
+                ).fetchone()
+                payer_name = legacy["payer_name"] if legacy else (
+                    "省公司" if item in {"medical", "injury", "maternity", "annuity"}
+                    else "省公众"
+                )
+                payer_code = entity_code_from_name(conn, payer_name)
+                source = "现有人员参保设置"
+            result = (
+                "省公众自行缴纳"
+                if payer_code == "province_public"
+                else f"{payer_name}集中代缴，省公众结算"
+            )
+            rows.append({
+                "insurance_item": item,
+                "项目": INSURANCE_LABELS[item],
+                "办理单位编码": payer_code,
+                "办理方式": payer_name,
+                "成本归属": "省公众",
+                "系统处理": result,
+                "规则来源": source,
+            })
+        return pd.DataFrame(rows)
+    finally:
+        conn.close()
+
+
+def save_normal_route_default(
+    insurance_item: str,
+    payer_entity_code: str,
+    effective_from_month: str,
+    remarks: str = "",
+) -> Tuple[bool, str]:
+    """保存普通人员统一办理方式；个人例外仍保持最高优先级。"""
+    if insurance_item not in PERSON_TREATMENT_ITEMS:
+        return False, "待遇项目无效"
+    if not payer_entity_code:
+        return False, "请选择办理单位"
+    if not re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", str(effective_from_month or "")):
+        return False, "生效月份必须为 YYYY-MM"
+    counterparty, settlement_mode, settlement_cycle = _derive_settlement(
+        payer_entity_code, "province_public", "normal"
+    )
+    conn = _get_db_connection()
+    try:
+        conn.execute(
+            """
+            UPDATE social_route_policies
+            SET active = 0, updated_at = CURRENT_TIMESTAMP
+            WHERE arrangement_type = 'normal' AND insurance_item = ?
+              AND active = 1 AND effective_from_month = ?
+            """,
+            (insurance_item, effective_from_month),
+        )
+        conn.execute(
+            """
+            UPDATE social_route_policies
+            SET effective_to_month = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE arrangement_type = 'normal' AND insurance_item = ?
+              AND active = 1 AND effective_from_month < ?
+              AND (effective_to_month IS NULL OR effective_to_month >= ?)
+            """,
+            (
+                _previous_month(effective_from_month), insurance_item,
+                effective_from_month, effective_from_month,
+            ),
+        )
+        payer_name = entity_name_from_code(conn, payer_entity_code)
+        conn.execute(
+            """
+            INSERT INTO social_route_policies(
+                policy_name, arrangement_type, insurance_item,
+                effective_from_month, enabled_default,
+                calculation_policy_entity, payer_entity_rule, payer_entity_code,
+                cost_bearer_rule, cost_bearer_code, settlement_counterparty_code,
+                settlement_mode, settlement_cycle, amount_source,
+                priority, active, remarks
+            ) VALUES (?, 'normal', ?, ?, NULL, ?, 'fixed', ?,
+                      'fixed', 'province_public', ?, ?, ?,
+                      'system_calculated', 100, 1, ?)
+            """,
+            (
+                f"普通人员{INSURANCE_LABELS[insurance_item]}办理方式",
+                insurance_item, effective_from_month, payer_entity_code,
+                payer_entity_code, counterparty, settlement_mode,
+                settlement_cycle, str(remarks or "").strip(),
+            ),
+        )
+        conn.commit()
+        return True, f"普通人员{INSURANCE_LABELS[insurance_item]}办理方式已保存"
+    except Exception as exc:
+        conn.rollback()
+        return False, str(exc)
+    finally:
+        conn.close()
+
+
+SPECIAL_DEFAULT_ARRANGEMENT_TYPES = {
+    "down_secondment": "下沉人员",
+    "city_transfer": "地市正式转入",
+}
+
+SPECIAL_ROUTE_UNIT_LABELS = {
+    "province_public": "省公众",
+    "province_company": "省公司",
+    "related_branch": "关联地市/原单位",
+}
+
+
+def _policy_rule_display(
+    conn: sqlite3.Connection,
+    rule: Optional[str],
+    entity_code: Optional[str],
+    role: str,
+) -> str:
+    if rule == "related_branch":
+        return "关联地市/原单位"
+    if rule == "actual_work_unit":
+        return "实际工作单位"
+    if rule in {"fixed", None, ""} and entity_code:
+        return entity_name_from_code(conn, entity_code)
+    if role == "payer":
+        return "沿用人员原办理方式"
+    return "沿用人员原成本归属"
+
+
+def get_arrangement_route_defaults(
+    arrangement_type: str,
+    target_month: str,
+) -> pd.DataFrame:
+    """展示下沉/地市转入人员在指定月份采用的统一待遇规则。"""
+    if arrangement_type not in SPECIAL_DEFAULT_ARRANGEMENT_TYPES:
+        return pd.DataFrame()
+    conn = _get_db_connection()
+    try:
+        rows = []
+        for item in PERSON_TREATMENT_ITEMS:
+            policy = conn.execute(
+                """
+                SELECT * FROM social_route_policies
+                WHERE arrangement_type = ? AND insurance_item = ? AND active = 1
+                  AND effective_from_month <= ?
+                  AND (effective_to_month IS NULL OR effective_to_month >= ?)
+                ORDER BY priority DESC, effective_from_month DESC, route_policy_id DESC
+                LIMIT 1
+                """,
+                (arrangement_type, item, target_month, target_month),
+            ).fetchone()
+            if not policy:
+                continue
+            data = dict(policy)
+            payer = _policy_rule_display(
+                conn, data.get("payer_entity_rule"), data.get("payer_entity_code"), "payer"
+            )
+            cost = _policy_rule_display(
+                conn, data.get("cost_bearer_rule"), data.get("cost_bearer_code"), "cost"
+            )
+            if not int(data.get("enabled_default") if data.get("enabled_default") is not None else 1):
+                result = "默认不办理"
+            elif payer == cost:
+                result = f"由{payer}办理并承担"
+            elif cost == "省公众":
+                result = f"由{payer}办理，计入本单位人工成本并生成结算记录"
+            else:
+                result = f"由{payer}办理，费用由{cost}承担，不进入本单位人工成本"
+            payer_choice = (
+                data.get("payer_entity_code")
+                if data.get("payer_entity_rule") == "fixed"
+                else data.get("payer_entity_rule")
+            )
+            rows.append({
+                "项目": INSURANCE_LABELS[item],
+                "默认办理": "是" if int(data.get("enabled_default") if data.get("enabled_default") is not None else 1) else "否",
+                "办理单位": payer,
+                "成本归属": cost,
+                "系统处理": result,
+                "生效月份": data.get("effective_from_month"),
+                "说明": data.get("remarks") or "",
+                "insurance_item": item,
+                "payer_choice": payer_choice,
+                "include_company_cost": cost == "省公众",
+            })
+        return pd.DataFrame(rows)
+    finally:
+        conn.close()
+
+
+def save_arrangement_route_default(
+    arrangement_type: str,
+    insurance_item: str,
+    enabled: bool,
+    payer_choice: str,
+    include_company_cost: bool,
+    effective_from_month: str,
+    remarks: str = "",
+) -> Tuple[bool, str]:
+    """保存一类特殊人员的一项默认规则，个人例外仍保持最高优先级。"""
+    if arrangement_type not in SPECIAL_DEFAULT_ARRANGEMENT_TYPES:
+        return False, "请选择下沉人员或地市正式转入"
+    if insurance_item not in PERSON_TREATMENT_ITEMS:
+        return False, "待遇项目无效"
+    if payer_choice not in SPECIAL_ROUTE_UNIT_LABELS:
+        return False, "办理单位无效"
+    if not re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", str(effective_from_month or "")):
+        return False, "生效月份必须为 YYYY-MM"
+
+    payer_rule = "related_branch" if payer_choice == "related_branch" else "fixed"
+    payer_code = None if payer_rule == "related_branch" else payer_choice
+    cost_rule = "fixed" if include_company_cost else "related_branch"
+    cost_code = "province_public" if include_company_cost else None
+    calculation_entity = (
+        "province_company" if payer_choice == "province_company" else "province_public"
+    )
+    if payer_rule == cost_rule == "related_branch":
+        settlement_mode, settlement_cycle = "none", "none"
+    elif include_company_cost and payer_rule == "related_branch":
+        settlement_mode, settlement_cycle = "annual_labor_cost_reallocation", "annual"
+    elif not include_company_cost and payer_choice == "province_public":
+        settlement_mode, settlement_cycle = "annual_reimbursement", "annual"
+    elif not include_company_cost and payer_choice == "province_company":
+        settlement_mode, settlement_cycle = "mixed_by_item", "annual"
+    else:
+        settlement_mode, settlement_cycle = "none", "none"
+
+    conn = _get_db_connection()
+    try:
+        conn.execute(
+            """
+            UPDATE social_route_policies
+            SET active = 0, updated_at = CURRENT_TIMESTAMP
+            WHERE arrangement_type = ? AND insurance_item = ?
+              AND active = 1 AND effective_from_month = ?
+            """,
+            (arrangement_type, insurance_item, effective_from_month),
+        )
+        conn.execute(
+            """
+            UPDATE social_route_policies
+            SET effective_to_month = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE arrangement_type = ? AND insurance_item = ? AND active = 1
+              AND effective_from_month < ?
+              AND (effective_to_month IS NULL OR effective_to_month >= ?)
+            """,
+            (
+                _previous_month(effective_from_month), arrangement_type,
+                insurance_item, effective_from_month, effective_from_month,
+            ),
+        )
+        next_policy = conn.execute(
+            """
+            SELECT effective_from_month FROM social_route_policies
+            WHERE arrangement_type = ? AND insurance_item = ? AND active = 1
+              AND effective_from_month > ?
+            ORDER BY effective_from_month ASC LIMIT 1
+            """,
+            (arrangement_type, insurance_item, effective_from_month),
+        ).fetchone()
+        effective_to = (
+            _previous_month(next_policy["effective_from_month"]) if next_policy else None
+        )
+        conn.execute(
+            """
+            INSERT INTO social_route_policies(
+                policy_name, arrangement_type, insurance_item,
+                effective_from_month, effective_to_month, enabled_default,
+                calculation_policy_entity, payer_entity_rule, payer_entity_code,
+                cost_bearer_rule, cost_bearer_code,
+                settlement_mode, settlement_cycle, amount_source,
+                priority, active, remarks
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                      'system_calculated', 200, 1, ?)
+            """,
+            (
+                f"{SPECIAL_DEFAULT_ARRANGEMENT_TYPES[arrangement_type]}{INSURANCE_LABELS[insurance_item]}默认规则",
+                arrangement_type, insurance_item, effective_from_month, effective_to,
+                1 if enabled else 0, calculation_entity, payer_rule, payer_code,
+                cost_rule, cost_code, settlement_mode, settlement_cycle,
+                str(remarks or "").strip(),
+            ),
+        )
+        conn.commit()
+        return True, (
+            f"{SPECIAL_DEFAULT_ARRANGEMENT_TYPES[arrangement_type]}的"
+            f"{INSURANCE_LABELS[insurance_item]}默认规则已保存"
+        )
+    except Exception as exc:
+        conn.rollback()
+        return False, str(exc)
+    finally:
+        conn.close()
+
+
 def get_social_overrides_dataframe(active_only: bool = True) -> pd.DataFrame:
     conn = _get_db_connection()
     try:
@@ -692,6 +1185,140 @@ def create_social_override(data: Dict[str, Any]) -> Tuple[bool, str]:
         conn.close()
 
 
+def save_person_social_override(
+    emp_id: str,
+    insurance_item: str,
+    effective_from_month: str,
+    enabled: bool,
+    payer_entity_code: str,
+    include_in_company_cost: bool,
+    external_cost_bearer_code: Optional[str],
+    special_reason: str,
+    effective_to_month: Optional[str] = None,
+    source_document_no: str = "",
+) -> Tuple[bool, str]:
+    """人员页面的简化保存接口：自动推导成本、结算对象和结算周期。"""
+    if insurance_item not in PERSON_TREATMENT_ITEMS:
+        return False, "请选择有效的待遇项目"
+    if not re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", str(effective_from_month or "")):
+        return False, "生效月份必须为 YYYY-MM"
+    if effective_to_month and not re.fullmatch(
+        r"\d{4}-(0[1-9]|1[0-2])", str(effective_to_month)
+    ):
+        return False, "失效月份必须为 YYYY-MM"
+    if effective_to_month and effective_to_month < effective_from_month:
+        return False, "失效月份不能早于生效月份"
+    if not payer_entity_code:
+        return False, "请选择办理单位"
+    if not str(special_reason or "").strip():
+        return False, "请填写特殊原因"
+
+    cost_bearer_code = (
+        "province_public" if include_in_company_cost else external_cost_bearer_code
+    )
+    if not cost_bearer_code:
+        return False, "不计入本单位人工成本时，必须选择实际承担费用的单位"
+
+    conn = _get_db_connection()
+    try:
+        arrangement = get_effective_arrangement(str(emp_id), effective_from_month, conn)
+        arrangement_type = arrangement.get("arrangement_type", "normal")
+        counterparty, settlement_mode, settlement_cycle = _derive_settlement(
+            payer_entity_code, cost_bearer_code, arrangement_type
+        )
+
+        # 同一个人同一项目的新版本自动结束旧的开放版本，历史月份仍保留。
+        conn.execute(
+            """
+            UPDATE employee_social_overrides
+            SET active = 0, updated_at = CURRENT_TIMESTAMP
+            WHERE emp_id = ? AND insurance_item = ? AND active = 1
+              AND effective_from_month = ?
+            """,
+            (str(emp_id), insurance_item, effective_from_month),
+        )
+        conn.execute(
+            """
+            UPDATE employee_social_overrides
+            SET effective_to_month = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE emp_id = ? AND insurance_item = ? AND active = 1
+              AND effective_from_month < ?
+              AND (effective_to_month IS NULL OR effective_to_month >= ?)
+            """,
+            (
+                _previous_month(effective_from_month), str(emp_id), insurance_item,
+                effective_from_month, effective_from_month,
+            ),
+        )
+        columns = [
+            "emp_id", "insurance_item", "effective_from_month", "effective_to_month",
+            "enabled", "calculation_policy_entity", "payer_entity_code",
+            "cost_bearer_code", "settlement_counterparty_code", "settlement_mode",
+            "settlement_cycle", "amount_source", "payment_channel_code",
+            "special_reason", "source_document_no", "active",
+        ]
+        values = {
+            "emp_id": str(emp_id),
+            "insurance_item": insurance_item,
+            "effective_from_month": effective_from_month,
+            "effective_to_month": effective_to_month,
+            "enabled": 1 if enabled else 0,
+            "calculation_policy_entity": payer_entity_code,
+            "payer_entity_code": payer_entity_code,
+            "cost_bearer_code": cost_bearer_code,
+            "settlement_counterparty_code": counterparty,
+            "settlement_mode": settlement_mode,
+            "settlement_cycle": settlement_cycle,
+            "amount_source": "system_calculated",
+            "payment_channel_code": None,
+            "special_reason": str(special_reason).strip(),
+            "source_document_no": str(source_document_no or "").strip(),
+            "active": 1,
+        }
+        conn.execute(
+            f"INSERT INTO employee_social_overrides ({','.join(columns)}) "
+            f"VALUES ({','.join(['?'] * len(columns))})",
+            tuple(values[column] for column in columns),
+        )
+        conn.commit()
+        return True, "个人待遇例外已保存；旧月份规则保持不变"
+    except Exception as exc:
+        conn.rollback()
+        return False, str(exc)
+    finally:
+        conn.close()
+
+
+def end_person_social_override(override_id: int, effective_to_month: str) -> Tuple[bool, str]:
+    if not re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", str(effective_to_month or "")):
+        return False, "结束月份必须为 YYYY-MM"
+    conn = _get_db_connection()
+    try:
+        row = conn.execute(
+            "SELECT effective_from_month FROM employee_social_overrides WHERE override_id = ?",
+            (int(override_id),),
+        ).fetchone()
+        if not row:
+            return False, "未找到这条个人例外"
+        if effective_to_month < row["effective_from_month"]:
+            return False, "结束月份不能早于生效月份"
+        conn.execute(
+            """
+            UPDATE employee_social_overrides
+            SET effective_to_month = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE override_id = ?
+            """,
+            (effective_to_month, int(override_id)),
+        )
+        conn.commit()
+        return True, "个人例外结束月份已保存"
+    except Exception as exc:
+        conn.rollback()
+        return False, str(exc)
+    finally:
+        conn.close()
+
+
 def create_arrangement(data: Dict[str, Any]) -> Tuple[bool, str]:
     conn = _get_db_connection()
     try:
@@ -715,16 +1342,150 @@ def create_arrangement(data: Dict[str, Any]) -> Tuple[bool, str]:
             "payroll_entity_code", "home_dept_id", "actual_work_unit_code",
             "related_branch_code", "accounting_entity_code",
             "ultimate_cost_bearer_code", "start_date", "planned_end_date",
-            "actual_end_date", "payroll_included", "settlement_mode",
+            "actual_end_date", "payroll_included", "labor_cost_included", "settlement_mode",
             "settlement_cycle", "status", "source_document_no", "remarks",
         ]
         conn.execute(
             f"INSERT INTO employee_arrangements ({','.join(columns)}) "
             f"VALUES ({','.join(['?'] * len(columns))})",
-            tuple(data.get(column) for column in columns),
+            tuple(
+                (
+                    data.get(column)
+                    if data.get(column) is not None
+                    else (0 if data.get("arrangement_type") in {"proxy_social", "down_secondment"} else 1)
+                )
+                if column == "labor_cost_included" else data.get(column)
+                for column in columns
+            ),
         )
         conn.commit()
         return True, "用工与结算关系已保存"
+    except Exception as exc:
+        conn.rollback()
+        return False, str(exc)
+    finally:
+        conn.close()
+
+
+def save_simple_arrangement(data: Dict[str, Any]) -> Tuple[bool, str]:
+    """保存人员情形，页面无需理解合同主体、记账主体和结算模式等技术字段。"""
+    emp_id = str(data.get("emp_id") or "").strip()
+    relation_type = data.get("arrangement_type") or "normal"
+    start_date = str(data.get("start_date") or "").strip()
+    if relation_type not in ARRANGEMENT_LABELS:
+        return False, "人员情形无效"
+    try:
+        start_day = datetime.strptime(start_date, "%Y-%m-%d").date()
+    except ValueError:
+        return False, "生效日期必须为 YYYY-MM-DD"
+
+    conn = _get_db_connection()
+    try:
+        employee = conn.execute(
+            "SELECT emp_id, dept_id FROM employees WHERE emp_id = ?", (emp_id,)
+        ).fetchone()
+        if not employee:
+            return False, "未找到该人员"
+
+        current = conn.execute(
+            """
+            SELECT * FROM employee_arrangements
+            WHERE emp_id = ? AND status = 'active'
+              AND (actual_end_date IS NULL OR date(actual_end_date) >= date(?))
+            ORDER BY date(start_date) DESC, arrangement_id DESC
+            LIMIT 1
+            """,
+            (emp_id, start_date),
+        ).fetchone()
+
+        if relation_type == "normal":
+            if not current:
+                return True, "该人员已经按普通人员管理，无需重复设置"
+            if start_day <= datetime.strptime(current["start_date"], "%Y-%m-%d").date():
+                return False, "恢复普通人员的日期必须晚于当前特殊关系开始日期"
+            conn.execute(
+                """
+                UPDATE employee_arrangements
+                SET actual_end_date = ?, status = 'closed', updated_at = CURRENT_TIMESTAMP
+                WHERE arrangement_id = ?
+                """,
+                ((start_day - timedelta(days=1)).isoformat(), current["arrangement_id"]),
+            )
+            conn.commit()
+            return True, "特殊人员关系已结束，之后恢复普通人员规则"
+
+        related_code = data.get("related_branch_code")
+        actual_work_code = data.get("actual_work_unit_code") or related_code
+        payroll_included = 1 if data.get("payroll_included") else 0
+        labor_included = 1 if data.get("labor_cost_included") else 0
+        if relation_type in {"proxy_social", "down_secondment", "city_transfer"} and not related_code:
+            return False, "请选择关联地市或单位"
+        if not labor_included and not related_code:
+            return False, "不计入本单位人工成本时必须选择费用承担单位"
+
+        defaults = {
+            "proxy_social": ("proxy_social", "quarterly"),
+            "down_secondment": ("mixed_by_item", "mixed"),
+            "city_transfer": ("annual_labor_cost_reallocation", "annual"),
+        }
+        settlement_mode, settlement_cycle = defaults[relation_type]
+        record = {
+            "emp_id": emp_id,
+            "arrangement_type": relation_type,
+            "contract_entity_code": "province_public" if relation_type != "proxy_social" else None,
+            "payroll_entity_code": "province_public" if payroll_included else None,
+            "home_dept_id": int(employee["dept_id"]),
+            "actual_work_unit_code": actual_work_code,
+            "related_branch_code": related_code,
+            "accounting_entity_code": "province_public",
+            "ultimate_cost_bearer_code": "province_public" if labor_included else related_code,
+            "start_date": start_date,
+            "planned_end_date": data.get("planned_end_date"),
+            "actual_end_date": None,
+            "payroll_included": payroll_included,
+            "labor_cost_included": labor_included,
+            "settlement_mode": settlement_mode,
+            "settlement_cycle": settlement_cycle,
+            "status": "active",
+            "source_document_no": str(data.get("source_document_no") or "").strip(),
+            "remarks": str(data.get("remarks") or "").strip(),
+        }
+
+        columns = [
+            "emp_id", "arrangement_type", "contract_entity_code", "payroll_entity_code",
+            "home_dept_id", "actual_work_unit_code", "related_branch_code",
+            "accounting_entity_code", "ultimate_cost_bearer_code", "start_date",
+            "planned_end_date", "actual_end_date", "payroll_included",
+            "labor_cost_included", "settlement_mode", "settlement_cycle", "status",
+            "source_document_no", "remarks",
+        ]
+        if current and str(current["start_date"]) == start_date:
+            assignments = ",".join(f"{column} = ?" for column in columns[1:])
+            conn.execute(
+                f"UPDATE employee_arrangements SET {assignments}, updated_at = CURRENT_TIMESTAMP "
+                "WHERE arrangement_id = ?",
+                tuple(record[column] for column in columns[1:]) + (current["arrangement_id"],),
+            )
+        else:
+            if current:
+                current_start = datetime.strptime(current["start_date"], "%Y-%m-%d").date()
+                if start_day <= current_start:
+                    return False, "新情形的生效日期必须晚于当前关系开始日期"
+                conn.execute(
+                    """
+                    UPDATE employee_arrangements
+                    SET actual_end_date = ?, status = 'closed', updated_at = CURRENT_TIMESTAMP
+                    WHERE arrangement_id = ?
+                    """,
+                    ((start_day - timedelta(days=1)).isoformat(), current["arrangement_id"]),
+                )
+            conn.execute(
+                f"INSERT INTO employee_arrangements ({','.join(columns)}) "
+                f"VALUES ({','.join(['?'] * len(columns))})",
+                tuple(record[column] for column in columns),
+            )
+        conn.commit()
+        return True, "人员情形已保存，历史期间保持不变"
     except Exception as exc:
         conn.rollback()
         return False, str(exc)
@@ -792,9 +1553,9 @@ def seed_proxy_arrangements() -> Tuple[int, str]:
                     emp_id, arrangement_type, home_dept_id,
                     actual_work_unit_code, related_branch_code,
                     ultimate_cost_bearer_code, start_date,
-                    payroll_included, settlement_mode, settlement_cycle,
+                    payroll_included, labor_cost_included, settlement_mode, settlement_cycle,
                     status, remarks
-                ) VALUES (?, 'proxy_social', ?, ?, ?, ?, ?, 0,
+                ) VALUES (?, 'proxy_social', ?, ?, ?, ?, ?, 0, 0,
                           'proxy_social', 'quarterly', 'active', ?)
                 """,
                 (
@@ -954,13 +1715,16 @@ def backfill_relationship_snapshots() -> Dict[str, int]:
                 UPDATE labor_cost_ledger
                 SET arrangement_id = ?, business_type_snapshot = ?, actual_work_unit_code = ?,
                     accounting_entity_code = ?, ultimate_cost_bearer_code = ?,
+                    labor_cost_included_snapshot = ?,
                     reallocation_mode = ?, reallocation_status = ?
                 WHERE record_id = ?
                 """,
                 (
                     arrangement.get("arrangement_id"), relation_type,
                     arrangement.get("actual_work_unit_code"), arrangement.get("accounting_entity_code"),
-                    arrangement.get("ultimate_cost_bearer_code"), mode, status, row["record_id"],
+                    arrangement.get("ultimate_cost_bearer_code"),
+                    int(arrangement.get("labor_cost_included", 1)),
+                    mode, status, row["record_id"],
                 ),
             )
             counts["ledger_records"] += 1

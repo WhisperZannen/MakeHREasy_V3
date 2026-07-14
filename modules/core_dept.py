@@ -87,6 +87,13 @@ def soft_delete_department(dept_id):
     conn = _get_db_connection()
     cursor = conn.cursor()
     try:
+        cursor.execute("SELECT COUNT(*) FROM employees WHERE dept_id = ?", (dept_id,))
+        assigned_count = int(cursor.fetchone()[0])
+        if assigned_count:
+            return False, (
+                f"该部门仍有 {assigned_count} 人，不能直接撤销。"
+                "请使用“组织调整”先把人员批量转入承接部门。"
+            )
         cursor.execute("UPDATE departments SET status = 0 WHERE dept_id = ?", (dept_id,))
         if cursor.rowcount == 0: return False, "撤销失败：部门不存在。"
         conn.commit()

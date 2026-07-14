@@ -40,7 +40,8 @@ from modules.core_social_security import (
     get_policy_rules,
     upsert_policy_rules,
     _get_db_connection,
-    batch_update_emp_matrix
+    batch_update_emp_matrix,
+    batch_update_social_bases,
 )
 from modules.core_arrangements import (
     ACTIVE_LABELS,
@@ -56,12 +57,15 @@ from modules.core_arrangements import (
     backfill_relationship_snapshots,
     create_route_policy,
     create_social_override,
+    get_effective_arrangement,
     get_entities_dataframe,
+    get_normal_route_defaults,
     get_route_policies_dataframe,
     get_settlement_batches_dataframe,
     get_social_overrides_dataframe,
     register_social_settlement_batch,
     resolve_social_route,
+    save_normal_route_default,
     update_settlement_batch_status,
 )
 
@@ -129,18 +133,18 @@ def safe_float(val, default=0.0):
 if 'show_confirm' not in st.session_state: st.session_state['show_confirm'] = False
 if 'pending_params' not in st.session_state: st.session_state['pending_params'] = None
 
-st.title("🛡️ 社保与福利结算中心")
-st.caption("核心业务流向：当月基数备料 ➡️ 理论核算与补缴对账 ➡️ 跨主体结算与公对公要款 ➡️ 引擎底座配置")
+st.title("🛡️ 社保与福利")
+st.caption("按顺序完成当月办理、结算导出和封账；个人特殊情况统一回到人员档案设置。")
 
 tab1, tab2, tab3, tab4, tab5 = st.tabs(
-    ["🧮 当月社保沙盘 (含补缴)", "📤 财务提款与公对公结算函", "⚙️ 全局规则与参数配置",
-     "📥 历史账单导入 (冷启动)", "🔀 社保险种缴费规则"])
+    ["① 当月社保办理", "② 结算与导出", "③ 缴费金额参数",
+     "历史账单导入", "普通人员默认办理方式"])
 
 # ------------------------------------------------------------------------------
 # Tab 1: 当月社保沙盘与对账池
 # ------------------------------------------------------------------------------
 with tab1:
-    st.info("💡 业务铁律：先在【第一步】确保所有人基数就绪，再在【第二步】跑出当期理论账单，最后在【第三步】补录官方滞纳金与历史补缴差额。")
+    st.info("按顺序完成三步：确认本月缴费基数 → 生成本月社保明细 → 如有官方调整再补录。没有补缴或滞纳金时，第三步可以跳过。")
 
     # ==========================================================================
     # [极致体验修复] 智能推算下个月份引擎
@@ -166,7 +170,7 @@ with tab1:
     # 提示语明确告诉你要按回车
     calc_month = st.text_input("📅 当前核算工作月份 (修改后请按【回车键】确认👇)", value=default_month, max_chars=7)
 
-    st.subheader("🛠️ 第一步：基数初始化与特例抢救")
+    st.subheader("第一步：确认本月缴费基数")
     conn = _get_db_connection()
     try:
         # [极致修复 1] 强力复刻人员模块的排序算法：部门权重 -> 岗位权重 -> 岗级(负数取反)
@@ -179,7 +183,7 @@ with tab1:
                 IFNULL(m.medical_enabled, 1) AS '医疗参保(1是0否)', IFNULL(m.medical_account, '省公司') AS '医疗缴纳主体',
                 7.0 AS '大病统筹(个人固定)',
                 IFNULL(m.unemp_enabled, 1) AS '失业参保(1是0否)', IFNULL(m.unemp_account, '省公众') AS '失业缴纳主体',
-                IFNULL(m.injury_enabled, 1) AS '工伤参保(1是0否)', IFNULL(m.injury_account, '省公众') AS '工伤缴纳主体',
+                IFNULL(m.injury_enabled, 1) AS '工伤参保(1是0否)', IFNULL(m.injury_account, '省公司') AS '工伤缴纳主体',
                 IFNULL(m.maternity_enabled, 1) AS '生育参保(1是0否)', IFNULL(m.maternity_account, '省公司') AS '生育缴纳主体',
                 IFNULL(m.fund_enabled, 1) AS '公积金参保(1是0否)', IFNULL(m.fund_account, '省公众') AS '公积金缴纳主体',
                 IFNULL(m.annuity_enabled, 0) AS '年金参保(1是0否)', IFNULL(m.annuity_account, '省公司') AS '年金缴纳主体'
@@ -202,13 +206,33 @@ with tab1:
     finally:
         conn.close()
 
+    roster_export_df = roster_df[[
+        '工号', '姓名', '部门', '财务归属', '已录入原始基数', '独立公积金基数(选填)'
+    ]].copy()
+    conn_route_preview = _get_db_connection()
+    try:
+        roster_export_df.insert(
+            3,
+            '人员情形',
+            roster_export_df['工号'].astype(str).map(
+                lambda emp_id: ARRANGEMENT_LABELS.get(
+                    get_effective_arrangement(emp_id, calc_month, conn_route_preview).get(
+                        'arrangement_type', 'normal'
+                    ),
+                    '普通在职',
+                )
+            ),
+        )
+    finally:
+        conn_route_preview.close()
+
     c_down, c_up = st.columns(2)
     with c_down:
         # 基数表使用排版引擎冻结表头、拉宽列距
         buffer = io.BytesIO()
         with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-            roster_df.to_excel(writer, index=False, sheet_name='全员基数与缴交主体配置表')
-            format_excel_sheet(writer.sheets['全员基数与缴交主体配置表'], roster_df.columns)
+            roster_export_df.to_excel(writer, index=False, sheet_name='社保基数表')
+            format_excel_sheet(writer.sheets['社保基数表'], roster_export_df.columns)
 
         # [防呆设计] 按钮上直接大字显示当前认定的月份，绝对不会下错！
         st.download_button(
@@ -224,7 +248,7 @@ with tab1:
             if st.session_state.get('last_processed_file_id') != uploaded_file.file_id:
                 try:
                     upload_df = pd.read_csv(uploaded_file) if uploaded_file.name.endswith('.csv') else pd.read_excel(uploaded_file)
-                    success, msg = batch_update_emp_matrix(upload_df)
+                    success, msg = batch_update_social_bases(upload_df)
                     if success:
                         st.session_state['last_processed_file_id'] = uploaded_file.file_id
                         st.rerun()
@@ -234,11 +258,11 @@ with tab1:
 
     st.divider()
 
-    st.subheader("🧮 第二步：本月正常参保核算")
+    st.subheader("第二步：生成本月社保明细")
     rule_year_to_use = st.selectbox("⚙️ 选择本次套用的【规则年度】(如次年6月前沿用上年规则)",
                                     ["2024", "2025", "2026", "2027", "2028"], index=1)
 
-    if st.button("🚀 启动引擎，生成当期理论账单", type="primary"):
+    if st.button("生成本月社保明细", type="primary"):
         missing_count = len(roster_df[roster_df['已录入原始基数'] == 0.0])
         if missing_count > 0:
             st.error(f"🚨 警告：发现 {missing_count} 名员工基数为 0，请在第一步补充完整！")
@@ -423,7 +447,7 @@ with tab1:
                 else:
                     st.error(msg)
 
-    st.subheader("📥 第三步：补缴与滞纳金手工入账 (对齐官方核定单)")
+    st.subheader("第三步：补录官方调整（如有）")
     st.write("🔧 遇到历史跨月补缴、滞纳金等系统无法自动推演的账目，请在此按社保局单据直接填报写入。")
 
     rc1, rc2 = st.columns(2)
@@ -527,16 +551,69 @@ with tab1:
 # Tab 5: 带生效期的缴费路由与个人例外
 # ------------------------------------------------------------------------------
 with tab5:
-    st.subheader("🔀 社保险种缴费规则与个人特殊处理")
+    st.subheader("普通人员默认办理方式")
     st.info(
-        "系统按“单个人员特殊规则 ＞ 同类人员统一规则 ＞ 原参保配置”的顺序判断每个人、每个险种。"
-        "这里只决定由谁计算、谁缴费、成本由谁承担以及是否结算，不直接修改已经封账的历史账单。"
+        "这里只设置普通人员的统一规则。例如医保从省公司转为省公众缴纳时，"
+        "只改一次并填写生效月份。李峰林等个人例外请到【人员与组织档案 → 特殊人员与待遇】设置。"
     )
 
     entity_df = get_entities_dataframe(active_only=True)
     entity_names = dict(zip(entity_df['entity_code'], entity_df['entity_name']))
     entity_options = [None] + entity_df['entity_code'].tolist()
     item_options = list(INSURANCE_LABELS.keys())
+
+    default_month_for_route = datetime.date.today().strftime('%Y-%m')
+    route_month = st.text_input(
+        "查看月份", value=default_month_for_route, max_chars=7, key="normal_route_month"
+    )
+    normal_defaults = get_normal_route_defaults(route_month)
+    st.dataframe(
+        normal_defaults[[
+            '项目', '办理方式', '成本归属', '系统处理', '规则来源'
+        ]],
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    with st.expander("修改一项普通人员统一规则", expanded=False):
+        st.caption("个人例外优先级更高，因此修改普通规则不会覆盖李峰林等已经设置的个人特殊项目。")
+        with st.form("simple_normal_route_form"):
+            sr1, sr2, sr3 = st.columns(3)
+            with sr1:
+                simple_item = st.selectbox(
+                    "项目", [item for item in item_options if item in {
+                        'pension', 'medical', 'unemp', 'injury', 'maternity', 'fund', 'annuity'
+                    }],
+                    format_func=lambda value: INSURANCE_LABELS[value],
+                )
+            with sr2:
+                simple_payer_options = entity_df['entity_code'].tolist()
+                simple_payer = st.selectbox(
+                    "以后由谁办理", simple_payer_options,
+                    format_func=lambda value: entity_names.get(value, value),
+                )
+            with sr3:
+                simple_effective_from = st.text_input(
+                    "生效月份", value=route_month, max_chars=7
+                )
+            simple_remarks = st.text_input("依据或说明（可选）")
+            if st.form_submit_button("保存统一办理方式", type="primary"):
+                ok, msg = save_normal_route_default(
+                    simple_item, simple_payer, simple_effective_from.strip(), simple_remarks
+                )
+                if ok:
+                    st.success(msg)
+                    st.rerun()
+                else:
+                    st.error(msg)
+
+    st.caption(
+        "页面显示的“省公司集中代缴”只表示付款渠道；只要成本归属是省公众，"
+        "该金额仍进入本单位人工成本，并由系统记录与省公司的结算。"
+    )
+
+    # 旧版高级路由编辑器不再执行。源码暂时保留，便于兼容核对后再彻底删除。
+    legacy_route_editor_source = r"""
 
     route_tab, override_tab = st.tabs([
         "📘 同类人员统一规则（公共政策）", "👤 单个人员特殊规则（个人例外）"
@@ -807,6 +884,8 @@ with tab5:
                         st.success(msg)
                     else:
                         st.error(msg)
+
+    """
 
 # ------------------------------------------------------------------------------
 # (Tab 2, Tab 3, Tab 4 维持之前的代码逻辑不动)

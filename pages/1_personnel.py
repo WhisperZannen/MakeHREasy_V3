@@ -16,7 +16,10 @@ from dateutil.relativedelta import relativedelta
 # 导入底层接口
 from modules.core_dept import get_all_departments, add_department, update_department, soft_delete_department
 from modules.core_position import get_all_positions, add_position, update_position
-from modules.core_personnel import get_all_employees, add_employee, update_employee, update_employee_status, get_all_history, rollback_history
+from modules.core_personnel import (
+    get_all_employees, add_employee, update_employee, update_employee_status,
+    get_all_history, rollback_history, batch_transfer_department_members,
+)
 from modules.core_arrangements import (
     ACTIVE_LABELS,
     ARRANGEMENT_CLOSE_RESULT_LABELS,
@@ -28,8 +31,19 @@ from modules.core_arrangements import (
     close_arrangement,
     create_business_entity,
     create_arrangement,
+    end_person_social_override,
+    get_effective_arrangement,
     get_arrangements_dataframe,
+    get_arrangement_route_defaults,
     get_entities_dataframe,
+    get_people_management_dataframe,
+    get_person_treatment_dataframe,
+    get_social_overrides_dataframe,
+    INSURANCE_LABELS,
+    PERSON_TREATMENT_ITEMS,
+    save_arrangement_route_default,
+    save_person_social_override,
+    save_simple_arrangement,
     set_business_entity_active,
 )
 
@@ -117,7 +131,7 @@ st.sidebar.title("🎛️ 组织人事中枢")
 # 严格按照你的要求调整了次序：人员 -> 流水 -> 部门 -> 岗位
 current_page = st.sidebar.radio(
     "请选择操作模块:",
-    ["👥 人员档案", "🔄 特殊用工与结算关系", "🕰️ 历史变动流水", "🏢 部门管理", "🎯 岗位字典"]
+    ["👥 人员档案", "🧭 特殊人员与待遇", "🕰️ 历史变动流水", "🏢 部门管理", "🎯 岗位字典"]
 )
 st.title(current_page)
 
@@ -194,13 +208,16 @@ if current_page == "🏢 部门管理":
 
     with col_d2:
         st.subheader("📊 组织架构树")
-        s1, s2 = st.columns([2, 1])
+        s1, s2, s3 = st.columns([2, 1, 1])
         with s1: d_s = st.text_input("🔍 搜索部门")
         with s2: st.write(""); show_i = st.checkbox("含已撤销")
+        with s3: st.write(""); show_pools = st.checkbox("显示系统人员池")
 
         fdf = df_depts.copy()
         if not fdf.empty:
             if not show_i: fdf = fdf[fdf['status'] == 1]
+            if not show_pools and 'is_virtual_pool' in fdf.columns:
+                fdf = fdf[fdf['is_virtual_pool'] != 1]
             if d_s:
                 m_ids = set()
                 dh = fdf[fdf['dept_name'].str.contains(d_s, na=False)]['dept_id'].tolist()
@@ -210,6 +227,8 @@ if current_page == "🏢 部门管理":
                 for h in dh: trace(h, df_depts)
                 fdf = df_depts[df_depts['dept_id'].isin(m_ids)]
                 if not show_i: fdf = fdf[fdf['status'] == 1]
+                if not show_pools and 'is_virtual_pool' in fdf.columns:
+                    fdf = fdf[fdf['is_virtual_pool'] != 1]
 
             t_data = build_dept_tree(fdf)
             if t_data:
@@ -217,6 +236,64 @@ if current_page == "🏢 部门管理":
                 tdf['status'] = tdf['status'].apply(lambda x: "正常" if x == 1 else "已撤销")
                 tdf = tdf.rename(columns=DEPT_COL_MAP)
                 st.dataframe(tdf[['部门ID', '层级展示名', '性质', '权重', '状态']], use_container_width=True, hide_index=True)
+
+    st.divider()
+    with st.expander("组织调整：部门合并、撤销承接或拆分", expanded=False):
+        st.caption(
+            "选择原部门、人员和承接部门，系统会一次性生成人员调动流水。"
+            "15日及以前生效的当月归新部门，16日以后当月仍归原部门。"
+            "部门拆分时，按不同承接部门分几次操作即可。"
+        )
+        formal_active_depts = df_depts[
+            (df_depts['status'] == 1)
+            & (df_depts.get('is_virtual_pool', 0) != 1)
+        ].copy()
+        formal_dept_ids = formal_active_depts['dept_id'].astype(int).tolist()
+        formal_dept_names = dict(zip(
+            formal_active_depts['dept_id'].astype(int), formal_active_depts['dept_name']
+        ))
+        if len(formal_dept_ids) < 2:
+            st.info("至少需要两个有效正式部门才能进行组织调整。")
+        else:
+            source_dept = st.selectbox(
+                "原部门", formal_dept_ids,
+                format_func=lambda value: formal_dept_names[value],
+                key="org_source_dept",
+            )
+            source_people = df_emps[df_emps['dept_id'] == source_dept].copy()
+            source_people_ids = source_people['emp_id'].astype(str).tolist()
+            source_people_names = {
+                str(row['emp_id']): f"{row['name']}（{row['emp_id']}）"
+                for _, row in source_people.iterrows()
+            }
+            target_options = [dept_id for dept_id in formal_dept_ids if dept_id != source_dept]
+            with st.form("organization_transfer_form"):
+                target_dept = st.selectbox(
+                    "承接部门", target_options,
+                    format_func=lambda value: formal_dept_names[value],
+                )
+                selected_people = st.multiselect(
+                    "需要调整的人员", source_people_ids,
+                    default=source_people_ids,
+                    format_func=lambda value: source_people_names[value],
+                )
+                transfer_date = st.date_input("生效日期", value=date.today())
+                transfer_reason = st.text_input(
+                    "调整说明*", placeholder="例如：研发运营五中心并入研发运营四中心"
+                )
+                deactivate_source = st.checkbox(
+                    "人员全部转出后撤销原部门",
+                    value=len(selected_people) == len(source_people_ids),
+                )
+                if st.form_submit_button("预览无误，执行组织调整", type="primary"):
+                    ok, msg = batch_transfer_department_members(
+                        selected_people, target_dept, transfer_date.isoformat(),
+                        transfer_reason, source_dept, deactivate_source,
+                    )
+                    if ok:
+                        set_msg_and_rerun(msg)
+                    else:
+                        st.error(msg)
 
 # ==============================================================================
 # 模块 B: 🎯 岗位字典
@@ -419,8 +496,8 @@ elif current_page == "👥 人员档案":
             conn = sqlite3.connect(db_path)
             conn.row_factory = sqlite3.Row
             full_emp_df = pd.read_sql_query("""
-                SELECT e.*, p.* FROM employees e 
-                LEFT JOIN employee_profiles p ON e.emp_id = p.emp_id 
+                SELECT e.*, p.* FROM employees e
+                LEFT JOIN employee_profiles p ON e.emp_id = p.emp_id
                 WHERE e.emp_id = ?
             """, conn, params=[sel_id])
             conn.close()
@@ -506,8 +583,20 @@ elif current_page == "👥 人员档案":
                 fname = st.text_input("姓名*", value=str(t_emp_sel.get('name', "")) if t_emp_sel is not None else "")
                 fidc = st.text_input("身份证", value=str(t_emp_sel.get('id_card', "")) if t_emp_sel is not None and pd.notna(t_emp_sel.get('id_card')) else "")
             with f2:
-                vd = df_depts[df_depts['status']==1]; dm = {r['dept_id']: r['dept_name'] for _, r in vd.iterrows()}
                 def_d = t_emp_sel.get('dept_id') if t_emp_sel is not None else None
+                vd = df_depts[df_depts['status']==1].copy()
+                # 编辑仍挂在已撤销部门的人员时，保留其当前部门供展示，避免下拉框
+                # 静默跳到第一个有效部门并制造一次误调动。
+                if def_d is not None and def_d not in vd['dept_id'].tolist():
+                    current_inactive = df_depts[df_depts['dept_id'] == def_d]
+                    if not current_inactive.empty:
+                        vd = pd.concat([current_inactive, vd], ignore_index=True)
+                dm = {
+                    r['dept_id']: (
+                        f"{r['dept_name']}（已撤销，请迁出）" if r['status'] != 1 else r['dept_name']
+                    )
+                    for _, r in vd.iterrows()
+                }
                 fdept = st.selectbox("部门*", options=list(dm.keys()), format_func=lambda x: dm[x], index=list(dm.keys()).index(def_d) if def_d in dm else 0) if dm else None
 
                 frank = st.number_input("岗级*", 0.0, 28.0,
@@ -589,8 +678,435 @@ elif current_page == "👥 人员档案":
                     else: st.error(msg)
 
 # ==============================================================================
-# 模块 D: 🔄 用工与结算关系
+# 模块 D: 特殊人员与待遇（业务人员简化入口）
 # ==============================================================================
+elif current_page == "🧭 特殊人员与待遇":
+    person_settings_tab, default_rules_tab = st.tabs([
+        "人员设置", "下沉/地市转入默认规则"
+    ])
+    with person_settings_tab:
+        st.subheader("🧭 特殊人员与待遇设置")
+        st.caption(
+            "先确定这个人属于哪种情形，再只维护与普通人员不同的项目。"
+            "办理单位和人工成本归属可以不同，系统会自动生成结算处理。"
+        )
+
+        target_month = st.text_input(
+            "查看和设置月份", value=date.today().strftime('%Y-%m'), max_chars=7,
+            help="所有人员情形和单项例外都按生效期保存，修改未来月份不会改写历史账。",
+        )
+        people_df = get_people_management_dataframe(target_month)
+        if people_df.empty:
+            st.info("当前没有可设置的在职或挂靠人员。")
+            st.stop()
+
+        metric_cols = st.columns(5)
+        metric_cols[0].metric("普通人员", int((people_df['arrangement_type'] == 'normal').sum()))
+        metric_cols[1].metric("挂靠代缴", int((people_df['arrangement_type'] == 'proxy_social').sum()))
+        metric_cols[2].metric("下沉人员", int((people_df['arrangement_type'] == 'down_secondment').sum()))
+        metric_cols[3].metric("地市转入", int((people_df['arrangement_type'] == 'city_transfer').sum()))
+        metric_cols[4].metric("有单项例外", int((people_df['个人例外数'] > 0).sum()))
+
+        f1, f2 = st.columns([1, 2])
+        with f1:
+            situation_filter = st.selectbox(
+                "人员筛选", ["全部"] + list(ARRANGEMENT_LABELS.values()) + ["有单项例外"]
+            )
+        filtered_people = people_df.copy()
+        if situation_filter == "有单项例外":
+            filtered_people = filtered_people[filtered_people['个人例外数'] > 0]
+        elif situation_filter != "全部":
+            filtered_people = filtered_people[filtered_people['人员情形'] == situation_filter]
+        with f2:
+            person_options = filtered_people['emp_id'].astype(str).tolist()
+            person_labels = {
+                str(row['emp_id']): (
+                    f"{row['name']}（{row['emp_id']}）｜{row['人员情形']}｜{row['dept_name'] or '未分配部门'}"
+                )
+                for _, row in filtered_people.iterrows()
+            }
+            selected_emp_id = st.selectbox(
+                "选择人员", person_options,
+                format_func=lambda value: person_labels[value],
+                placeholder="没有符合筛选条件的人员",
+            )
+        if not selected_emp_id:
+            st.stop()
+
+        selected_person = people_df[
+            people_df['emp_id'].astype(str) == str(selected_emp_id)
+        ].iloc[0]
+        arrangement = get_effective_arrangement(str(selected_emp_id), target_month)
+        relation_type = arrangement.get('arrangement_type', 'normal')
+
+        st.divider()
+        s1, s2, s3, s4 = st.columns(4)
+        s1.markdown(f"**{selected_person['name']}**\n\n{selected_person['emp_id']}")
+        s2.markdown(f"**内部部门**\n\n{selected_person['dept_name'] or '未分配部门'}")
+        s3.markdown(f"**人员情形**\n\n{ARRANGEMENT_LABELS.get(relation_type, relation_type)}")
+        s4.markdown(
+            f"**系统结论**\n\n{selected_person['工资处理']}；{selected_person['人工成本处理']}"
+        )
+
+        if relation_type == 'city_transfer':
+            st.success("正式转入人员：属于本单位人员，工资和人工成本默认计入本单位；来源地市仅用于年度成本划转。")
+        elif relation_type == 'down_secondment':
+            st.info("下沉人员：社保中仍可保留由本单位办理的项目，但费用不进入本单位人工成本，按期间导出结算。")
+        elif relation_type == 'proxy_social':
+            st.info("挂靠代缴：只记录实际代缴项目，不发本单位工资，也不进入本单位人工成本。")
+        elif int(selected_person['个人例外数']) > 0:
+            st.warning("该人员仍是普通人员，但存在个别待遇项目例外。李峰林应按这种方式管理。")
+
+        entity_df = get_entities_dataframe(active_only=True)
+        entity_names = dict(zip(entity_df['entity_code'], entity_df['entity_name']))
+        external_entities = entity_df[entity_df['entity_code'] != 'province_public']
+        external_options = external_entities['entity_code'].tolist()
+
+        with st.expander("① 设置人员情形", expanded=relation_type != 'normal'):
+            relation_options = list(ARRANGEMENT_LABELS)
+            selected_relation_type = st.radio(
+                "这个人属于哪种情形？",
+                relation_options,
+                format_func=lambda value: ARRANGEMENT_LABELS[value],
+                index=relation_options.index(relation_type) if relation_type in relation_options else 0,
+                horizontal=True,
+                key=f"arrangement_type_{selected_emp_id}",
+            )
+            with st.form("simple_arrangement_form"):
+                is_switching_situation = selected_relation_type != relation_type
+                existing_start = None if is_switching_situation else arrangement.get('start_date')
+                try:
+                    start_default = pd.to_datetime(existing_start).date() if existing_start else date.today()
+                except Exception:
+                    start_default = date.today()
+                start_value = st.date_input(
+                    "生效日期", value=start_default,
+                    key=f"arrangement_start_{selected_emp_id}_{selected_relation_type}",
+                )
+
+                related_unit = None
+                actual_work_unit = None
+                payroll_included = True
+                labor_cost_included = True
+                planned_end = None
+                document_no = ""
+                relation_remarks = ""
+                if selected_relation_type != 'normal':
+                    c1, c2 = st.columns(2)
+                    current_related = (
+                        None if is_switching_situation else arrangement.get('related_branch_code')
+                    )
+                    current_actual = (
+                        None if is_switching_situation else arrangement.get('actual_work_unit_code')
+                    )
+                    with c1:
+                        related_unit = st.selectbox(
+                            "来源/关联地市或单位*", external_options,
+                            format_func=lambda value: entity_names.get(value, value),
+                            index=(
+                                external_options.index(current_related)
+                                if current_related in external_options else None
+                            ),
+                            placeholder="请选择关联单位",
+                            key=f"related_unit_{selected_emp_id}_{selected_relation_type}",
+                        ) if external_options else None
+                        actual_work_unit = st.selectbox(
+                            "实际工作单位（不填则同关联单位）", external_options,
+                            format_func=lambda value: entity_names.get(value, value),
+                            index=external_options.index(current_actual) if current_actual in external_options else (
+                                external_options.index(related_unit) if related_unit in external_options else None
+                            ),
+                            placeholder="默认与关联单位一致",
+                            key=f"actual_unit_{selected_emp_id}_{selected_relation_type}",
+                        ) if external_options else None
+                    with c2:
+                        if selected_relation_type == relation_type:
+                            default_payroll = int(arrangement.get('payroll_included', 1))
+                            default_labor = int(arrangement.get('labor_cost_included', 1))
+                        else:
+                            default_payroll = 0 if selected_relation_type in {'proxy_social', 'down_secondment'} else 1
+                            default_labor = 0 if selected_relation_type in {'proxy_social', 'down_secondment'} else 1
+                        payroll_included = st.checkbox(
+                            "工资由本系统发放", value=bool(default_payroll),
+                            key=f"payroll_scope_{selected_emp_id}_{selected_relation_type}",
+                        )
+                        labor_cost_included = st.checkbox(
+                            "计入本单位人工成本", value=bool(default_labor),
+                            key=f"labor_scope_{selected_emp_id}_{selected_relation_type}",
+                        )
+                        if selected_relation_type in {'proxy_social', 'down_secondment'}:
+                            st.caption("该类人员默认两项都不勾选；只有政策明确改变时才手工开启。")
+                        if selected_relation_type == 'down_secondment':
+                            try:
+                                planned_default = pd.to_datetime(
+                                    arrangement.get('planned_end_date')
+                                ).date() if arrangement.get('planned_end_date') else start_value + relativedelta(years=2)
+                            except Exception:
+                                planned_default = start_value + relativedelta(years=2)
+                            planned_end = st.date_input(
+                                "计划结束日期", value=planned_default,
+                                key=f"planned_end_{selected_emp_id}_{selected_relation_type}",
+                            )
+                    document_no = st.text_input(
+                        "文件或协议编号",
+                        value=(
+                            "" if is_switching_situation
+                            else str(arrangement.get('source_document_no') or '')
+                        ),
+                        key=f"arrangement_document_{selected_emp_id}_{selected_relation_type}",
+                    )
+                    relation_remarks = st.text_area(
+                        "说明", value=(
+                            "" if is_switching_situation else str(arrangement.get('remarks') or '')
+                        ),
+                        placeholder="只写业务上需要记住的说明即可。",
+                        key=f"arrangement_remarks_{selected_emp_id}_{selected_relation_type}",
+                    )
+                elif selected_person['status'] == '挂靠人员':
+                    st.warning("该人员档案状态仍是“挂靠人员”。若要恢复普通人员，请先在人员档案中改为“在职”。")
+
+                if st.form_submit_button("保存人员情形", type="primary"):
+                    ok, msg = save_simple_arrangement({
+                        'emp_id': str(selected_emp_id),
+                        'arrangement_type': selected_relation_type,
+                        'related_branch_code': related_unit,
+                        'actual_work_unit_code': actual_work_unit,
+                        'start_date': start_value.isoformat(),
+                        'planned_end_date': planned_end.isoformat() if planned_end else None,
+                        'payroll_included': payroll_included,
+                        'labor_cost_included': labor_cost_included,
+                        'source_document_no': document_no,
+                        'remarks': relation_remarks,
+                    })
+                    if ok:
+                        set_msg_and_rerun(msg)
+                    else:
+                        st.error(msg)
+
+        st.write("### ② 当前待遇办理结果")
+        treatment_df = get_person_treatment_dataframe(str(selected_emp_id), target_month)
+        st.dataframe(
+            treatment_df[[
+                '项目', '是否缴纳', '办理单位', '成本归属', '系统处理结果', '规则来源'
+            ]],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        with st.expander("只修改一个特殊项目", expanded=False):
+            st.caption(
+                "只有和普通规则不同的项目才在这里设置。例如李峰林只需要设置“工伤保险”。"
+                "没有设置的项目自动沿用普通人员或该类人员规则。"
+            )
+            with st.form("simple_person_override_form"):
+                o1, o2, o3 = st.columns(3)
+                with o1:
+                    override_item = st.selectbox(
+                        "待遇项目", PERSON_TREATMENT_ITEMS,
+                        format_func=lambda value: INSURANCE_LABELS[value],
+                    )
+                    override_enabled = st.checkbox("本项目需要缴纳", value=True)
+                with o2:
+                    payer_options = entity_df['entity_code'].tolist()
+                    default_payer_index = payer_options.index('province_public') if 'province_public' in payer_options else 0
+                    override_payer = st.selectbox(
+                        "由谁实际办理缴费", payer_options,
+                        format_func=lambda value: entity_names.get(value, value),
+                        index=default_payer_index,
+                    )
+                    include_company_cost = st.checkbox("计入本单位人工成本", value=True)
+                with o3:
+                    external_cost_bearer = st.selectbox(
+                        "不计入本单位时，由谁承担", external_options,
+                        format_func=lambda value: entity_names.get(value, value),
+                        disabled=include_company_cost,
+                    ) if external_options else None
+                    override_from = st.text_input("生效月份", value=target_month, max_chars=7)
+                    has_override_end = st.checkbox("设置结束月份")
+                    override_to = st.text_input(
+                        "结束月份", value=target_month, max_chars=7,
+                        disabled=not has_override_end,
+                    )
+                override_reason = st.text_input(
+                    "特殊原因*", placeholder="例如：一建资质要求工资、合同、工伤缴费主体一致"
+                )
+                override_document = st.text_input("依据文件（可选）")
+                if st.form_submit_button("保存这个项目的特殊设置", type="primary"):
+                    ok, msg = save_person_social_override(
+                        str(selected_emp_id), override_item, override_from.strip(),
+                        override_enabled, override_payer, include_company_cost,
+                        external_cost_bearer, override_reason,
+                        override_to.strip() if has_override_end else None,
+                        override_document,
+                    )
+                    if ok:
+                        set_msg_and_rerun(msg)
+                    else:
+                        st.error(msg)
+
+        all_overrides = get_social_overrides_dataframe(active_only=True)
+        person_overrides = all_overrides[
+            all_overrides['emp_id'].astype(str) == str(selected_emp_id)
+        ] if not all_overrides.empty else pd.DataFrame()
+        if not person_overrides.empty:
+            with st.expander("查看或结束已有单项例外", expanded=False):
+                person_overrides = person_overrides.copy()
+                person_overrides['项目'] = person_overrides['insurance_item'].map(INSURANCE_LABELS)
+                person_overrides['办理单位'] = person_overrides['payer_entity_name']
+                person_overrides['成本归属'] = person_overrides['cost_bearer_name']
+                st.dataframe(
+                    person_overrides[[
+                        'override_id', '项目', 'effective_from_month', 'effective_to_month',
+                        '办理单位', '成本归属', 'special_reason'
+                    ]].rename(columns={
+                        'override_id': '编号', 'effective_from_month': '开始月',
+                        'effective_to_month': '结束月', 'special_reason': '原因',
+                    }),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+                with st.form("end_person_override_form"):
+                    override_ids = person_overrides['override_id'].astype(int).tolist()
+                    override_labels = {
+                        int(row['override_id']): f"{row['项目']}（{row['effective_from_month']}起）"
+                        for _, row in person_overrides.iterrows()
+                    }
+                    end_override_id = st.selectbox(
+                        "选择要结束的例外", override_ids,
+                        format_func=lambda value: override_labels[value],
+                    )
+                    end_override_month = st.text_input("结束月份", value=target_month, max_chars=7)
+                    if st.form_submit_button("保存结束月份"):
+                        ok, msg = end_person_social_override(end_override_id, end_override_month.strip())
+                        if ok:
+                            set_msg_and_rerun(msg)
+                        else:
+                            st.error(msg)
+
+        with st.expander("业务单位维护（新增地市或其他单位）", expanded=False):
+            st.caption("地市和承接单位可以随时新增；停用只影响以后选择，不删除历史记录。")
+            st.dataframe(
+                entity_df[['entity_name', 'entity_type', 'parent_entity_name']].rename(columns={
+                    'entity_name': '单位名称', 'entity_type': '单位类型',
+                    'parent_entity_name': '上级单位',
+                }),
+                use_container_width=True,
+                hide_index=True,
+            )
+            with st.form("simple_entity_form"):
+                ec1, ec2 = st.columns(2)
+                with ec1:
+                    new_entity_name = st.text_input("新单位名称")
+                with ec2:
+                    new_entity_type = st.selectbox("单位类型", ["地市分公司", "其他承接单位"])
+                if st.form_submit_button("新增单位"):
+                    ok, msg = create_business_entity(new_entity_name, new_entity_type, 'province_company')
+                    if ok:
+                        set_msg_and_rerun(msg)
+                    else:
+                        st.error(msg)
+
+    with default_rules_tab:
+        st.subheader("下沉/地市转入默认待遇规则")
+        st.info(
+            "这里维护一类人员的统一默认值。以后新增或调整为该情形的人员会自动套用；"
+            "已经生效的同类人员也会从所选月份开始采用新版本。个人特殊设置优先级最高，不会被覆盖。"
+        )
+        rule_month = st.text_input(
+            "查看和设置月份", value=date.today().strftime('%Y-%m'),
+            max_chars=7, key="special_default_rule_month",
+        )
+        rule_type = st.radio(
+            "人员情形", ['down_secondment', 'city_transfer'], horizontal=True,
+            format_func=lambda value: ARRANGEMENT_LABELS[value],
+            key="special_default_rule_type",
+        )
+        if rule_type == 'down_secondment':
+            st.caption(
+                "省公司文件默认：养老、年金由省公司集中办理；失业、工伤由下沉地市办理；"
+                "医疗、生育、公积金由省公众办理。全部费用由下沉地市承担。"
+            )
+        else:
+            st.caption(
+                "当前默认：养老、医疗、失业、工伤、生育由省公众办理；"
+                "住房公积金、企业年金由原单位办理；全部计入本单位人工成本。"
+            )
+
+        default_rule_df = get_arrangement_route_defaults(rule_type, rule_month)
+        if default_rule_df.empty:
+            st.warning("当前月份没有可用的默认规则，请在下方建立第一条规则。")
+        else:
+            st.dataframe(
+                default_rule_df[[
+                    '项目', '默认办理', '办理单位', '成本归属',
+                    '系统处理', '生效月份', '说明',
+                ]],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        edit_rule_item = st.selectbox(
+            "选择要调整的项目", PERSON_TREATMENT_ITEMS,
+            format_func=lambda value: INSURANCE_LABELS[value],
+            key=f"default_rule_item_{rule_type}",
+        )
+        current_rule_rows = (
+            default_rule_df[default_rule_df['insurance_item'] == edit_rule_item]
+            if not default_rule_df.empty else pd.DataFrame()
+        )
+        current_rule = current_rule_rows.iloc[0] if not current_rule_rows.empty else None
+        payer_choices = ['province_public', 'province_company', 'related_branch']
+        payer_labels = {
+            'province_public': '省公众',
+            'province_company': '省公司',
+            'related_branch': '关联地市/原单位',
+        }
+        current_payer = (
+            current_rule['payer_choice']
+            if current_rule is not None and current_rule['payer_choice'] in payer_choices
+            else ('province_public' if rule_type == 'city_transfer' else 'related_branch')
+        )
+        with st.form(f"special_default_rule_form_{rule_type}_{edit_rule_item}"):
+            rc1, rc2, rc3 = st.columns(3)
+            with rc1:
+                rule_enabled = st.checkbox(
+                    "该项目默认需要办理",
+                    value=(
+                        current_rule is None or current_rule['默认办理'] == '是'
+                    ),
+                )
+            with rc2:
+                rule_payer = st.selectbox(
+                    "默认由谁办理", payer_choices,
+                    format_func=lambda value: payer_labels[value],
+                    index=payer_choices.index(current_payer),
+                )
+            with rc3:
+                rule_company_cost = st.checkbox(
+                    "计入本单位人工成本",
+                    value=(
+                        bool(current_rule['include_company_cost'])
+                        if current_rule is not None else rule_type == 'city_transfer'
+                    ),
+                )
+            rule_effective_month = st.text_input(
+                "新规则生效月份", value=rule_month, max_chars=7
+            )
+            rule_remarks = st.text_input(
+                "依据或说明（可选）",
+                value=str(current_rule['说明']) if current_rule is not None else "",
+            )
+            if st.form_submit_button("保存这一项默认规则", type="primary"):
+                ok, msg = save_arrangement_route_default(
+                    rule_type, edit_rule_item, rule_enabled, rule_payer,
+                    rule_company_cost, rule_effective_month.strip(), rule_remarks,
+                )
+                if ok:
+                    set_msg_and_rerun(msg)
+                else:
+                    st.error(msg)
+
+# 旧版复杂入口保留在代码中用于兼容，但不再出现在导航中。
 elif current_page == "🔄 特殊用工与结算关系":
     st.subheader("🔄 特殊用工、实际工作与成本结算关系")
     st.info(
