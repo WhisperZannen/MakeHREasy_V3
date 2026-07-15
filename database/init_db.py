@@ -7,6 +7,7 @@
 import sqlite3
 import os
 import uuid
+import json
 
 def ensure_payroll_schema_patch(cursor):
     """
@@ -874,6 +875,356 @@ def ensure_finance_labor_schema(cursor):
         )
     ''')
 
+def ensure_payroll_rule_dictionary_schema(cursor):
+    """建立按生效月份维护的薪酬总阀门，不切换既有月度算薪引擎。"""
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS payroll_rule_versions (
+            rule_version_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            rule_name TEXT NOT NULL,
+            effective_from_month TEXT NOT NULL,
+            effective_to_month TEXT,
+            status TEXT NOT NULL DEFAULT 'draft',
+            original_perf_base REAL NOT NULL DEFAULT 1500,
+            incentive_base REAL NOT NULL DEFAULT 3000,
+            remarks TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(rule_name, effective_from_month)
+        )
+    ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS payroll_salary_matrix_rules (
+            rule_version_id INTEGER NOT NULL,
+            post_rank INTEGER NOT NULL,
+            post_grade TEXT NOT NULL,
+            amount REAL NOT NULL,
+            PRIMARY KEY(rule_version_id, post_rank, post_grade),
+            FOREIGN KEY(rule_version_id) REFERENCES payroll_rule_versions(rule_version_id)
+        )
+    ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS payroll_original_perf_rules (
+            rule_version_id INTEGER NOT NULL,
+            employee_category TEXT NOT NULL,
+            post_rank INTEGER NOT NULL,
+            coefficient REAL,
+            PRIMARY KEY(rule_version_id, employee_category, post_rank),
+            FOREIGN KEY(rule_version_id) REFERENCES payroll_rule_versions(rule_version_id)
+        )
+    ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS payroll_management_incentive_rules (
+            rule_version_id INTEGER NOT NULL,
+            management_role TEXT NOT NULL,
+            coefficient REAL NOT NULL,
+            PRIMARY KEY(rule_version_id, management_role),
+            FOREIGN KEY(rule_version_id) REFERENCES payroll_rule_versions(rule_version_id)
+        )
+    ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS payroll_derived_management_rules (
+            rule_version_id INTEGER NOT NULL,
+            special_role TEXT NOT NULL,
+            base_management_role TEXT NOT NULL,
+            multiplier REAL NOT NULL,
+            remarks TEXT,
+            PRIMARY KEY(rule_version_id, special_role),
+            FOREIGN KEY(rule_version_id) REFERENCES payroll_rule_versions(rule_version_id)
+        )
+    ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS payroll_position_value_rules (
+            rule_version_id INTEGER NOT NULL,
+            official_position_name TEXT NOT NULL,
+            base_coefficient REAL,
+            t1_coefficient REAL,
+            t2_coefficient REAL,
+            t3_coefficient REAL,
+            t4_coefficient REAL,
+            t5_coefficient REAL,
+            source_order INTEGER DEFAULT 999,
+            remarks TEXT,
+            PRIMARY KEY(rule_version_id, official_position_name),
+            FOREIGN KEY(rule_version_id) REFERENCES payroll_rule_versions(rule_version_id)
+        )
+    ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS payroll_company_leader_rules (
+            rule_version_id INTEGER NOT NULL,
+            leader_position_name TEXT NOT NULL,
+            standard_amount REAL,
+            remarks TEXT,
+            PRIMARY KEY(rule_version_id, leader_position_name),
+            FOREIGN KEY(rule_version_id) REFERENCES payroll_rule_versions(rule_version_id)
+        )
+    ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS payroll_position_rule_mappings (
+            rule_version_id INTEGER NOT NULL,
+            pos_id INTEGER NOT NULL,
+            payroll_category TEXT NOT NULL DEFAULT 'unclassified',
+            management_role TEXT,
+            official_position_name TEXT,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            remarks TEXT,
+            PRIMARY KEY(rule_version_id, pos_id),
+            FOREIGN KEY(rule_version_id) REFERENCES payroll_rule_versions(rule_version_id),
+            FOREIGN KEY(pos_id) REFERENCES positions(pos_id)
+        )
+    ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS payroll_person_calculation_overrides (
+            override_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            rule_version_id INTEGER NOT NULL,
+            emp_id TEXT NOT NULL,
+            calculation_mode TEXT NOT NULL,
+            counterparty_name TEXT,
+            remarks TEXT,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(rule_version_id, emp_id),
+            FOREIGN KEY(rule_version_id) REFERENCES payroll_rule_versions(rule_version_id),
+            FOREIGN KEY(emp_id) REFERENCES employees(emp_id)
+        )
+    ''')
+    cursor.execute('''
+        CREATE INDEX IF NOT EXISTS idx_payroll_rule_versions_effective
+        ON payroll_rule_versions(effective_from_month, effective_to_month, status)
+    ''')
+
+    existing = cursor.execute(
+        "SELECT rule_version_id FROM payroll_rule_versions ORDER BY rule_version_id LIMIT 1"
+    ).fetchone()
+    if existing:
+        _apply_confirmed_payroll_rule_upgrades(cursor)
+        return
+
+    cursor.execute('''
+        INSERT INTO payroll_rule_versions(
+            rule_name, effective_from_month, status,
+            original_perf_base, incentive_base, remarks
+        ) VALUES ('2026年薪酬基础规则', '2026-07', 'draft', 1500, 3000,
+                  '依据工资规则PDF建立；启用前须完成岗位差异确认。')
+    ''')
+    version_id = cursor.lastrowid
+
+    dict_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        'payroll_dicts.json',
+    )
+    if os.path.exists(dict_path):
+        with open(dict_path, 'r', encoding='utf-8') as source:
+            salary_matrix = json.load(source).get('salary_matrix', {})
+        salary_rows = []
+        for rank, grades in salary_matrix.items():
+            for grade, amount in grades.items():
+                salary_rows.append((version_id, int(float(rank)), str(grade), float(amount)))
+        cursor.executemany('''
+            INSERT INTO payroll_salary_matrix_rules(
+                rule_version_id, post_rank, post_grade, amount
+            ) VALUES (?, ?, ?, ?)
+        ''', salary_rows)
+
+    professional_coefficients = {
+        20: 2.8, 19: 2.6, 18: 2.5, 17: 2.3, 16: 2.2,
+        15: 2.1, 14: 1.9, 13: 1.8, 12: 1.7, 11: 1.6,
+    }
+    original_rows = [
+        (version_id, 'professional', rank, coefficient)
+        for rank, coefficient in professional_coefficients.items()
+    ]
+    original_rows.extend(
+        (version_id, category, rank, coefficient)
+        for category, coefficient in (
+            ('management_director', 2.9),
+            ('management_deputy', 2.4),
+        )
+        for rank in range(1, 29)
+    )
+    cursor.executemany('''
+        INSERT INTO payroll_original_perf_rules(
+            rule_version_id, employee_category, post_rank, coefficient
+        ) VALUES (?, ?, ?, ?)
+    ''', original_rows)
+
+    cursor.executemany('''
+        INSERT INTO payroll_management_incentive_rules(
+            rule_version_id, management_role, coefficient
+        ) VALUES (?, ?, ?)
+    ''', [
+        (version_id, 'management_director', 2.5),
+        (version_id, 'management_deputy', 2.0),
+        (version_id, 'management_assistant', 1.8),
+    ])
+
+    position_value_rows = [
+        ('解决方案经理', 1.1, 1.1, 1.2, 1.4, 1.7, 2.3),
+        ('体系赋能员-综合管理岗', 1.0, 1.0, 1.1, 1.3, None, None),
+        ('体系赋能员-商务助理岗', 1.0, 1.0, 1.1, 1.3, None, None),
+        ('体系赋能员-项目助理岗', 1.0, 1.0, 1.1, 1.3, None, None),
+        ('体系赋能员-体系运营岗', 1.0, 1.0, 1.1, 1.3, None, None),
+        ('系统架构师', 1.4, None, 1.5, 1.7, 2.0, 2.6),
+        ('产品设计师', 1.2, None, 1.3, 1.5, 1.8, 2.4),
+        ('UI设计工程师', 1.0, 1.0, 1.1, 1.3, 1.6, None),
+        ('应用研发工程师', 1.2, 1.2, 1.3, 1.5, 1.8, 2.4),
+        ('大数据研发工程师', 1.2, 1.2, 1.3, 1.5, 1.8, 2.4),
+        ('AI研发工程师', 1.3, 1.3, 1.4, 1.6, 1.9, 2.5),
+        ('测试工程师', 1.1, 1.1, 1.2, 1.4, 1.7, None),
+        ('项目经理', 1.2, None, 1.3, 1.5, 1.8, 2.4),
+        ('安全工程师', 1.2, 1.2, 1.3, 1.5, 1.8, 2.4),
+        ('网络工程师', 1.1, 1.1, 1.2, 1.4, 1.7, 2.3),
+        ('系统工程师', 1.1, 1.1, 1.2, 1.4, 1.7, 2.3),
+        ('运维工程师', 1.0, 1.0, 1.1, 1.3, 1.6, None),
+        ('管控岗1', 1.2, 1.2, 1.3, 1.5, 1.8, None),
+        ('管控岗2', 1.0, 1.0, 1.1, 1.3, None, None),
+    ]
+    cursor.executemany('''
+        INSERT INTO payroll_position_value_rules(
+            rule_version_id, official_position_name, base_coefficient,
+            t1_coefficient, t2_coefficient, t3_coefficient,
+            t4_coefficient, t5_coefficient, source_order
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ''', [
+        (version_id, name, base, t1, t2, t3, t4, t5, index)
+        for index, (name, base, t1, t2, t3, t4, t5)
+        in enumerate(position_value_rows, start=1)
+    ])
+
+    cursor.executemany('''
+        INSERT INTO payroll_company_leader_rules(
+            rule_version_id, leader_position_name, standard_amount, remarks
+        ) VALUES (?, ?, NULL, '等待省公司下发标准')
+    ''', [
+        (version_id, '总经理'),
+        (version_id, '副总经理'),
+        (version_id, '总经理助理兼安全主任'),
+    ])
+
+    position_rows = cursor.execute(
+        "SELECT pos_id, pos_name FROM positions WHERE status = 1"
+    ).fetchall()
+    management_roles = {
+        '主任': 'management_director',
+        '总监': 'management_director',
+        '副主任': 'management_deputy',
+        '副总监': 'management_deputy',
+        '主任助理': 'management_assistant',
+    }
+    leader_names = {'总经理', '副总经理', '总经理助理兼安全主任'}
+    official_names = {row[0] for row in position_value_rows}
+    mapping_rows = []
+    for pos_id, pos_name in position_rows:
+        if pos_name in leader_names:
+            category, role, official_name = 'company_leader', None, None
+        elif pos_name in management_roles:
+            category, role, official_name = 'management', management_roles[pos_name], None
+        elif pos_name in official_names:
+            category, role, official_name = 'professional', None, pos_name
+        else:
+            category, role, official_name = 'unclassified', None, None
+        mapping_rows.append(
+            (version_id, pos_id, category, role, official_name, 1)
+        )
+    cursor.executemany('''
+        INSERT INTO payroll_position_rule_mappings(
+            rule_version_id, pos_id, payroll_category,
+            management_role, official_position_name, enabled
+        ) VALUES (?, ?, ?, ?, ?, ?)
+    ''', mapping_rows)
+    _apply_confirmed_payroll_rule_upgrades(cursor)
+
+
+def _apply_confirmed_payroll_rule_upgrades(cursor):
+    """只补仍未归类的岗位，不覆盖用户已在总阀门确认过的映射。"""
+    version_ids = [
+        row[0] for row in cursor.execute(
+            'SELECT rule_version_id FROM payroll_rule_versions'
+        ).fetchall()
+    ]
+    professional_aliases = {
+        '售前支撑经理-解决方案经理': '解决方案经理',
+        '体系赋能员-商务助理': '体系赋能员-商务助理岗',
+        '体系赋能员-项目助理': '体系赋能员-项目助理岗',
+        '体系赋能员-体系运营': '体系赋能员-体系运营岗',
+        '系统架构师-技术总监': '系统架构师',
+        '产品设计师-UI': 'UI设计工程师',
+        '研发工程师-应用': '应用研发工程师',
+        '研发工程师-大数据': '大数据研发工程师',
+        '研发工程师-AI': 'AI研发工程师',
+    }
+    control_group_1 = {
+        '档案与机要',
+        '初级产品经理',
+        '中级产品经理',
+        '劳动用工与员工队伍建设',
+        '全面预算与分析',
+    }
+    control_group_2 = {
+        '安全与保卫', '采购管理', '党建管理', '档案与发票管理',
+        '法律事务', '工会管理', '合规风控（保密员）', '会计核算',
+        '纪检与信访', '教育培训与人才队伍建设', '客户经理',
+        '业务流程管理', '业务流程支撑', '业务管理', '业务价值管理',
+        '信息与安全', '网信安管理', '资金收入管理', 'IT需求与应用管理',
+    }
+    for version_id in version_ids:
+        cursor.execute('''
+            INSERT OR IGNORE INTO payroll_derived_management_rules(
+                rule_version_id, special_role, base_management_role,
+                multiplier, remarks
+            ) VALUES (?, 'senior_advisor', 'management_director', 0.8,
+                      '高级顾问按管理正职绩效基数的80%执行')
+        ''', (version_id,))
+
+        for system_name, official_name in professional_aliases.items():
+            cursor.execute('''
+                UPDATE payroll_position_rule_mappings
+                SET payroll_category = 'professional', management_role = NULL,
+                    official_position_name = ?
+                WHERE rule_version_id = ?
+                  AND pos_id = (SELECT pos_id FROM positions WHERE pos_name = ?)
+                  AND payroll_category = 'unclassified'
+            ''', (official_name, version_id, system_name))
+        for system_name in control_group_1:
+            cursor.execute('''
+                UPDATE payroll_position_rule_mappings
+                SET payroll_category = 'professional', management_role = NULL,
+                    official_position_name = '管控岗1'
+                WHERE rule_version_id = ?
+                  AND pos_id = (SELECT pos_id FROM positions WHERE pos_name = ?)
+                  AND payroll_category = 'unclassified'
+            ''', (version_id, system_name))
+        for system_name in control_group_2:
+            cursor.execute('''
+                UPDATE payroll_position_rule_mappings
+                SET payroll_category = 'professional', management_role = NULL,
+                    official_position_name = '管控岗2'
+                WHERE rule_version_id = ?
+                  AND pos_id = (SELECT pos_id FROM positions WHERE pos_name = ?)
+                  AND payroll_category = 'unclassified'
+            ''', (version_id, system_name))
+        cursor.execute('''
+            UPDATE payroll_position_rule_mappings
+            SET payroll_category = 'management',
+                management_role = 'senior_advisor', official_position_name = NULL
+            WHERE rule_version_id = ?
+              AND pos_id = (SELECT pos_id FROM positions WHERE pos_name = '高级顾问')
+              AND payroll_category = 'unclassified'
+        ''', (version_id,))
+
+        weiwei = cursor.execute(
+            "SELECT emp_id FROM employees WHERE name = '魏巍' LIMIT 1"
+        ).fetchone()
+        if weiwei:
+            cursor.execute('''
+                INSERT OR IGNORE INTO payroll_person_calculation_overrides(
+                    rule_version_id, emp_id, calculation_mode,
+                    counterparty_name, remarks, enabled
+                ) VALUES (?, ?, 'external_notice', '黄石分公司',
+                          '工资按黄石分公司每月来函要求核定，不套系统自动公式', 1)
+            ''', (version_id, weiwei[0]))
+
+
 def init_database(db_path=None):
     # 获取当前脚本所在绝对路径，拼接数据库文件路径，防止生成的数据库文件位置错乱
     current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -1647,6 +1998,7 @@ def init_database(db_path=None):
         ensure_social_policy_versions_schema(cursor)
         ensure_work_arrangement_schema(cursor)
         ensure_finance_labor_schema(cursor)
+        ensure_payroll_rule_dictionary_schema(cursor)
 
         conn.commit()
         print("✅ V3.6 用工关系、社保路由与结算底座初始化成功！")

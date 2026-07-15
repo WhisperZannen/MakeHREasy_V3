@@ -14,6 +14,32 @@ import datetime
 from modules.core_social_security import _get_db_connection
 from modules.core_arrangements import get_effective_arrangement
 from modules.core_identity import resolve_employee_reference
+from modules.core_payroll_rules import (
+    CATEGORY_CODES,
+    CATEGORY_LABELS,
+    ROLE_CODES,
+    ROLE_LABELS,
+    RULE_STATUS_LABELS,
+    activate_rule_version,
+    calculate_rule_preview,
+    copy_rule_version,
+    get_company_leader_rules,
+    get_management_incentive_rules,
+    get_original_perf_rules,
+    get_person_calculation_overrides,
+    get_position_mappings,
+    get_position_value_rules,
+    get_rule_versions,
+    get_salary_matrix,
+    save_company_leader_rules,
+    save_management_incentive_rules,
+    save_original_perf_rules,
+    save_position_mappings,
+    save_position_value_rules,
+    save_salary_matrix,
+    update_rule_version,
+    validate_rule_version,
+)
 
 st.set_page_config(page_title="薪酬核算与发放", layout="wide")
 
@@ -1924,57 +1950,323 @@ with tab4:
 # Tab 5: 全局参数与薪酬字典
 # ------------------------------------------------------------------------------
 with tab5:
-    st.subheader("🛠️ 非线性薪酬矩阵与算力参数")
-    st.info("💡 这是系统『智能算钱引擎』的心脏！这里的参数完全从你上传的PDF规则中原汁原味破译而来。")
+    st.subheader("⚙️ 薪酬规则总阀门")
+    st.caption(
+        "先维护规则、完成岗位归类并通过试算，再接入正式月度算薪。"
+        "本页不会回写已经生成的历史工资。"
+    )
 
-    c_p1, c_p2 = st.columns([1.5, 1])
+    rule_versions = get_rule_versions()
+    if rule_versions.empty:
+        st.error("没有可用的薪酬规则版本，请先执行数据库初始化。")
+        st.stop()
 
-    with c_p1:
-        st.write("💰 **1. 岗位工资二维矩阵 (行:岗级, 列:档次)**")
-        df_matrix = pd.DataFrame.from_dict(curr_dicts["salary_matrix"], orient='index')
-        df_matrix.index.name = "岗级"
-        df_matrix.reset_index(inplace=True)
-        df_matrix["岗级数值"] = pd.to_numeric(df_matrix["岗级"])
-        df_matrix = df_matrix.sort_values(by="岗级数值", ascending=False).drop(columns=["岗级数值"])
-        edited_matrix = st.data_editor(df_matrix, use_container_width=True, hide_index=True)
+    version_options = rule_versions['rule_version_id'].astype(int).tolist()
+    version_labels = {
+        int(row['rule_version_id']): (
+            f"{row['rule_name']}｜{row['effective_from_month']}生效｜"
+            f"{RULE_STATUS_LABELS.get(row['status'], row['status'])}"
+        )
+        for _, row in rule_versions.iterrows()
+    }
+    selected_version_id = st.selectbox(
+        "当前维护的规则版本",
+        version_options,
+        format_func=lambda value: version_labels.get(value, str(value)),
+    )
+    selected_version = rule_versions[
+        rule_versions['rule_version_id'] == selected_version_id
+    ].iloc[0]
 
-    with c_p2:
-        st.write("🚀 **2. 绩效标准 (包含手写基数)**")
-        df_perf = pd.DataFrame.from_dict(curr_dicts["perf_matrix"], orient='index')
-        df_perf.index.name = "岗级"
-        df_perf.reset_index(inplace=True)
-        df_perf.rename(columns={"base": "绩效基数(手写值)", "coef": "绩效系数"}, inplace=True)
-        df_perf["岗级数值"] = pd.to_numeric(df_perf["岗级"])
-        df_perf = df_perf.sort_values(by="岗级数值", ascending=False).drop(columns=["岗级数值"])
-        edited_perf = st.data_editor(df_perf, use_container_width=True, hide_index=True)
+    validation_df = validate_rule_version(selected_version_id)
+    passed_count = int(validation_df['通过'].sum())
+    v1, v2, v3, v4 = st.columns(4)
+    v1.metric("规则状态", RULE_STATUS_LABELS.get(selected_version['status'], selected_version['status']))
+    v2.metric("原绩效基础金额", f"{selected_version['original_perf_base']:,.2f}")
+    v3.metric("激励包基础金额", f"{selected_version['incentive_base']:,.2f}")
+    v4.metric("规则检查", f"{passed_count}/{len(validation_df)} 通过")
 
-        st.write("🏅 **3. T序列激励包与专家津贴**")
-        df_t = pd.DataFrame(list(curr_dicts["t_level_map"].items()), columns=["级别", "金额"])
-        edited_t = st.data_editor(df_t, num_rows="dynamic", use_container_width=True, hide_index=True)
+    with st.expander("新建下一版本（从当前版本复制）"):
+        nc1, nc2 = st.columns(2)
+        with nc1:
+            copied_rule_name = st.text_input("新版本名称", value="下一版薪酬规则")
+        with nc2:
+            copied_effective_month = st.text_input("新版本生效月份", value="2027-01")
+        if st.button("复制为新草稿版本"):
+            ok, msg = copy_rule_version(
+                selected_version_id, copied_rule_name, copied_effective_month
+            )
+            if ok:
+                st.success(msg)
+                st.rerun()
+            else:
+                st.error(msg)
 
-    if st.button("💾 覆盖保存全量薪酬字典 (高危操作)", type="primary"):
-        try:
-            new_salary_matrix = {}
-            for _, row in edited_matrix.iterrows():
-                rank = str(row["岗级"])
-                new_salary_matrix[rank] = {col: row[col] for col in edited_matrix.columns if
-                                           col != "岗级" and not pd.isna(row[col])}
+    rule_tab1, rule_tab2, rule_tab3, rule_tab4, rule_tab5 = st.tabs([
+        "① 基础参数与检查",
+        "② 岗位工资",
+        "③ 原绩效",
+        "④ 激励包",
+        "⑤ 岗位归类与试算",
+    ])
 
-            new_perf_matrix = {}
-            for _, row in edited_perf.iterrows():
-                rank = str(row["岗级"])
-                new_perf_matrix[rank] = {"base": float(row["绩效基数(手写值)"]), "coef": float(row["绩效系数"])}
+    with rule_tab1:
+        st.write("#### 基础金额和生效时间")
+        with st.form(f"payroll_rule_base_{selected_version_id}"):
+            rb1, rb2 = st.columns(2)
+            with rb1:
+                rule_name_input = st.text_input(
+                    "规则名称", value=str(selected_version['rule_name'])
+                )
+                effective_month_input = st.text_input(
+                    "生效月份", value=str(selected_version['effective_from_month'])
+                )
+            with rb2:
+                original_base_input = st.number_input(
+                    "原绩效基础金额",
+                    min_value=0.0, step=100.0,
+                    value=float(selected_version['original_perf_base']),
+                )
+                incentive_base_input = st.number_input(
+                    "激励包基础金额",
+                    min_value=0.0, step=100.0,
+                    value=float(selected_version['incentive_base']),
+                )
+            remarks_input = st.text_area(
+                "规则说明", value=str(selected_version.get('remarks') or '')
+            )
+            if st.form_submit_button("保存基础参数", type="primary"):
+                ok, msg = update_rule_version(
+                    selected_version_id, rule_name_input, effective_month_input,
+                    original_base_input, incentive_base_input, remarks_input,
+                )
+                if ok:
+                    st.success(msg)
+                    st.rerun()
+                else:
+                    st.error(msg)
 
-            new_t_map = {str(row["级别"]).strip(): float(row["金额"]) for _, row in edited_t.iterrows() if
-                         str(row["级别"]).strip()}
+        st.write("#### 启用前检查")
+        checks_display = validation_df.copy()
+        checks_display['状态'] = checks_display['通过'].map({True: '通过', False: '待处理'})
+        st.dataframe(
+            checks_display[['检查项', '状态', '结果']],
+            use_container_width=True, hide_index=True,
+        )
+        if not validation_df['通过'].all():
+            st.warning("仍有待处理项。本版本保持草稿，不会成为正式算薪规则。")
+        if st.button(
+            "启用当前规则版本",
+            disabled=not validation_df['通过'].all(),
+            type="primary",
+        ):
+            ok, msg = activate_rule_version(selected_version_id)
+            if ok:
+                st.success(msg)
+                st.rerun()
+            else:
+                st.error(msg)
 
-            new_dicts = {
-                "salary_matrix": new_salary_matrix,
-                "perf_matrix": new_perf_matrix,
-                "t_level_map": new_t_map,
-                "expert_allowance": curr_dicts.get("expert_allowance", {})
-            }
-            save_payroll_dicts(new_dicts)
-            st.success("✅ 二维算力矩阵更新成功！")
-        except Exception as e:
-            st.error(f"❌ 数据格式错误，保存失败: {e}")
+    with rule_tab2:
+        st.write("#### 岗位工资：岗级 × A-J档")
+        st.caption("来源于PDF附件2，共28个岗级、10个档次。")
+        salary_matrix_df = get_salary_matrix(selected_version_id)
+        edited_salary_matrix = st.data_editor(
+            salary_matrix_df,
+            use_container_width=True,
+            hide_index=True,
+            disabled=['岗级'],
+            key=f"salary_matrix_{selected_version_id}",
+        )
+        if st.button("保存岗位工资表", key=f"save_salary_{selected_version_id}"):
+            ok, msg = save_salary_matrix(selected_version_id, edited_salary_matrix)
+            st.success(msg) if ok else st.error(msg)
+
+    with rule_tab3:
+        st.write("#### 原绩效：1500 × 系数")
+        st.caption(
+            "专业岗位按文件中的11-20级维护；管理正职和管理副职按1-28级逐级维护。"
+            "当前正职均为2.9，副职均为2.4。"
+        )
+        original_perf_df = get_original_perf_rules(selected_version_id)
+        edited_original_perf = st.data_editor(
+            original_perf_df,
+            use_container_width=True,
+            hide_index=True,
+            disabled=['岗级'],
+            column_config={
+                '专业岗位系数': st.column_config.NumberColumn(format="%.2f"),
+                '管理正职系数': st.column_config.NumberColumn(format="%.2f"),
+                '管理副职系数': st.column_config.NumberColumn(format="%.2f"),
+            },
+            key=f"original_perf_{selected_version_id}",
+        )
+        if st.button("保存原绩效系数", key=f"save_original_{selected_version_id}"):
+            ok, msg = save_original_perf_rules(
+                selected_version_id, edited_original_perf
+            )
+            st.success(msg) if ok else st.error(msg)
+
+        st.write("#### 公司领导绩效标准")
+        st.caption("公司领导不套普通系数，等待省公司标准后在这里填写。")
+        leader_rules_df = get_company_leader_rules(selected_version_id)
+        edited_leader_rules = st.data_editor(
+            leader_rules_df,
+            use_container_width=True,
+            hide_index=True,
+            disabled=['公司领导岗位'],
+            key=f"leader_rules_{selected_version_id}",
+        )
+        if st.button("保存公司领导标准", key=f"save_leader_{selected_version_id}"):
+            ok, msg = save_company_leader_rules(
+                selected_version_id, edited_leader_rules
+            )
+            st.success(msg) if ok else st.error(msg)
+
+    with rule_tab4:
+        st.write("#### 管理岗位激励包：3000 × 管理角色系数")
+        management_incentive_df = get_management_incentive_rules(selected_version_id)
+        edited_management_incentive = st.data_editor(
+            management_incentive_df,
+            use_container_width=True,
+            hide_index=True,
+            disabled=['management_role', '管理角色'],
+            column_config={'management_role': None},
+            key=f"management_incentive_{selected_version_id}",
+        )
+        if st.button("保存管理岗位激励包", key=f"save_management_pack_{selected_version_id}"):
+            ok, msg = save_management_incentive_rules(
+                selected_version_id, edited_management_incentive
+            )
+            st.success(msg) if ok else st.error(msg)
+
+        st.write("#### 专业岗位激励包：3000 × 岗位 × T级系数")
+        st.caption("空白表示文件中为“/”，该岗位不允许使用对应T级。")
+        position_value_df = get_position_value_rules(selected_version_id)
+        edited_position_value = st.data_editor(
+            position_value_df,
+            use_container_width=True,
+            hide_index=True,
+            disabled=['文件岗位', '文件序号'],
+            key=f"position_value_{selected_version_id}",
+        )
+        if st.button("保存专业岗位价值系数", key=f"save_position_value_{selected_version_id}"):
+            ok, msg = save_position_value_rules(
+                selected_version_id, edited_position_value
+            )
+            st.success(msg) if ok else st.error(msg)
+
+    with rule_tab5:
+        st.write("#### 系统岗位归类")
+        st.caption(
+            "这里不修改人员模块的岗位名称，只决定该岗位应该套用哪类薪酬规则。"
+            "名称有差异的岗位暂时保持“待归类”，等待业务确认。"
+        )
+        mapping_df = get_position_mappings(selected_version_id)
+        mapping_editor_df = mapping_df[[
+            '岗位ID', '系统岗位', '当前人数', '薪酬分类',
+            '管理角色', '对应文件岗位', '启用',
+        ]].copy()
+        official_position_options = [''] + position_value_df['文件岗位'].tolist()
+        role_options = [''] + list(ROLE_LABELS.values())
+        edited_mappings = st.data_editor(
+            mapping_editor_df,
+            use_container_width=True,
+            hide_index=True,
+            disabled=['岗位ID', '系统岗位', '当前人数'],
+            column_config={
+                '薪酬分类': st.column_config.SelectboxColumn(
+                    options=list(CATEGORY_LABELS.values()), required=True
+                ),
+                '管理角色': st.column_config.SelectboxColumn(options=role_options),
+                '对应文件岗位': st.column_config.SelectboxColumn(
+                    options=official_position_options
+                ),
+                '启用': st.column_config.CheckboxColumn(),
+            },
+            key=f"position_mapping_{selected_version_id}",
+        )
+        if st.button("保存岗位薪酬归类", key=f"save_mapping_{selected_version_id}"):
+            ok, msg = save_position_mappings(selected_version_id, edited_mappings)
+            if ok:
+                st.success(msg)
+                st.rerun()
+            else:
+                st.error(msg)
+
+        person_override_df = get_person_calculation_overrides(selected_version_id)
+        if not person_override_df.empty:
+            st.write("#### 个人特殊核定")
+            st.caption("此类人员不套岗位自动公式，由外部单位来函或其他正式依据核定。")
+            st.dataframe(
+                person_override_df,
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        st.divider()
+        st.write("#### 规则试算")
+        tc1, tc2, tc3 = st.columns(3)
+        with tc1:
+            trial_category_label = st.selectbox(
+                "薪酬分类",
+                ['专业岗位', '管理岗位', '公司领导'],
+                key=f"trial_category_{selected_version_id}",
+            )
+            trial_rank = st.number_input(
+                "岗级", min_value=1, max_value=28, value=17, step=1,
+                key=f"trial_rank_{selected_version_id}",
+            )
+        with tc2:
+            trial_grade = st.selectbox(
+                "档次", list('ABCDEFGHIJ'),
+                key=f"trial_grade_{selected_version_id}",
+            )
+            trial_role_label = None
+            if trial_category_label == '管理岗位':
+                trial_role_label = st.selectbox(
+                    "管理角色", list(ROLE_LABELS.values()),
+                    key=f"trial_role_{selected_version_id}",
+                )
+        with tc3:
+            trial_official_position = None
+            trial_tech_grade = None
+            trial_leader_position = None
+            if trial_category_label == '专业岗位':
+                trial_official_position = st.selectbox(
+                    "文件岗位", position_value_df['文件岗位'].tolist(),
+                    key=f"trial_position_{selected_version_id}",
+                )
+                trial_tech_grade = st.selectbox(
+                    "T级", ['T1', 'T2', 'T3', 'T4', 'T5'],
+                    key=f"trial_tech_{selected_version_id}",
+                )
+            elif trial_category_label == '公司领导':
+                trial_leader_position = st.selectbox(
+                    "公司领导岗位", leader_rules_df['公司领导岗位'].tolist(),
+                    key=f"trial_leader_{selected_version_id}",
+                )
+
+        trial_result = calculate_rule_preview(
+            selected_version_id,
+            trial_rank,
+            trial_grade,
+            CATEGORY_CODES[trial_category_label],
+            management_role=ROLE_CODES.get(trial_role_label),
+            official_position_name=trial_official_position,
+            tech_grade=trial_tech_grade,
+            leader_position_name=trial_leader_position,
+        )
+        pr1, pr2, pr3, pr4 = st.columns(4)
+        pr1.metric("岗位工资", f"{trial_result['岗位工资'] or 0:,.2f}")
+        pr2.metric("原绩效", f"{trial_result['原绩效'] or 0:,.2f}")
+        pr3.metric("激励包", f"{trial_result['激励包'] or 0:,.2f}")
+        pr4.metric("绩效基数", f"{trial_result['绩效基数'] or 0:,.2f}")
+        st.write(
+            f"原绩效：{trial_result['原绩效基础金额']:,.2f} × "
+            f"{trial_result['原绩效系数'] if trial_result['原绩效系数'] is not None else '未配置'}；"
+            f"激励包：{trial_result['激励包基础金额']:,.2f} × "
+            f"{trial_result['岗位价值系数'] if trial_result['岗位价值系数'] is not None else '未配置'}。"
+        )
+        for issue in trial_result['问题']:
+            st.warning(issue)
