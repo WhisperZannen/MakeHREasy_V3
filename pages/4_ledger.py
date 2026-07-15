@@ -29,7 +29,10 @@ from modules.core_labor_cost import (
     recalculate_labor_cost_columns, get_company_social_snapshot,
 )
 from modules.core_arrangements import get_effective_arrangement, is_labor_cost_included
-from modules.core_personnel import get_effective_department_snapshot
+from modules.core_personnel import (
+    classify_department_snapshot_change,
+    get_effective_department_snapshot,
+)
 from modules.core_identity import (
     get_employee_no,
     resolve_employee_reference,
@@ -1153,11 +1156,12 @@ with tab3:
     # ==========================================================
     # 小工具：刷新已导入台账的部门归属
     # ==========================================================
-    st.write("### 🧭 小工具：按人员变动刷新已导入台账部门归属")
+    st.write("### 🧭 小工具：按人员/组织变动刷新已导入台账部门归属")
 
     st.info(
         "这个工具只刷新已导入台账的【部门归属快照】，不会改任何金额。"
-        "适用于你已经导入人工成本后，才发现人员调动日期漏维护或维护晚了的情况。"
+        "适用于人员调动日期补录、部门改名，或者历史台账缺少部门ID的情况。"
+        "部门ID相同但名称不同，也会同步为人员模块中的最新部门名称。"
     )
 
     conn_refresh = _get_db_connection()
@@ -1234,11 +1238,12 @@ with tab3:
                         target_department = effective_dept_map.get(emp_id)
                         if not target_department:
                             continue
-                        new_dept_id = int(target_department['dept_id'])
-                        new_dept_name = target_department['dept_name']
-
-                        # 用部门ID判断真正的组织调动。仅仅改了部门名称时保留历史名称快照。
-                        if pd.isna(old_dept_id) or int(old_dept_id) != new_dept_id:
+                        snapshot_change = classify_department_snapshot_change(
+                            old_dept_id,
+                            old_dept_name,
+                            target_department,
+                        )
+                        if snapshot_change:
                             preview_rows.append({
                                 "流水ID": row["record_id"],
                                 "核算月份": row["cost_month"],
@@ -1246,8 +1251,9 @@ with tab3:
                                 "姓名": row["emp_name"],
                                 "当前台账部门": old_dept_name,
                                 "当前部门ID": old_dept_id,
-                                "应调整为部门": new_dept_name,
-                                "应调整为部门ID": new_dept_id,
+                                "应调整为部门": snapshot_change['new_dept_name'],
+                                "应调整为部门ID": snapshot_change['new_dept_id'],
+                                "调整原因": snapshot_change['reason'],
                                 "人员状态": row["emp_status"],
                                 "人工成本合计": row["total_labor_cost"],
                             })

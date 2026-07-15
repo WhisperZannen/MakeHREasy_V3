@@ -76,6 +76,42 @@ class DepartmentChangeTest(unittest.TestCase):
         self.assertEqual(july['D001']['dept_id'], self.old_dept)
         self.assertEqual(august['D001']['dept_id'], self.new_dept)
 
+    def test_department_rename_is_detected_for_ledger_snapshot_refresh(self):
+        from modules.core_personnel import (
+            classify_department_snapshot_change,
+            get_effective_department_snapshot,
+        )
+
+        conn = sqlite3.connect(self.db_path)
+        conn.execute(
+            "UPDATE departments SET dept_name='原部门（更名后）' WHERE dept_id=?",
+            (self.old_dept,),
+        )
+        conn.commit()
+        conn.close()
+
+        target = get_effective_department_snapshot('2026-07')['D001']
+        change = classify_department_snapshot_change(
+            self.old_dept,
+            '原部门',
+            target,
+        )
+
+        self.assertIsNotNone(change)
+        self.assertEqual(change['new_dept_id'], self.old_dept)
+        self.assertEqual(change['new_dept_name'], '原部门（更名后）')
+        self.assertEqual(change['reason'], '部门名称同步')
+
+    def test_unchanged_department_snapshot_does_not_refresh(self):
+        from modules.core_personnel import classify_department_snapshot_change
+
+        change = classify_department_snapshot_change(
+            self.old_dept,
+            '原部门',
+            {'dept_id': self.old_dept, 'dept_name': '原部门'},
+        )
+        self.assertIsNone(change)
+
 
 if __name__ == '__main__':
     unittest.main()

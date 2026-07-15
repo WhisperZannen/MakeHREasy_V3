@@ -441,6 +441,31 @@ def get_effective_department_snapshot(target_month, conn=None):
             conn.close()
 
 
+def classify_department_snapshot_change(old_dept_id, old_dept_name, target_department):
+    """判断人工成本台账的部门快照是否需要按当前组织档案刷新。"""
+    if not target_department:
+        return None
+
+    old_id = _normalize_rank_value(old_dept_id)
+    new_id = _normalize_rank_value(target_department.get('dept_id'))
+    old_name = _normalize_text(old_dept_name)
+    new_name = _normalize_text(target_department.get('dept_name'))
+    reasons = []
+
+    if old_id != new_id:
+        reasons.append("补齐部门ID" if not old_id else "人员归属调整")
+    if old_name != new_name:
+        reasons.append("部门名称同步")
+
+    if not reasons:
+        return None
+    return {
+        'new_dept_id': int(float(new_id)),
+        'new_dept_name': new_name,
+        'reason': "、".join(reasons),
+    }
+
+
 def batch_transfer_department_members(
     emp_ids,
     target_dept_id,
