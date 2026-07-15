@@ -68,6 +68,7 @@ from modules.core_arrangements import (
     save_normal_route_default,
     update_settlement_batch_status,
 )
+from modules.core_identity import resolve_employee_reference, resolve_internal_emp_id
 
 st.set_page_config(page_title="社保与福利结算", layout="wide")
 
@@ -176,7 +177,9 @@ with tab1:
         # [极致修复 1] 强力复刻人员模块的排序算法：部门权重 -> 岗位权重 -> 岗级(负数取反)
         detect_sql = """
             SELECT 
-                e.emp_id AS '工号', e.name AS '姓名', d.dept_name AS '部门', e.status AS '人事状态',
+                COALESCE(NULLIF(e.employee_no, ''), '待分配') AS '工号',
+                e.emp_id AS '__内部人员ID', e.name AS '姓名', e.id_card AS '身份证号',
+                d.dept_name AS '部门', e.status AS '人事状态',
                 IFNULL(m.cost_center, '本级') AS '财务归属', IFNULL(m.base_salary_avg, 0.0) AS '已录入原始基数',
                 IFNULL(m.fund_base_avg, 0.0) AS '独立公积金基数(选填)',
                 IFNULL(m.pension_enabled, 1) AS '养老参保(1是0否)', IFNULL(m.pension_account, '省公众') AS '养老缴纳主体',
@@ -200,23 +203,26 @@ with tab1:
                      ELSE IFNULL(d.sort_order, 999) END ASC,
                 IFNULL(pos.sort_order, 999) ASC,
                 CASE WHEN e.post_rank IS NOT NULL THEN -e.post_rank ELSE 9999.0 END ASC,
-                e.emp_id ASC
+                COALESCE(e.employee_no, e.emp_id) ASC
         """
         roster_df = pd.read_sql_query(detect_sql, conn)
     finally:
         conn.close()
 
     roster_export_df = roster_df[[
-        '工号', '姓名', '部门', '财务归属', '已录入原始基数', '独立公积金基数(选填)'
+        '工号', '姓名', '身份证号', '部门', '财务归属', '已录入原始基数', '独立公积金基数(选填)'
     ]].copy()
     conn_route_preview = _get_db_connection()
     try:
         roster_export_df.insert(
             3,
             '人员情形',
-            roster_export_df['工号'].astype(str).map(
+            roster_df['__内部人员ID'].astype(str).map(
                 lambda emp_id: ARRANGEMENT_LABELS.get(
-                    get_effective_arrangement(emp_id, calc_month, conn_route_preview).get(
+                    get_effective_arrangement(
+                        emp_id,
+                        calc_month, conn_route_preview
+                    ).get(
                         'arrangement_type', 'normal'
                     ),
                     '普通在职',
@@ -455,7 +461,8 @@ with tab1:
     with rc1:
         # [极致修复 3] 将表头命名为极其详细的白痴级规范，让使用者一眼就懂格式
         retro_cols = [
-            '处理月份(必填:YYYY-MM)', '工号(必填)', '补缴起始月(选填:YYYY-MM)', '补缴结束月(选填:YYYY-MM)',
+            '处理月份(必填:YYYY-MM)', '工号(可暂缺)', '姓名(工号暂缺时必填)', '身份证号(工号暂缺时建议填)',
+            '补缴起始月(选填:YYYY-MM)', '补缴结束月(选填:YYYY-MM)',
             '补缴险种(必选下拉框)', '企业本金合计', '个人本金合计', '企业承担滞纳金', '备注(原因等)'
         ]
         retro_template = pd.DataFrame(columns=retro_cols)
@@ -467,7 +474,7 @@ with tab1:
             format_excel_sheet(ws, retro_cols)
             # 对于日期要求的列特别标红提醒
             red_fill = PatternFill(start_color="FFCCCC", end_color="FFCCCC", fill_type="solid")
-            for i in [1, 3, 4]:  # 处理月份, 起始月, 结束月
+            for i in [1, 5, 6]:  # 处理月份, 起始月, 结束月
                 ws.cell(row=1, column=i).fill = red_fill
 
             from openpyxl.worksheet.datavalidation import DataValidation
@@ -476,7 +483,7 @@ with tab1:
                                 formula1='"养老保险,医疗保险,大病医疗,失业保险,工伤保险,生育保险,住房公积金,企业年金"',
                                 allow_blank=False)
             ws.add_data_validation(dv)
-            dv.add("E2:E1000")  # 在E列加上下拉框限制
+            dv.add("G2:G1000")  # 在G列加上下拉框限制
 
         st.download_button("📥 下载补缴与滞纳金专用模板 (已标明日历格式与下拉框)", data=retro_buffer.getvalue(),
                            file_name=f"补缴专用导入模板_{calc_month}.xlsx")
@@ -512,8 +519,13 @@ with tab1:
                     'annuity': ('annuity_enabled', 'annuity_account'),
                 }
                 for _, row in r_df.iterrows():
-                    eid = str(row.get('工号(必填)', '')).replace('.0', '').strip()
-                    if not eid or eid == 'nan': continue
+                    eid = resolve_employee_reference(
+                        employee_no=row.get('工号(可暂缺)', row.get('工号(必填)')),
+                        id_card=row.get('身份证号(工号暂缺时建议填)'),
+                        name=row.get('姓名(工号暂缺时必填)'),
+                        conn=conn,
+                    )
+                    if not eid: continue
                     process_month = str(row.get('处理月份(必填:YYYY-MM)', calc_month)).strip()
                     retro_type = str(row.get('补缴险种(必选下拉框)', '未知险种'))
                     item_code = retro_item_map.get(retro_type, 'pension')
@@ -777,13 +789,13 @@ with tab5:
             display_override['active'] = display_override['active'].map(ACTIVE_LABELS).fillna(display_override['active'])
             st.dataframe(
                 display_override[[
-                    'override_id', 'emp_name', 'emp_id', '险种', 'effective_from_month',
+                    'override_id', 'emp_name', 'employee_no', '险种', 'effective_from_month',
                     'effective_to_month', 'enabled', 'calculation_policy_entity_name',
                     'payer_entity_name', 'cost_bearer_name', 'settlement_counterparty_name',
                     'settlement_mode', 'settlement_cycle', 'amount_source',
                     'special_reason', 'source_document_no', 'active'
                 ]].rename(columns={
-                    'override_id': '例外ID', 'emp_name': '姓名', 'emp_id': '工号',
+                    'override_id': '例外ID', 'emp_name': '姓名', 'employee_no': '工号',
                     'effective_from_month': '生效月', 'effective_to_month': '失效月',
                     'enabled': '参保', 'calculation_policy_entity_name': '计算政策主体',
                     'payer_entity_name': '缴费主体', 'cost_bearer_name': '成本承担',
@@ -800,14 +812,14 @@ with tab5:
 
         conn_people = _get_db_connection()
         people_df = pd.read_sql_query(
-            "SELECT emp_id, name, status FROM employees WHERE status IN ('在职','挂靠人员') ORDER BY name",
+            "SELECT emp_id, employee_no, name, status FROM employees WHERE status IN ('在职','挂靠人员') ORDER BY name",
             conn_people
         )
         conn_people.close()
         people_options = people_df['emp_id'].astype(str).tolist()
         people_names = dict(zip(
             people_df['emp_id'].astype(str),
-            people_df.apply(lambda row: f"{row['name']}（{row['status']}）", axis=1)
+            people_df.apply(lambda row: f"{row['name']}（{row['employee_no'] or '工号待分配'}，{row['status']}）", axis=1)
         ))
 
         with st.expander("➕ 新增个人险种例外", expanded=False):
@@ -924,7 +936,7 @@ with tab2:
         conn = _get_db_connection()
 
         query = """
-            SELECT r.*, e.name AS '姓名'
+            SELECT r.*, e.employee_no, e.name AS '姓名'
             FROM ss_monthly_records r 
             LEFT JOIN employees e ON r.emp_id = e.emp_id 
             WHERE r.cost_month >= ? AND r.cost_month <= ?
@@ -932,7 +944,7 @@ with tab2:
         raw_df = pd.read_sql_query(query, conn, params=[s_m, e_m])
 
         retro_query = """
-            SELECT r.*, e.name AS '姓名',
+            SELECT r.*, e.employee_no, e.name AS '姓名',
                    COALESCE(cost_entity.entity_name, m.cost_center, '本级') AS 'cost_center',
                    payer_entity.entity_name AS 'retro_payer_name'
             FROM ss_retroactive_records r
@@ -950,7 +962,7 @@ with tab2:
             with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
 
                 rename_map = {
-                    'emp_id': '工号', 'cost_center': '财务归属',
+                    'employee_no': '工号', 'cost_center': '财务归属',
                     'pension_comp': '养老(企业)', 'pension_pers': '养老(个人)',
                     'medical_comp': '医疗(企业)', 'medical_pers': '医疗(个人)', 'medical_serious_pers': '大病(个人)',
                     'unemp_comp': '失业(企业)', 'unemp_pers': '失业(个人)',
@@ -1020,7 +1032,7 @@ with tab2:
                         if not df_channel.empty:
                             excel_io = io.BytesIO()
                             with pd.ExcelWriter(excel_io, engine='xlsxwriter') as writer:
-                                group_cols = ['emp_id', '姓名', 'cost_center']
+                                group_cols = ['employee_no', '姓名', 'cost_center']
                                 active_sum_cols = [c for c in money_cols if df_channel[c].sum() > 0]
 
                                 if active_sum_cols:
@@ -1042,7 +1054,7 @@ with tab2:
 
                 if not retro_df.empty:
                     retro_map = {
-                        'process_month': '处理月份', 'emp_id': '工号', 'retro_type': '补缴险种',
+                        'process_month': '处理月份', 'employee_no': '工号', 'retro_type': '补缴险种',
                         'target_start_month': '补缴起始月', 'target_end_month': '补缴结束月',
                         'total_comp_retro': '企业本金', 'total_pers_retro': '个人本金',
                         'late_fee': '滞纳金(异常支出)', 'remarks': '产生原因(备注)', 'cost_center': '财务归属'
@@ -1104,7 +1116,7 @@ with tab2:
         ext_params = [s_m, e_m] + selected_branches
 
         ext_query = f"""
-            SELECT r.*, e.name AS '姓名', 
+            SELECT r.*, e.employee_no, e.name AS '姓名',
                    COALESCE(NULLIF(m.ss_base_actual, 0.0), NULLIF(m.base_salary_avg, 0.0), 0.0) AS '基数'
             FROM ss_monthly_records r 
             LEFT JOIN employees e ON r.emp_id = e.emp_id 
@@ -1145,7 +1157,7 @@ with tab2:
                             ext_df.at[idx, 'medical_serious_pers'] = 0.0
 
         retro_query = f"""
-            SELECT r.*, e.name AS '姓名', 
+            SELECT r.*, e.employee_no, e.name AS '姓名',
                    COALESCE(cost_entity.entity_name, m.cost_center, '本级') AS 'cost_center',
                    COALESCE(NULLIF(m.ss_base_actual, 0.0), NULLIF(m.base_salary_avg, 0.0), 0.0) AS '基数',
                    payer_entity.entity_name AS 'retro_payer_name',
@@ -1177,7 +1189,8 @@ with tab2:
 
             new_row = {
                 'cost_month': f"补缴({row['process_month']})",
-                'emp_id': row['emp_id'], '姓名': row['姓名'], 'cost_center': row['cost_center'], '基数': row['基数'],
+                'emp_id': row['emp_id'], 'employee_no': row.get('employee_no'),
+                '姓名': row['姓名'], 'cost_center': row['cost_center'], '基数': row['基数'],
                 f'{prefix}_comp': row['total_comp_retro'], f'{prefix}_pers': row['total_pers_retro'],
                 f'{prefix}_route': row.get('retro_payer_name') or row.get(f'{prefix}_route', '未知'),
                 'late_fee': row['late_fee']
@@ -1616,7 +1629,7 @@ with tab4:
             if ref_month:
                 st.info(f"💡 探针已激活：系统侦测到最近的关联账单为 {ref_month}，正在为您完美克隆该月数据作为底稿...")
                 clone_query = """
-                    SELECT r.*, e.name AS '姓名'
+                    SELECT r.*, e.employee_no, e.id_card AS '身份证号', e.name AS '姓名'
                     FROM ss_monthly_records r
                     LEFT JOIN employees e ON r.emp_id = e.emp_id
                     WHERE r.cost_month = ?
@@ -1625,7 +1638,7 @@ with tab4:
             else:
                 st.info("💡 探针已激活：系统暂无历史账单，正在从现有人事档案中提取名单生成空白底稿...")
                 clone_query = """
-                    SELECT e.emp_id, e.name AS '姓名', IFNULL(m.cost_center, '本级') AS cost_center
+                    SELECT e.emp_id, e.employee_no, e.id_card AS '身份证号', e.name AS '姓名', IFNULL(m.cost_center, '本级') AS cost_center
                     FROM employees e
                     LEFT JOIN ss_emp_matrix m ON e.emp_id = m.emp_id
                     WHERE e.status IN ('在职', '挂靠人员')
@@ -1634,7 +1647,7 @@ with tab4:
             conn.close()
 
             hist_cols = [
-                '核算月份(YYYY-MM)', '工号', '姓名', '财务归属(成本中心)',
+                '核算月份(YYYY-MM)', '工号', '姓名', '身份证号', '财务归属(成本中心)',
                 '养老_企金额', '养老_个金额', '养老_通道(如:省公众)',
                 '医疗_企金额', '医疗_个金额', '大病_个固定', '医疗_通道(如:省公司)',
                 '失业_企金额', '失业_个金额', '失业_通道(如:省公众)',
@@ -1648,8 +1661,9 @@ with tab4:
             for _, row in ref_df.iterrows():
                 out_row = {col: 0.0 for col in hist_cols}
                 out_row['核算月份(YYYY-MM)'] = target_hist_month
-                out_row['工号'] = row.get('emp_id', '')
+                out_row['工号'] = row.get('employee_no', '') or '待分配'
                 out_row['姓名'] = row.get('姓名', '')
+                out_row['身份证号'] = row.get('身份证号', '')
                 out_row['财务归属(成本中心)'] = row.get('cost_center', '本级')
 
                 if ref_month:
@@ -1680,7 +1694,7 @@ with tab4:
             hist_buffer = io.BytesIO()
             with pd.ExcelWriter(hist_buffer, engine='xlsxwriter') as writer:
                 hist_template.to_excel(writer, index=False)
-                writer.sheets['Sheet1'].set_column('A:X', 18)
+                writer.sheets['Sheet1'].set_column('A:Y', 18)
 
             st.session_state['ss_hist_data'] = hist_buffer.getvalue()
             st.session_state['ss_hist_filename'] = f"{target_hist_month}_历史社保智能补录底稿.xlsx"
@@ -1727,8 +1741,10 @@ with tab4:
                 count = 0
                 for _, row in h_df.iterrows():
                     h_month = str(row.get('核算月份(YYYY-MM)', '')).strip()
-                    eid = str(row.get('工号', '')).replace('.0', '').strip()
-                    if not h_month or not eid or h_month == 'nan' or eid == 'nan': continue
+                    eid = resolve_employee_reference(
+                        row.get('工号'), row.get('身份证号'), row.get('姓名'), conn
+                    )
+                    if not h_month or not eid or h_month == 'nan': continue
 
                     rec_id = f"{h_month}_{eid}"
                     cc = str(row.get('财务归属(成本中心)', '本级')).strip()

@@ -333,9 +333,14 @@ def _add_columns_if_missing(cursor, table_name, required_columns):
 
 
 def ensure_person_lifecycle_schema(cursor):
-    """为人员增加稳定内部标识和实习/转正生命周期，不改变旧工号关联。"""
+    """分离隐藏内部键与可变工号，并补充实习/转正生命周期。"""
+    employee_columns = {
+        row[1] for row in cursor.execute("PRAGMA table_info(employees)").fetchall()
+    }
+    employee_no_added = 'employee_no' not in employee_columns
     _add_columns_if_missing(cursor, 'employees', {
         'person_id': 'TEXT',
+        'employee_no': 'TEXT',
     })
     rows = cursor.execute(
         "SELECT emp_id FROM employees WHERE person_id IS NULL OR TRIM(person_id) = ''"
@@ -347,6 +352,11 @@ def ensure_person_lifecycle_schema(cursor):
         )
     cursor.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_employees_person_id ON employees(person_id)"
+    )
+    if employee_no_added:
+        cursor.execute("UPDATE employees SET employee_no = emp_id")
+    cursor.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_employees_employee_no ON employees(employee_no)"
     )
 
     _add_columns_if_missing(cursor, 'employee_profiles', {
@@ -920,7 +930,9 @@ def init_database(db_path=None):
         # 系统的“户口本”。不管是真干活的，还是早就退休的，只要有钱的往来，就得在这登记。
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS employees (
-            emp_id TEXT PRIMARY KEY,                    -- 工号，全系统唯一标识！(如: 42001943)
+            emp_id TEXT PRIMARY KEY,                    -- 隐藏内部关联键；页面、模板不得要求用户填写
+            person_id TEXT UNIQUE,                      -- 跨系统稳定人员ID
+            employee_no TEXT UNIQUE,                    -- 可暂缺、可修改但必须唯一的业务工号/人力编码
             name TEXT NOT NULL,                         -- 员工姓名 (如: 周慧中)
             id_card TEXT UNIQUE,                        -- 身份证号 (防重名，发工资和报税的铁凭证)
             dept_id INTEGER NOT NULL,                   -- 当前属于哪个部门 (强关联表1的部门ID)
@@ -936,7 +948,7 @@ def init_database(db_path=None):
         # 户口本的“背面”，放那些会影响他拿多少提成、拿多少补贴的附加信息。
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS employee_profiles (
-            emp_id TEXT PRIMARY KEY,                    -- 员工工号
+            emp_id TEXT PRIMARY KEY,                    -- 隐藏内部关联键
             pos_id INTEGER,                             -- 当前的具体岗位 (强关联表2的岗位ID)
             tech_grade TEXT,                            -- 技术等级 (如 T1、T3，决定他的“激励包基数”是3900还是3000)
             title_order INTEGER DEFAULT 999,            -- 领导正副职排位 (正职排前面，副职排后面)
@@ -956,7 +968,7 @@ def init_database(db_path=None):
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS personnel_changes (
             change_id INTEGER PRIMARY KEY AUTOINCREMENT, -- 变动记录号
-            emp_id TEXT NOT NULL,                        -- 谁发生了变动
+            emp_id TEXT NOT NULL,                        -- 谁发生了变动（隐藏内部关联键）
             change_type TEXT,                            -- 是什么变动 (入职/调岗/调薪/离职/转正)
             old_dept_id INTEGER,                         -- 变动前的老部门
             new_dept_id INTEGER,                         -- 变动后的新部门

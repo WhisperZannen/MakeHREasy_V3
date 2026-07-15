@@ -537,7 +537,7 @@ def get_people_management_dataframe(target_month: str) -> pd.DataFrame:
     try:
         people = pd.read_sql_query(
             """
-            SELECT e.emp_id, e.name, e.status, e.dept_id, d.dept_name
+            SELECT e.emp_id, e.employee_no, e.name, e.status, e.dept_id, d.dept_name
             FROM employees e
             LEFT JOIN departments d ON e.dept_id = d.dept_id
             WHERE e.status IN ('在职', '挂靠人员')
@@ -581,7 +581,7 @@ def get_arrangements_dataframe(include_closed: bool = True) -> pd.DataFrame:
         where = "" if include_closed else "WHERE a.status = 'active'"
         return pd.read_sql_query(
             f"""
-            SELECT a.*, e.name AS emp_name, d.dept_name AS home_dept_name,
+            SELECT a.*, e.employee_no, e.name AS emp_name, d.dept_name AS home_dept_name,
                    be_contract.entity_name AS contract_entity_name,
                    be_payroll.entity_name AS payroll_entity_name,
                    be_work.entity_name AS actual_work_unit_name,
@@ -1131,7 +1131,7 @@ def get_social_overrides_dataframe(active_only: bool = True) -> pd.DataFrame:
         where = "WHERE o.active = 1" if active_only else ""
         return pd.read_sql_query(
             f"""
-            SELECT o.*, e.name AS emp_name,
+            SELECT o.*, e.employee_no, e.name AS emp_name,
                    ecalc.entity_name AS calculation_policy_entity_name,
                    ep.entity_name AS payer_entity_name,
                    eb.entity_name AS cost_bearer_name,

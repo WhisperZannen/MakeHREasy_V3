@@ -30,6 +30,10 @@ from modules.core_labor_cost import (
 )
 from modules.core_arrangements import get_effective_arrangement, is_labor_cost_included
 from modules.core_personnel import get_effective_department_snapshot
+from modules.core_identity import (
+    get_employee_no,
+    resolve_employee_reference,
+)
 
 st.set_page_config(page_title="人工成本台账", layout="wide")
 
@@ -149,7 +153,7 @@ def resolve_hr_director_tail_carrier(conn, ledger_df):
     """从组织和岗位档案识别人力资源部主任，并确认其存在于本月底表。"""
     director_df = pd.read_sql_query(
         '''
-        SELECT e.emp_id, e.name
+        SELECT e.emp_id, e.employee_no, e.name
         FROM employees e
         JOIN departments d ON e.dept_id = d.dept_id
         JOIN employee_profiles ep ON e.emp_id = ep.emp_id
@@ -166,7 +170,7 @@ def resolve_hr_director_tail_carrier(conn, ledger_df):
             f'系统应识别到1名在职人力资源部主任，当前识别到{len(director_df)}名。'
         )
 
-    director_id = str(director_df.iloc[0]['emp_id']).strip()
+    director_id = str(director_df.iloc[0]['employee_no'] or '').strip()
     director_name = str(director_df.iloc[0]['name']).strip()
     ledger_ids = (
         ledger_df['工号'].astype(str).str.replace(r'\.0$', '', regex=True).str.strip()
@@ -202,16 +206,27 @@ def upsert_labor_cost_dataframe(in_df):
                 employee_id = str(int(raw_id))
             else:
                 employee_id = str(raw_id).replace('.0', '').strip()
-            if not raw_month or not employee_id or raw_month == 'nan' or employee_id == 'nan':
+            if not raw_month or raw_month == 'nan':
                 continue
+            internal_emp_id = resolve_employee_reference(
+                employee_no=employee_id,
+                id_card=row.get('身份证号'),
+                name=employee_name,
+                conn=conn,
+            )
+            if not internal_emp_id:
+                raise ValueError(
+                    f'无法识别人员：{employee_name or "未填写姓名"}'
+                    f'（工号：{employee_id or "待分配"}）'
+                )
             cost_month = raw_month[:7].replace('/', '-') if len(raw_month) >= 7 else raw_month
 
-            arrangement = get_effective_arrangement(employee_id, cost_month, conn)
+            arrangement = get_effective_arrangement(internal_emp_id, cost_month, conn)
             if not int(arrangement.get('labor_cost_included', 1)):
                 # 下沉和挂靠的社保仍留在社保账及结算账，但绝不进入本单位人工成本。
                 cursor.execute(
                     "DELETE FROM labor_cost_ledger WHERE cost_month = ? AND emp_id = ?",
-                    (cost_month, employee_id),
+                    (cost_month, internal_emp_id),
                 )
                 continue
 
@@ -235,6 +250,7 @@ def upsert_labor_cost_dataframe(in_df):
                     db_data[db_column] = str(value).strip() if pd.notna(value) else ''
 
             # 人员关系和部门归属以系统有效期为准，不相信Excel里可能过期的技术快照。
+            db_data['emp_id'] = internal_emp_id
             relation_type = arrangement.get('arrangement_type', 'normal')
             db_data['arrangement_id'] = arrangement.get('arrangement_id')
             db_data['business_type_snapshot'] = relation_type
@@ -244,7 +260,7 @@ def upsert_labor_cost_dataframe(in_df):
             db_data['ultimate_cost_bearer_code'] = arrangement.get('ultimate_cost_bearer_code') or 'province_public'
             if cost_month not in department_snapshots:
                 department_snapshots[cost_month] = get_effective_department_snapshot(cost_month, conn)
-            department = department_snapshots[cost_month].get(employee_id)
+            department = department_snapshots[cost_month].get(internal_emp_id)
             if department:
                 db_data['dept_id'] = department['dept_id']
                 db_data['dept_name'] = department['dept_name']
@@ -504,6 +520,9 @@ with tab2:
             placeholders = ",".join(["?"] * len(selected_months))
             query = f"SELECT * FROM labor_cost_ledger WHERE cost_month IN ({placeholders}) ORDER BY dept_name ASC"
             raw_export_df = pd.read_sql_query(query, conn, params=selected_months)
+            employee_no_map = dict(conn.execute(
+                "SELECT emp_id, COALESCE(employee_no, '待分配') FROM employees"
+            ).fetchall())
             conn.close()
 
             if not raw_export_df.empty:
@@ -564,6 +583,7 @@ with tab2:
 
                         # 6. 翻译回中文表头并排序
                         summary_cn = summary_df.rename(columns=DB_TO_CN_MAP)
+                        summary_cn['工号'] = summary_cn['工号'].map(employee_no_map).fillna('待分配')
                         report_cols = [c for c in LEDGER_MAP.keys() if c in summary_cn.columns and c != '核算月份']
                         if '备注' not in report_cols: report_cols.append('备注')
 
@@ -578,6 +598,7 @@ with tab2:
                         month_df = raw_export_df[raw_export_df['cost_month'] == month].copy()
                         if not month_df.empty:
                             month_cn = localize_labor_cost_codes(month_df.rename(columns=DB_TO_CN_MAP))
+                            month_cn['工号'] = month_cn['工号'].map(employee_no_map).fillna('待分配')
                             month_cols = [c for c in LEDGER_MAP.keys() if c in month_cn.columns]
                             month_cn = month_cn[month_cols]
 
@@ -655,7 +676,7 @@ with tab2:
         reallocation_export = pd.read_sql_query(
             """
             SELECT l.cost_month AS 核算月份,
-                   l.emp_id AS 工号,
+                   COALESCE(e.employee_no, '待分配') AS 工号,
                    l.emp_name AS 姓名,
                    l.dept_name AS 归属部门,
                    l.business_type_snapshot AS 业务关系类型,
@@ -667,6 +688,7 @@ with tab2:
                    l.reallocation_mode AS 划转方式,
                    l.reallocation_status AS 划转状态
             FROM labor_cost_ledger l
+            LEFT JOIN employees e ON l.emp_id = e.emp_id
             LEFT JOIN business_entities work ON l.actual_work_unit_code = work.entity_code
             LEFT JOIN business_entities bearer ON l.ultimate_cost_bearer_code = bearer.entity_code
             WHERE l.cost_month BETWEEN ? AND ?
@@ -724,7 +746,7 @@ with tab2:
             conn = _get_db_connection()
             try:
                 base_df = pd.read_sql_query("SELECT * FROM labor_cost_ledger WHERE cost_month = ?", conn, params=[base_month])
-                all_emps = pd.read_sql_query("SELECT emp_id, name, dept_id, status FROM employees", conn)
+                all_emps = pd.read_sql_query("SELECT emp_id, employee_no, name, dept_id, status FROM employees", conn)
                 active_emps = all_emps[all_emps['status'] == '在职']
                 active_emps = active_emps[
                     active_emps['emp_id'].astype(str).map(
@@ -808,6 +830,8 @@ with tab2:
                         base_df.at[idx, 'reallocation_status'] = reallocation_status
 
                     export_cn = base_df.rename(columns=DB_TO_CN_MAP)
+                    employee_no_map = dict(zip(all_emps['emp_id'], all_emps['employee_no']))
+                    export_cn['工号'] = export_cn['工号'].map(employee_no_map).fillna('待分配')
 
                     if clear_nums:
                         for cn_col in NUMERIC_COLS:
@@ -818,7 +842,12 @@ with tab2:
                         ss_index_df = ss_df.set_index('emp_id')
 
                         for idx, row in export_cn.iterrows():
-                            eid = str(row.get('工号', '')).replace('.0', '').strip()
+                            eid = resolve_employee_reference(
+                                employee_no=row.get('工号'),
+                                id_card=row.get('身份证号'),
+                                name=row.get('姓名'),
+                                conn=conn,
+                            )
                             if eid in ss_index_df.index:
                                 ss_rec = ss_index_df.loc[eid]
                                 if isinstance(ss_rec, pd.DataFrame):
@@ -1199,6 +1228,7 @@ with tab3:
 
                     for _, row in ledger_df.iterrows():
                         emp_id = str(row["emp_id"]).replace(".0", "").strip()
+                        employee_no = get_employee_no(emp_id, conn_refresh)
                         old_dept_id = row.get("dept_id")
                         old_dept_name = str(row["dept_name"]).strip()
                         target_department = effective_dept_map.get(emp_id)
@@ -1212,7 +1242,7 @@ with tab3:
                             preview_rows.append({
                                 "流水ID": row["record_id"],
                                 "核算月份": row["cost_month"],
-                                "工号": emp_id,
+                                "工号": employee_no,
                                 "姓名": row["emp_name"],
                                 "当前台账部门": old_dept_name,
                                 "当前部门ID": old_dept_id,
@@ -1333,13 +1363,24 @@ with tab3:
                     elif isinstance(raw_id, float): e_id = str(int(raw_id))
                     else: e_id = str(raw_id).replace('.0', '').strip()
 
-                    if not raw_month or not e_id or raw_month == 'nan' or e_id == 'nan': continue
+                    if not raw_month or raw_month == 'nan': continue
                     c_month = raw_month[:7].replace('/', '-') if len(raw_month) >= 7 else raw_month
-                    arrangement = get_effective_arrangement(e_id, c_month, conn)
+                    internal_emp_id = resolve_employee_reference(
+                        employee_no=e_id,
+                        id_card=row.get('身份证号'),
+                        name=e_name,
+                        conn=conn,
+                    )
+                    if not internal_emp_id:
+                        raise ValueError(
+                            f'无法识别人员：{e_name or "未填写姓名"}'
+                            f'（工号：{e_id or "待分配"}）'
+                        )
+                    arrangement = get_effective_arrangement(internal_emp_id, c_month, conn)
                     if not int(arrangement.get('labor_cost_included', 1)):
                         cursor.execute(
                             "DELETE FROM labor_cost_ledger WHERE cost_month = ? AND emp_id = ?",
-                            (c_month, e_id),
+                            (c_month, internal_emp_id),
                         )
                         continue
 
@@ -1360,13 +1401,14 @@ with tab3:
                             db_data[db_col] = str(val).strip() if pd.notna(val) else ""
 
                     relation_type = arrangement.get('arrangement_type', 'normal')
+                    db_data['emp_id'] = internal_emp_id
                     db_data['arrangement_id'] = arrangement.get('arrangement_id')
                     db_data['business_type_snapshot'] = relation_type
                     db_data['labor_cost_included_snapshot'] = 1
                     db_data['actual_work_unit_code'] = arrangement.get('actual_work_unit_code')
                     db_data['accounting_entity_code'] = arrangement.get('accounting_entity_code') or 'province_public'
                     db_data['ultimate_cost_bearer_code'] = arrangement.get('ultimate_cost_bearer_code') or 'province_public'
-                    department = get_effective_department_snapshot(c_month, conn).get(e_id)
+                    department = get_effective_department_snapshot(c_month, conn).get(internal_emp_id)
                     if department:
                         db_data['dept_id'] = department['dept_id']
                         db_data['dept_name'] = department['dept_name']

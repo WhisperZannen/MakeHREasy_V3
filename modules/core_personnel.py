@@ -13,6 +13,8 @@ import uuid
 import calendar
 from datetime import datetime
 
+from modules.core_identity import employee_no_exists, normalize_employee_no
+
 
 def _normalize_text(value):
     """统一空值及普通文本的比较口径。"""
@@ -161,14 +163,24 @@ def add_employee(emp_data, profile_data, reason="新员工入职", change_date=N
     conn = _get_db_connection()
     cursor = conn.cursor()
     try:
+        employee_no = normalize_employee_no(
+            emp_data.get('employee_no', emp_data.get('emp_id'))
+        )
+        if employee_no_exists(employee_no, conn=conn):
+            return False, f"工号 {employee_no} 已被其他人员使用"
+        internal_emp_id = str(
+            emp_data.get('internal_emp_id')
+            or emp_data.get('emp_id')
+            or f"P-{uuid.uuid4().hex}"
+        )
         profile_data = _prepare_lifecycle(
             profile_data, emp_data.get('join_company_date'), change_date
         )
         cursor.execute("""
-                       INSERT INTO employees (emp_id, person_id, name, id_card, dept_id, post_rank, post_grade, status,
+                       INSERT INTO employees (emp_id, person_id, employee_no, name, id_card, dept_id, post_rank, post_grade, status,
                                               join_company_date)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                       """, (emp_data['emp_id'], str(uuid.uuid4()), emp_data['name'], emp_data['id_card'], emp_data['dept_id'],
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                       """, (internal_emp_id, str(uuid.uuid4()), employee_no, emp_data['name'], emp_data['id_card'], emp_data['dept_id'],
                              emp_data['post_rank'], emp_data['post_grade'], emp_data.get('status', '在职'),
                              emp_data.get('join_company_date')))
         cursor.execute("""
@@ -177,7 +189,7 @@ def add_employee(emp_data, profile_data, reason="新员工入职", change_date=N
                                                       employment_stage, first_employment,
                                                       expected_regularization_date, actual_regularization_date)
                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                       """, (emp_data['emp_id'], profile_data.get('pos_id'), profile_data.get('tech_grade'),
+                       """, (internal_emp_id, profile_data.get('pos_id'), profile_data.get('tech_grade'),
                              profile_data.get('title_order', 999), profile_data.get('education_level'),
                              profile_data.get('degree'), profile_data.get('school_name'), profile_data.get('major'),
                              profile_data.get('graduation_date'), profile_data.get('first_job_date'),
@@ -194,12 +206,12 @@ def add_employee(emp_data, profile_data, reason="新员工入职", change_date=N
                 annuity_enabled, annuity_account
             ) VALUES (?, '本级', 1, '省公众', 1, '省公司', 1, '省公众',
                       1, '省公司', 1, '省公司', 1, '省公众', 1, '省公司')
-        """, (emp_data['emp_id'],))
+        """, (internal_emp_id,))
         cursor.execute("""
                        INSERT INTO personnel_changes (emp_id, change_type, new_dept_id, new_pos_id, new_tech_grade,
                                                       new_post_rank, new_post_grade, change_date, change_reason)
                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                       """, (emp_data['emp_id'], snapshot_type, emp_data['dept_id'], profile_data.get('pos_id'),
+                       """, (internal_emp_id, snapshot_type, emp_data['dept_id'], profile_data.get('pos_id'),
                              profile_data.get('tech_grade'), emp_data['post_rank'], emp_data['post_grade'],
                              initial_snapshot_time, reason))
         conn.commit()
@@ -215,6 +227,11 @@ def update_employee(emp_id, emp_data, profile_data, reason="档案更新", chang
     conn = _get_db_connection()
     cursor = conn.cursor()
     try:
+        employee_no = normalize_employee_no(
+            emp_data.get('employee_no', emp_data.get('emp_id'))
+        )
+        if employee_no_exists(employee_no, exclude_emp_id=emp_id, conn=conn):
+            return False, f"工号 {employee_no} 已被其他人员使用"
         cursor.execute("""
             SELECT e.dept_id, e.post_rank, e.post_grade, e.status,
                    p.pos_id, p.tech_grade, p.employment_stage, p.first_employment,
@@ -250,10 +267,12 @@ def update_employee(emp_id, emp_data, profile_data, reason="档案更新", chang
                 """, (emp_id, " + ".join(change_tags), old['dept_id'], emp_data['dept_id'], old['pos_id'], profile_data.get('pos_id'), old['tech_grade'], profile_data.get('tech_grade'), old['post_rank'], emp_data['post_rank'], old['post_grade'], emp_data['post_grade'], actual_date, reason))
 
         cursor.execute("""
-            UPDATE employees 
-            SET name=?, id_card=?, dept_id=?, post_rank=?, post_grade=?, status=?, join_company_date=? 
+            UPDATE employees
+            SET employee_no=?, name=?, id_card=?, dept_id=?, post_rank=?, post_grade=?, status=?, join_company_date=?
             WHERE emp_id=?
-        """, (emp_data['name'], emp_data['id_card'], emp_data['dept_id'], emp_data['post_rank'], emp_data['post_grade'], emp_data.get('status'), emp_data.get('join_company_date'), emp_id))
+        """, (employee_no, emp_data['name'], emp_data['id_card'], emp_data['dept_id'], emp_data['post_rank'], emp_data['post_grade'], emp_data.get('status'), emp_data.get('join_company_date'), emp_id))
+        if cursor.rowcount != 1:
+            raise ValueError("未找到要更新的人员，请刷新人员名单后重试")
 
         cursor.execute("""
             UPDATE employee_profiles
@@ -273,8 +292,15 @@ def update_employee(emp_id, emp_data, profile_data, reason="档案更新", chang
             profile_data.get('actual_regularization_date'), emp_id,
         ))
 
+        saved_row = cursor.execute(
+            "SELECT employee_no FROM employees WHERE emp_id = ?", (emp_id,)
+        ).fetchone()
+        saved_employee_no = normalize_employee_no(saved_row['employee_no']) if saved_row else None
+        if saved_employee_no != employee_no:
+            raise ValueError("工号保存校验失败，数据库未写入预期值")
+
         conn.commit()
-        return True, "人员档案及状态已成功更新。"
+        return True, f"人员档案已更新，当前工号：{saved_employee_no or '待分配'}。"
     except Exception as e:
         conn.rollback(); return False, str(e)
     finally:
@@ -316,7 +342,7 @@ def get_all_history():
     cursor = conn.cursor()
     try:
         cursor.execute("""
-            SELECT h.*, e.name as emp_name, d1.dept_name as old_dept_name, d2.dept_name as new_dept_name, p1.pos_name as old_pos_name, p2.pos_name as new_pos_name
+            SELECT h.*, e.employee_no, e.name as emp_name, d1.dept_name as old_dept_name, d2.dept_name as new_dept_name, p1.pos_name as old_pos_name, p2.pos_name as new_pos_name
             FROM personnel_changes h
             LEFT JOIN employees e ON h.emp_id = e.emp_id
             LEFT JOIN departments d1 ON h.old_dept_id = d1.dept_id

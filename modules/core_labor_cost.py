@@ -347,17 +347,25 @@ def cleanse_db_timestamps():
 def get_ledger_data(month_filter=None, dept_filter=None):
     conn = _get_db_connection()
     try:
-        query = "SELECT * FROM labor_cost_ledger WHERE 1=1"
+        query = """
+            SELECT l.*, e.employee_no AS __employee_no
+            FROM labor_cost_ledger l
+            LEFT JOIN employees e ON l.emp_id = e.emp_id
+            WHERE 1=1
+        """
         params = []
         if month_filter:
-            query += " AND cost_month = ?"
+            query += " AND l.cost_month = ?"
             params.append(month_filter)
         if dept_filter:
             placeholders = ",".join(['?'] * len(dept_filter))
-            query += f" AND dept_name IN ({placeholders})"
+            query += f" AND l.dept_name IN ({placeholders})"
             params.extend(dept_filter)
-        query += " ORDER BY cost_month DESC, dept_name ASC"
+        query += " ORDER BY l.cost_month DESC, l.dept_name ASC"
         df = pd.read_sql_query(query, conn, params=params)
+        if not df.empty:
+            df['emp_id'] = df['__employee_no'].fillna('待分配')
+            df = df.drop(columns=['__employee_no'])
         return df
     finally:
         conn.close()
@@ -375,7 +383,7 @@ def sort_flat_ledger_df(df):
         pos_df = pd.read_sql_query("SELECT pos_id, sort_order FROM positions", conn)
         pos_weights = dict(zip(pos_df['pos_id'], pos_df['sort_order']))
 
-        emp_df = pd.read_sql_query("SELECT emp_id, post_rank FROM employees", conn)
+        emp_df = pd.read_sql_query("SELECT emp_id, employee_no, post_rank FROM employees", conn)
         ep_df = pd.read_sql_query("SELECT emp_id, pos_id FROM employee_profiles", conn)
 
         personnel_meta = {}
@@ -385,6 +393,8 @@ def sort_flat_ledger_df(df):
             p_rank = float(r['post_rank']) if pd.notna(r['post_rank']) else 9999.0
             p_weight = pos_weights.get(r['pos_id'], 9999)
             personnel_meta[eid] = {'pos_weight': p_weight, 'rank_order': p_rank}
+            if pd.notna(r.get('employee_no')) and str(r.get('employee_no')).strip():
+                personnel_meta[str(r.get('employee_no')).strip()] = personnel_meta[eid]
     except Exception:
         dept_weights, personnel_meta = {}, {}
     finally:
@@ -421,7 +431,7 @@ def add_subtotals_and_totals(df, numeric_cols):
         pos_df = pd.read_sql_query("SELECT pos_id, sort_order FROM positions", conn)
         pos_weights = dict(zip(pos_df['pos_id'], pos_df['sort_order']))
 
-        emp_df = pd.read_sql_query("SELECT emp_id, post_rank FROM employees", conn)
+        emp_df = pd.read_sql_query("SELECT emp_id, employee_no, post_rank FROM employees", conn)
         ep_df = pd.read_sql_query("SELECT emp_id, pos_id FROM employee_profiles", conn)
 
         personnel_meta = {}
@@ -431,6 +441,8 @@ def add_subtotals_and_totals(df, numeric_cols):
             p_rank = float(r['post_rank']) if pd.notna(r['post_rank']) else 9999.0
             p_weight = pos_weights.get(r['pos_id'], 9999)
             personnel_meta[eid] = {'pos_weight': p_weight, 'rank_order': p_rank}
+            if pd.notna(r.get('employee_no')) and str(r.get('employee_no')).strip():
+                personnel_meta[str(r.get('employee_no')).strip()] = personnel_meta[eid]
     except Exception:
         dept_weights, personnel_meta = {}, {}
     finally:

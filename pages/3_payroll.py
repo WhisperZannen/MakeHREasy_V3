@@ -13,6 +13,7 @@ import json
 import datetime
 from modules.core_social_security import _get_db_connection
 from modules.core_arrangements import get_effective_arrangement
+from modules.core_identity import resolve_employee_reference
 
 st.set_page_config(page_title="薪酬核算与发放", layout="wide")
 
@@ -495,7 +496,10 @@ with tab1:
                 # ------------------------------------------------------
                 for _, row in import_df.iterrows():
 
-                    emp_id = clean_emp_id(row.get("工号"))
+                    employee_no = clean_emp_id(row.get("工号"))
+                    emp_id = resolve_employee_reference(
+                        employee_no, row.get('身份证号'), row.get('姓名'), conn
+                    )
 
                     # 没有工号的行直接跳过。
                     if not emp_id:
@@ -599,21 +603,22 @@ with tab1:
         items_df = pd.read_sql_query(
             """
             SELECT
-                cost_month,
-                emp_id,
-                emp_name_snapshot,
-                item_type,
-                item_name,
-                amount,
-                target_field,
-                direction,
-                source_column,
-                remarks,
-                import_batch_id
-            FROM payroll_monthly_items
-            WHERE cost_month = ?
-              AND is_active = 1
-            ORDER BY emp_id ASC, target_field ASC, item_type ASC
+                i.cost_month,
+                COALESCE(NULLIF(e.employee_no, ''), '待分配') AS employee_no,
+                i.emp_name_snapshot,
+                i.item_type,
+                i.item_name,
+                i.amount,
+                i.target_field,
+                i.direction,
+                i.source_column,
+                i.remarks,
+                i.import_batch_id
+            FROM payroll_monthly_items i
+            LEFT JOIN employees e ON i.emp_id = e.emp_id
+            WHERE i.cost_month = ?
+              AND i.is_active = 1
+            ORDER BY e.employee_no ASC, i.target_field ASC, i.item_type ASC
             """,
             conn,
             params=[item_month]
@@ -627,7 +632,7 @@ with tab1:
     else:
         show_items = items_df.rename(columns={
             "cost_month": "月份",
-            "emp_id": "工号",
+            "employee_no": "工号",
             "emp_name_snapshot": "姓名",
             "item_type": "项目类别",
             "item_name": "项目名称",
@@ -909,7 +914,8 @@ with tab2:
     conn = _get_db_connection()
     # SQL语法净化：使用双引号，去除了所有单引号和中文括号
     sql_perf = """
-               SELECT p.emp_id           AS "工号", \
+               SELECT p.emp_id           AS "__内部人员ID", \
+                      COALESCE(e.employee_no, '待分配') AS "工号", \
                       e.name             AS "姓名", \
                       p.base_salary      AS "系统查表_岗位工资", \
                       p.perf_standard    AS "系统查表_绩效基数", \
@@ -960,11 +966,12 @@ with tab2:
         edited_perf = st.data_editor(
             df_perf,
             column_config={
+                "__内部人员ID": None,
                 "本月KPI(修改这里)": st.column_config.NumberColumn(min_value=0, max_value=150, step=1),
                 "激励包倍数": st.column_config.NumberColumn(format="%.2f"),
                 "负责人系数": st.column_config.NumberColumn(format="%.2f"),
             },
-            disabled=["工号", "姓名", "系统查表_岗位工资", "系统查表_绩效基数", "激励包基数", "已算出的绩效"],
+            disabled=["__内部人员ID", "工号", "姓名", "系统查表_岗位工资", "系统查表_绩效基数", "激励包基数", "已算出的绩效"],
             use_container_width=True, hide_index=True
         )
 
@@ -987,7 +994,7 @@ with tab2:
                                    perf_salary_calc = ?
                                WHERE cost_month = ?
                                  AND emp_id = ?
-                               """, (kpi, p_coef, l_coef, calc_val, calc_month, row['工号']))
+                               """, (kpi, p_coef, l_coef, calc_val, calc_month, row['__内部人员ID']))
             conn.commit()
             st.success(f"✅ 绩效核算完毕！底层数据库已刷新。")
             st.rerun()
@@ -1059,7 +1066,8 @@ with tab3:
     # 3. 个税是财务算，所以系统只负责导出底表、导入财务回传结果。
     sql_final = """
         SELECT
-            p.emp_id                                                   AS "工号",
+            p.emp_id                                                   AS "__内部人员ID",
+            COALESCE(e.employee_no, '待分配')                          AS "工号",
             e.name                                                     AS "姓名",
             p.dept_name                                                AS "部门",
 
@@ -1325,7 +1333,10 @@ with tab3:
                     # --------------------------------------------------
                     for _, row in tax_df.iterrows():
 
-                        emp_id = clean_emp_id(row.get("工号"))
+                        employee_no = clean_emp_id(row.get("工号"))
+                        emp_id = resolve_employee_reference(
+                            employee_no, row.get('身份证号'), row.get('姓名'), conn
+                        )
 
                         if not emp_id:
                             skipped_no_emp += 1
@@ -1418,6 +1429,7 @@ with tab3:
         edited_final = st.data_editor(
             df_final,
             column_config={
+                "__内部人员ID": None,
                 "岗位补/扣": st.column_config.NumberColumn(format="%.2f"),
                 "专家/特殊津贴": st.column_config.NumberColumn(format="%.2f"),
                 "绩效补/扣": st.column_config.NumberColumn(format="%.2f"),
@@ -1499,7 +1511,7 @@ with tab3:
                         round(gross, 2),
                         round(net, 2),
                         final_month,
-                        row["工号"]
+                        row["__内部人员ID"]
                     )
                 )
 
@@ -1550,7 +1562,7 @@ with tab4:
     sql_ledger = """
         SELECT
             p.cost_month                                                AS "月份",
-            p.emp_id                                                    AS "工号",
+            COALESCE(e.employee_no, '待分配')                           AS "工号",
             e.name                                                      AS "姓名",
             p.dept_name                                                 AS "部门",
 

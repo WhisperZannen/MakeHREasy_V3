@@ -15,6 +15,7 @@ from datetime import date
 from decimal import Decimal, ROUND_HALF_UP
 
 from modules.core_arrangements import resolve_social_route
+from modules.core_identity import resolve_employee_reference, resolve_internal_emp_id
 
 # ------------------------------------------------------------------------------
 # 核心防御机制：空值清洗器 (必须在底层也配备一把，防止入库时遇到脏数据崩溃)
@@ -190,17 +191,28 @@ def upsert_policy_rules(params_tuple: tuple, is_all_entities: bool = False) -> t
 # 业务接口 3: 人员参保状态与基数批量灌库引擎
 # ------------------------------------------------------------------------------
 def batch_update_emp_matrix(df: pd.DataFrame) -> tuple:
-    if '工号' not in df.columns or '已录入原始基数' not in df.columns:
-        return False, "❌ Excel 模板错误：必须包含【工号】和【已录入原始基数】两列！"
+    if '已录入原始基数' not in df.columns:
+        return False, "❌ Excel 模板错误：必须包含【已录入原始基数】列！"
 
-    df_clean = df.dropna(subset=['工号', '已录入原始基数']).copy()
+    df_clean = df.dropna(subset=['已录入原始基数']).copy()
 
     def safe_get(col_name, default_val, is_num=False):
         if col_name in df_clean.columns:
             return pd.to_numeric(df_clean[col_name], errors='coerce').fillna(default_val) if is_num else df_clean[col_name].fillna(default_val)
         return [default_val] * len(df_clean)
 
-    emp_ids = df_clean['工号'].tolist()
+    conn_for_ids = _get_db_connection()
+    try:
+        emp_ids = [
+            resolve_employee_reference(
+                row.get('工号'), row.get('身份证号'), row.get('姓名'), conn_for_ids
+            )
+            for _, row in df_clean.iterrows()
+        ]
+    finally:
+        conn_for_ids.close()
+    if any(emp_id is None for emp_id in emp_ids):
+        return False, "❌ 文件中存在系统无法识别的工号，请先在人员档案中补充人员"
     c_center = safe_get('财务归属', '本级').tolist()
     base_avg = safe_get('已录入原始基数', 0.0, True).tolist()
     fund_avg = safe_get('独立公积金基数(选填)', 0.0, True).tolist()
@@ -271,16 +283,18 @@ def batch_update_emp_matrix(df: pd.DataFrame) -> tuple:
 
 def batch_update_social_bases(df: pd.DataFrame) -> tuple:
     """简化入口只更新基数；参保项目和办理单位继续由人员规则管理。"""
-    if '工号' not in df.columns or '已录入原始基数' not in df.columns:
-        return False, "❌ 文件必须包含【工号】和【已录入原始基数】两列"
-    clean = df.dropna(subset=['工号', '已录入原始基数']).copy()
+    if '已录入原始基数' not in df.columns:
+        return False, "❌ 文件必须包含【已录入原始基数】列"
+    clean = df.dropna(subset=['已录入原始基数']).copy()
     conn = _get_db_connection()
     try:
         count = 0
         for _, row in clean.iterrows():
-            emp_id = str(row['工号']).replace('.0', '').strip()
+            emp_id = resolve_employee_reference(
+                row.get('工号'), row.get('身份证号'), row.get('姓名'), conn
+            )
             if not emp_id or emp_id == 'nan':
-                continue
+                raise ValueError(f"无法识别人员：{row.get('姓名') or row.get('工号')}")
             base_value = safe_float(row.get('已录入原始基数'))
             fund_value = safe_float(row.get('独立公积金基数(选填)'))
             cost_center = str(row.get('财务归属') or '本级').strip()
@@ -421,6 +435,13 @@ def get_lifecycle_participation(emp_id: str, item: str, target_month: str, rules
 def calculate_complete_bill(emp_row: dict, target_year: str, target_month: str = None) -> dict:
     target_month = target_month or f"{target_year}-01"
     res = {'工号': emp_row['工号'], '姓名': emp_row['姓名'], '财务归属': emp_row['财务归属']}
+    internal_emp_id = (
+        emp_row.get('__内部人员ID')
+        or resolve_internal_emp_id(emp_row.get('工号'))
+    )
+    if not internal_emp_id:
+        raise ValueError(f"无法识别人员工号：{emp_row.get('工号')}")
+    res['__internal_emp_id'] = str(internal_emp_id)
 
     items_config = {
         'pension': ('已录入原始基数', '养老参保(1是0否)', '养老缴纳主体'),
@@ -442,7 +463,7 @@ def calculate_complete_bill(emp_row: dict, target_year: str, target_month: str =
 
     for item, (base_col, en_col, acc_col) in items_config.items():
         context = resolve_social_route(
-            str(emp_row['工号']),
+            str(internal_emp_id),
             item,
             target_month,
             legacy_enabled=int(emp_row.get(en_col, 0) or 0),
@@ -472,7 +493,7 @@ def calculate_complete_bill(emp_row: dict, target_year: str, target_month: str =
         lifecycle_enabled, lifecycle_reason = True, ''
         if not context.get('override_id') and rules:
             lifecycle_enabled, lifecycle_reason = get_lifecycle_participation(
-                str(emp_row['工号']), item, target_month, rules
+                str(internal_emp_id), item, target_month, rules
             )
 
         # 如果个人未开启参保，或尚未到自动启用月份，强制全部归零。
@@ -588,7 +609,9 @@ def save_monthly_ss_records(df: pd.DataFrame, month: str) -> tuple:
         item_insert_data = []
         item_codes = ['pension', 'medical', 'medical_serious', 'unemp', 'injury', 'maternity', 'fund', 'annuity']
         for _, row in df.iterrows():
-            eid = str(row['工号'])
+            eid = str(row.get('__internal_emp_id') or resolve_internal_emp_id(row['工号'], conn))
+            if not eid or eid == 'None':
+                raise ValueError(f"无法识别人员工号：{row['工号']}")
 
             # [核心解毒] 动态抓取前置计算出来的大病金额，不参保的人这里就是 0.0，彻底告别强行写死 7.0
             serious_pers_val = safe_float(row.get('medical_serious_个', 0.0))
@@ -663,7 +686,7 @@ def save_monthly_ss_records(df: pd.DataFrame, month: str) -> tuple:
                 (
                     safe_float(row.get('社保执行基数')),
                     safe_float(row.get('公积金执行基数')),
-                    str(row['工号']),
+                    str(row.get('__internal_emp_id') or resolve_internal_emp_id(row['工号'], conn)),
                 )
                 for _, row in df.iterrows()
             ],

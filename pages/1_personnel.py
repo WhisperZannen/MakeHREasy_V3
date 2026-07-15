@@ -88,7 +88,7 @@ if 'editor_key' not in st.session_state:
 DEPT_COL_MAP = {'dept_id': '部门ID', 'dept_name': '部门名称', 'dept_category': '性质', 'parent_dept_id': '上级ID', 'sort_order': '权重', 'status': '状态'}
 POS_COL_MAP = {'pos_id': '岗位ID', 'pos_name': '岗位名称', 'pos_category': '序列', 'sort_order': '权重', 'status': '状态'}
 EMP_COL_MAP = {
-    'emp_id': '工号/编号', 'name': '姓名', 'id_card': '身份证号', 'dept_id': '部门ID', 'pos_id': '岗位ID',
+    'emp_id': '_internal_emp_id', 'employee_no': '工号/编号', 'name': '姓名', 'id_card': '身份证号', 'dept_id': '部门ID', 'pos_id': '岗位ID',
     'post_rank': '岗级', 'post_grade': '档次', 'join_company_date': '入职日期', 'status': '状态',
     'pos_name': '岗位', 'tech_grade': 'T级', 'dept_name': '部门'
 }
@@ -263,7 +263,7 @@ if current_page == "🏢 部门管理":
             source_people = df_emps[df_emps['dept_id'] == source_dept].copy()
             source_people_ids = source_people['emp_id'].astype(str).tolist()
             source_people_names = {
-                str(row['emp_id']): f"{row['name']}（{row['emp_id']}）"
+                str(row['emp_id']): f"{row['name']}（{row.get('employee_no') or '待分配'}）"
                 for _, row in source_people.iterrows()
             }
             target_options = [dept_id for dept_id in formal_dept_ids if dept_id != source_dept]
@@ -373,7 +373,7 @@ elif current_page == "👥 人员档案":
                         expected = start_d + relativedelta(months=months)
                         days_left = (expected.date() - date.today()).days
                         st_str = f"🔴 已超期 {-days_left} 天" if days_left < 0 else (f"🟡 临近 ({days_left} 天)" if days_left <= 15 else f"🟢 正常 ({days_left} 天)")
-                        intern_list.append({'工号': intern['emp_id'], '姓名': intern['name'], '部门': intern['dept_name'], '预计转正': expected.strftime('%Y-%m-%d'), '当前状态': st_str})
+                        intern_list.append({'工号': intern.get('employee_no') or '待分配', '姓名': intern['name'], '部门': intern['dept_name'], '预计转正': expected.strftime('%Y-%m-%d'), '当前状态': st_str})
                 if intern_list: st.dataframe(pd.DataFrame(intern_list), use_container_width=True, hide_index=True)
             else: st.success("🎉 无待转正人员")
 
@@ -384,7 +384,11 @@ elif current_page == "👥 人员档案":
     with c3: q_status = st.multiselect("状态", options=["在职", "离职", "退休","挂靠人员"], default=["在职", "挂靠人员"])
 
     f_df = df_emps.copy()
-    if q_name: f_df = f_df[f_df['name'].str.contains(q_name) | f_df['emp_id'].str.contains(q_name)]
+    if q_name:
+        f_df = f_df[
+            f_df['name'].str.contains(q_name, na=False)
+            | f_df['employee_no'].fillna('').astype(str).str.contains(q_name, na=False)
+        ]
     if q_dept: f_df = f_df[f_df['dept_name'].isin(q_dept)]
     if q_status: f_df = f_df[f_df['status'].isin(q_status)]
 
@@ -459,7 +463,7 @@ elif current_page == "👥 人员档案":
             # 拼接并重命名
             out_df = pd.merge(f_df, profiles_df, on='emp_id', how='left')
             out_df = out_df.rename(columns={
-                'emp_id': '工号/编号', 'name': '姓名', 'id_card': '身份证号', 'dept_name': '部门', 'pos_name': '岗位',
+                'employee_no': '工号/编号', 'name': '姓名', 'id_card': '身份证号', 'dept_name': '部门', 'pos_name': '岗位',
                 'post_rank': '岗级', 'post_grade': '档次', 'tech_grade': 'T级', 'join_company_date': '入职日期',
                 'status': '状态', 'education_level': '学历', 'degree': '学位', 'school_name': '毕业院校',
                 'major': '专业', 'graduation_date': '毕业日期', 'first_job_date': '参加工作日期'
@@ -481,15 +485,24 @@ elif current_page == "👥 人员档案":
     disp = f_df.rename(columns=EMP_COL_MAP)
     t_emp_sel = None
     if not disp.empty:
-        target_cols = ['工号/编号', '姓名', '部门', '岗位', 'T级', '岗级', '档次', '状态']
+        target_cols = ['_internal_emp_id', '工号/编号', '姓名', '部门', '岗位', 'T级', '岗级', '档次', '状态']
         ui_cols = [c for c in target_cols if c in disp.columns]
 
         disp_ui = disp[ui_cols].copy()
         disp_ui.insert(0, "✅勾选修改", False)
-        edited_df = st.data_editor(disp_ui, hide_index=True, use_container_width=True, key=st.session_state.editor_key, column_config={"✅勾选修改": st.column_config.CheckboxColumn(required=True)})
+        st.caption("上方名单只用于勾选人员，工号和档案内容请在下方“单条维护区”修改并保存。")
+        edited_df = st.data_editor(
+            disp_ui, hide_index=True, use_container_width=True,
+            key=st.session_state.editor_key,
+            column_config={
+                "✅勾选修改": st.column_config.CheckboxColumn(required=True),
+                "_internal_emp_id": None,
+            },
+            disabled=ui_cols,
+        )
         selected_rows = edited_df[edited_df["✅勾选修改"] == True]
         if not selected_rows.empty:
-            sel_id = selected_rows.iloc[0]['工号/编号']
+            sel_id = selected_rows.iloc[0]['_internal_emp_id']
 
             import sqlite3, os
             db_path = os.path.join('database', 'hr_core.db')
@@ -519,12 +532,24 @@ elif current_page == "👥 人员档案":
             uf = st.file_uploader("上传 Excel", type=["xlsx"], key="emp_up")
             if uf and st.button("开始执行智能导入"):
                 idf = pd.read_excel(uf); sc = 0; uc = 0; errs = []
-                ex_ids = df_emps['emp_id'].tolist() if not df_emps.empty else []
+                existing_by_no = {
+                    clean_str(row.get('employee_no')): str(row['emp_id'])
+                    for _, row in df_emps.iterrows() if clean_str(row.get('employee_no'))
+                }
+                existing_by_idcard = {
+                    clean_str(row.get('id_card')): str(row['emp_id'])
+                    for _, row in df_emps.iterrows() if clean_str(row.get('id_card'))
+                }
                 _, c_d = get_all_departments(True); d_df = pd.DataFrame(c_d)
                 _, c_p = get_all_positions(True); p_df = pd.DataFrame(c_p)
                 for idx, row in idf.iterrows():
-                    eid = clean_str(row.get('工号'))
-                    if not eid: continue
+                    eid = clean_str(row.get('工号')) or None
+                    idc_raw = clean_str(row.get('身份证号'))
+                    internal_id = existing_by_no.get(eid) if eid else None
+                    if not internal_id and idc_raw:
+                        internal_id = existing_by_idcard.get(idc_raw)
+                    if not clean_str(row.get('姓名')):
+                        continue
                     status_val = clean_str(row.get('状态')) or '在职'
                     if status_val in ['离职', '退休']:
                         idn = "离退休公共池"; ipn = "无岗位"; rank_val = 0; grade_val = "-"
@@ -549,8 +574,7 @@ elif current_page == "👥 人员档案":
                             add_position(ipn, "通用", 999); _, rp = get_all_positions(True); p_df = pd.DataFrame(rp)
                             tp = int(p_df[p_df['pos_name']==ipn].iloc[0]['pos_id'])
 
-                    idc_raw = clean_str(row.get('身份证号'))
-                    ed = {'emp_id': eid, 'name': clean_str(row.get('姓名')), 'id_card': idc_raw if idc_raw else None, 'dept_id': td, 'post_rank': rank_val, 'post_grade': grade_val, 'status': status_val, 'join_company_date': clean_date(row.get('入职日期'))}
+                    ed = {'employee_no': eid, 'name': clean_str(row.get('姓名')), 'id_card': idc_raw if idc_raw else None, 'dept_id': td, 'post_rank': rank_val, 'post_grade': grade_val, 'status': status_val, 'join_company_date': clean_date(row.get('入职日期'))}
                     pd_info = {
                         'pos_id': tp,
                         'tech_grade': clean_str(row.get('技术等级(T级)')),
@@ -565,8 +589,8 @@ elif current_page == "👥 人员档案":
                         'first_employment': 1 if clean_str(row.get('首次就业(是/否)')) in {'是', '1', 'true', 'True'} else 0,
                     }
 
-                    if eid in ex_ids:
-                        ok, msg = update_employee(eid, ed, pd_info, reason="Excel批量覆盖更新")
+                    if internal_id:
+                        ok, msg = update_employee(internal_id, ed, pd_info, reason="Excel批量覆盖更新")
                         if ok: uc += 1
                         else: errs.append(f"行{idx+2}更新失败: {msg}")
                     else:
@@ -577,11 +601,16 @@ elif current_page == "👥 人员档案":
                 set_msg_and_rerun(f"完成！新增 {sc} 人, 更新 {uc} 人")
 
     with st.expander("📝 单条维护区", expanded=True):
-        if t_emp_sel is None: st.warning("💡 新增模式。如果录入挂靠人员，工号处可直接填写其社保编号。")
+        if t_emp_sel is None: st.info("新增人员时工号可以暂缺，系统会自动建立隐藏内部编号；正式工号下发后再回到这里补录。")
         with st.form("emp_form", clear_on_submit=True):
             f1, f2, f3 = st.columns(3)
             with f1:
-                fid = st.text_input("工号/社保编号*", value=str(t_emp_sel.get('emp_id', "")) if t_emp_sel is not None else "", help="挂靠人员请直接填写社保编号", disabled=(t_emp_sel is not None))
+                fid = st.text_input(
+                    "工号/人力编码（可暂缺）",
+                    value=(str(t_emp_sel.get('employee_no') or '') if t_emp_sel is not None else ""),
+                    help="工号必须唯一；暂未下发时可以留空，后续可直接补充或修改。",
+                    key=f"employee_no_input_{str(t_emp_sel.get('emp_id')) if t_emp_sel is not None else 'new'}",
+                )
                 fname = st.text_input("姓名*", value=str(t_emp_sel.get('name', "")) if t_emp_sel is not None else "")
                 fidc = st.text_input("身份证", value=str(t_emp_sel.get('id_card', "")) if t_emp_sel is not None and pd.notna(t_emp_sel.get('id_card')) else "")
             with f2:
@@ -672,11 +701,11 @@ elif current_page == "👥 人员档案":
             with cs3: frsn = st.text_input("变动说明*", placeholder="必填")
 
             if st.form_submit_button("保存并生成快照"):
-                if not fid or not fname or fdept is None: st.error("核心信息缺失")
+                if not fname or fdept is None: st.error("姓名和部门不能为空")
                 elif t_emp_sel is not None and not frsn: st.error("必填说明")
                 else:
                     idc_val = fidc.strip() if fidc.strip() else None
-                    ed = {'emp_id': fid, 'name': fname, 'id_card': idc_val, 'dept_id': int(fdept),
+                    ed = {'employee_no': fid.strip() or None, 'name': fname, 'id_card': idc_val, 'dept_id': int(fdept),
                           'post_rank': float(frank), 'post_grade': fgrade, 'status': fst,
                           'join_company_date': fjoin.strftime('%Y-%m-%d')}
                     pd_i = {
@@ -701,7 +730,7 @@ elif current_page == "👥 人员档案":
                         ),
                     }
                     ad_str = fcd.strftime('%Y-%m-%d %H:%M:%S')
-                    if t_emp_sel is not None: ok, msg = update_employee(fid, ed, pd_i, reason=frsn, change_date=ad_str)
+                    if t_emp_sel is not None: ok, msg = update_employee(str(t_emp_sel['emp_id']), ed, pd_i, reason=frsn, change_date=ad_str)
                     else: ok, msg = add_employee(ed, pd_i, reason=frsn or "手工录入", change_date=ad_str)
                     if ok: set_msg_and_rerun(msg)
                     else: st.error(msg)
@@ -750,7 +779,7 @@ elif current_page == "🧭 特殊人员与待遇":
             person_options = filtered_people['emp_id'].astype(str).tolist()
             person_labels = {
                 str(row['emp_id']): (
-                    f"{row['name']}（{row['emp_id']}）｜{row['人员情形']}｜{row['dept_name'] or '未分配部门'}"
+                    f"{row['name']}（{row.get('employee_no') or '待分配'}）｜{row['人员情形']}｜{row['dept_name'] or '未分配部门'}"
                 )
                 for _, row in filtered_people.iterrows()
             }
@@ -770,7 +799,7 @@ elif current_page == "🧭 特殊人员与待遇":
 
         st.divider()
         s1, s2, s3, s4 = st.columns(4)
-        s1.markdown(f"**{selected_person['name']}**\n\n{selected_person['emp_id']}")
+        s1.markdown(f"**{selected_person['name']}**\n\n{selected_person.get('employee_no') or '工号待分配'}")
         s2.markdown(f"**内部部门**\n\n{selected_person['dept_name'] or '未分配部门'}")
         s3.markdown(f"**人员情形**\n\n{ARRANGEMENT_LABELS.get(relation_type, relation_type)}")
         s4.markdown(
@@ -1187,7 +1216,7 @@ elif current_page == "🔄 特殊用工与结算关系":
             show_df['status'] = show_df['status'].map(ARRANGEMENT_STATUS_LABELS).fillna(show_df['status'])
 
             display_columns = {
-                'arrangement_id': '关系ID', 'emp_name': '姓名', 'emp_id': '工号',
+                'arrangement_id': '关系ID', 'emp_name': '姓名', 'employee_no': '工号',
                 '关系类型': '关系类型', 'contract_entity_name': '劳动合同主体',
                 'payroll_entity_name': '工资主体', 'actual_work_unit_name': '实际工作单位',
                 'related_branch_name': '关联地市', 'accounting_entity_name': '当前记账单位',
@@ -1231,7 +1260,7 @@ elif current_page == "🔄 特殊用工与结算关系":
         emp_options = active_people['emp_id'].astype(str).tolist()
         emp_label = dict(zip(
             active_people['emp_id'].astype(str),
-            active_people.apply(lambda row: f"{row['name']}（{row['emp_id']}）", axis=1)
+            active_people.apply(lambda row: f"{row['name']}（{row.get('employee_no') or '待分配'}）", axis=1)
         ))
 
         with st.form("arrangement_create_form"):
@@ -1436,7 +1465,7 @@ elif current_page == "🕰️ 历史变动流水":
             d_range = st.date_input("生效时段", value=(date.today() - relativedelta(months=3), date.today()))
 
         f_h = hdf.copy()
-        if hs: f_h = f_h[f_h['emp_name'].str.contains(hs, na=False) | f_h['emp_id'].str.contains(hs, na=False)]
+        if hs: f_h = f_h[f_h['emp_name'].str.contains(hs, na=False) | f_h['employee_no'].fillna('').astype(str).str.contains(hs, na=False)]
         if ht: f_h = f_h[f_h['change_type'].isin(ht)]
         if hd: f_h = f_h[f_h['old_dept_name'].isin(hd)]
         if len(d_range) == 2:
@@ -1447,7 +1476,7 @@ elif current_page == "🕰️ 历史变动流水":
 
         with st.sidebar:
             if not f_h.empty:
-                audit_cols = {'change_date': '生效日期', 'emp_name': '姓名', 'emp_id': '工号', 'change_type': '变动类型', 'old_dept_name': '原部门', 'new_dept_name': '新部门', 'old_pos_name': '原岗位', 'new_pos_name': '新岗位', 'old_tech_grade': '原T级', 'new_tech_grade': '新T级', 'old_post_rank': '原岗级', 'new_post_rank': '新岗级', 'old_post_grade': '原档次', 'new_post_grade': '新档次', 'change_reason': '说明'}
+                audit_cols = {'change_date': '生效日期', 'emp_name': '姓名', 'employee_no': '工号', 'change_type': '变动类型', 'old_dept_name': '原部门', 'new_dept_name': '新部门', 'old_pos_name': '原岗位', 'new_pos_name': '新岗位', 'old_tech_grade': '原T级', 'new_tech_grade': '新T级', 'old_post_rank': '原岗级', 'new_post_rank': '新岗级', 'old_post_grade': '原档次', 'new_post_grade': '新档次', 'change_reason': '说明'}
                 export_final = f_h[list(audit_cols.keys())].rename(columns=audit_cols)
                 ob = io.BytesIO()
                 with pd.ExcelWriter(ob, engine='openpyxl') as w: export_final.to_excel(w, index=False)
@@ -1459,7 +1488,7 @@ elif current_page == "🕰️ 历史变动流水":
                     h1, h2 = st.columns([1, 5])
                     with h1:
                         st.write(f"**{row['emp_name']}**")
-                        st.caption(f"工号: {row['emp_id']}")
+                        st.caption(f"工号: {row.get('employee_no') or '待分配'}")
                         type_str = row['change_type']
                         if '离职' in type_str or '退休' in type_str or '变为' in type_str: st.error(f"🛑 {type_str}")
                         elif '实习转正' in type_str: st.warning(f"🔥 {type_str}")
