@@ -14,6 +14,13 @@ import datetime
 from modules.core_social_security import _get_db_connection
 from modules.core_arrangements import get_effective_arrangement
 from modules.core_identity import resolve_employee_reference
+from modules.core_payroll import (
+    generate_payroll_draft,
+    previous_month,
+    recalculate_payroll_performance,
+    recalculate_payroll_totals,
+    save_person_scores,
+)
 from modules.core_payroll_rules import (
     CATEGORY_CODES,
     CATEGORY_LABELS,
@@ -24,6 +31,7 @@ from modules.core_payroll_rules import (
     calculate_rule_preview,
     copy_rule_version,
     get_company_leader_rules,
+    get_identity_rules,
     get_management_incentive_rules,
     get_original_perf_rules,
     get_person_calculation_overrides,
@@ -32,6 +40,7 @@ from modules.core_payroll_rules import (
     get_rule_versions,
     get_salary_matrix,
     save_company_leader_rules,
+    save_identity_rules,
     save_management_incentive_rules,
     save_original_perf_rules,
     save_position_mappings,
@@ -44,15 +53,24 @@ from modules.core_payroll_rules import (
 st.set_page_config(page_title="薪酬核算与发放", layout="wide")
 
 st.title("💸 薪酬核算与多平台分发中心")
-st.caption("🔒 核心流向：参数字典维护 ➡️ 抓取社保与算力底表 ➡️ 个税回灌与最终结算 ➡️ 台账封账")
+st.caption("人员与规则检查 → 本月工资办理 → 财务算税与OA → 封账并推送人工成本")
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
-    "📂 第一步：月度项目池导入",
-    "🧮 第二步：生成底表与绩效算力",
-    "📥 第三步：扣税与草稿结账",
-    "📜 综合查询与发薪凭证",
-    "⚙️ 全局参数与薪酬字典 (总阀门)"
+main_work, main_delivery, main_rules = st.tabs([
+    "🧮 本月工资办理",
+    "📤 财务、OA与封账",
+    "⚙️ 薪酬规则与特殊身份",
 ])
+with main_work:
+    tab2, tab1 = st.tabs([
+        "① 生成工资与导入评分",
+        "② 专项奖、提成及临时项目",
+    ])
+with main_delivery:
+    tab3, tab4 = st.tabs([
+        "① 财务算税与草稿结账",
+        "② 查询、凭证与OA草稿",
+    ])
+tab5 = main_rules
 
 
 # ==============================================================================
@@ -717,7 +735,7 @@ with tab1:
             if main_count == 0:
                 st.error(
                     "推送失败：本月薪酬主账还没有生成。"
-                    "请先到 Tab2 点击【抓取固定底薪与社保代扣】生成底表。"
+                    "请先到【生成工资与导入评分】生成本月工资底稿。"
                 )
                 st.stop()
 
@@ -726,7 +744,11 @@ with tab1:
             # ------------------------------------------------------
             allowed_target_fields = [
                 "position_adj",
+                "intern_subsidy",
+                "graduate_allowance",
                 "expert_allowance",
+                "female_labor_subsidy",
+                "commission_pay",
                 "special_bonus_total",
                 "history_clearance",
                 "promotion_backpay",
@@ -795,6 +817,7 @@ with tab1:
                 update_count += 1
 
             conn.commit()
+            recalculate_payroll_totals(item_month, conn=conn)
 
             st.success(
                 f"✅ 推送完成！更新 {update_count} 条员工字段汇总。"
@@ -814,219 +837,214 @@ with tab1:
     conn.close()
 
 # ------------------------------------------------------------------------------
-# Tab 2: 生成底表与绩效算力 (引擎组装核心区)
+# Tab 2: 本月工资办理
 # ------------------------------------------------------------------------------
 with tab2:
-    st.subheader("⚙️ 薪资主盘备料与绩效算力点火")
-    st.warning("⚠️ 启动引擎前，请确保本月【人员调动/调薪】已维护完毕，且【社保模块】已生成当期正式账单！")
-
+    st.subheader("本月工资办理")
+    st.caption(
+        "岗位工资取发薪月有效档案，绩效取上月有效档案和评分；"
+        "部门归属按发薪月15日规则判断。"
+    )
     default_month = datetime.date.today().strftime("%Y-%m")
-    calc_month = st.text_input("📅 输入当前薪酬核算月份 (格式 YYYY-MM)", value=default_month)
-
-    if st.button("🚀 1. 抓取固定底薪与社保代扣 (生成初版底表)", type="primary"):
-        conn = _get_db_connection()
-        cursor = conn.cursor()
+    mc1, mc2 = st.columns(2)
+    with mc1:
+        calc_month = st.text_input(
+            "发薪月份", value=default_month, key="payroll_pay_month"
+        )
+    with mc2:
         try:
-            sql = """
-                  SELECT e.emp_id, \
-                         e.name, \
-                         d.dept_name, \
-                         IFNULL(e.post_rank, '无')                                         AS post_rank, \
-                         IFNULL(e.post_grade, '无')                                        AS post_grade, \
-                         IFNULL(p.tech_grade, '无')                                        AS tech_grade, \
-                         IFNULL(s.pension_pers, 0.0)                                       AS ss_pension, \
-                         IFNULL(s.medical_pers, 0.0) + IFNULL(s.medical_serious_pers, 0.0) AS ss_medical, \
-                         IFNULL(s.unemp_pers, 0.0)                                         AS ss_unemp, \
-                         IFNULL(s.fund_pers, 0.0)                                          AS ss_fund, \
-                         IFNULL(s.annuity_pers, 0.0)                                       AS ss_annuity
-                  FROM employees e
-                           LEFT JOIN departments d ON e.dept_id = d.dept_id
-                           LEFT JOIN employee_profiles p ON e.emp_id = p.emp_id
-                           LEFT JOIN ss_monthly_records s ON e.emp_id = s.emp_id AND s.cost_month = ?
-                  WHERE e.status = '在职' \
-                  """
-            base_df = pd.read_sql_query(sql, conn, params=[calc_month])
-
-            count = 0
-            excluded_count = 0
-            for _, row in base_df.iterrows():
-                eid = row['emp_id']
-                arrangement = get_effective_arrangement(str(eid), calc_month, conn)
-                if not int(arrangement.get('payroll_included', 1)):
-                    excluded_count += 1
-                    continue
-
-                # 这里不能直接写 str(row['post_rank'])。
-                # 原因：
-                # 人员模块里的 post_rank 可能是 21.5、21.8、21.99。
-                # 这些小数点在人员模块里是排序用的，不能删。
-                # 但是薪酬矩阵里只有 21、22、23 这种整数岗级。
-                #
-                # 所以这里调用 normalize_rank_for_payroll()：
-                # 21.5  -> "21"
-                # 21.8  -> "21"
-                # 21.99 -> "21"
-                # 21.0  -> "21"
-                rank = normalize_rank_for_payroll(row['post_rank'])
-
-                # 档次仍然直接转成字符串。
-                # 例如 A、B、C、D、E、F、G、H、I、J。
-                grade = str(row['post_grade']).strip()
-
-                # T级也直接转成字符串。
-                # 例如 T1、T2、T3。
-                t_grade = str(row['tech_grade']).strip()
-
-                base_sal = 0.0
-                if rank in curr_dicts["salary_matrix"] and grade in curr_dicts["salary_matrix"][rank]:
-                    base_sal = float(curr_dicts["salary_matrix"][rank][grade])
-
-                perf_base_val = 0.0
-                if rank in curr_dicts["perf_matrix"]:
-                    perf_base_val = float(curr_dicts["perf_matrix"][rank]["base"]) * float(
-                        curr_dicts["perf_matrix"][rank]["coef"])
-
-                pack_base = 0.0
-                if t_grade in curr_dicts["t_level_map"]:
-                    pack_base = float(curr_dicts["t_level_map"][t_grade])
-
-                rec_id = f"{calc_month}_{eid}"
-
-                upsert_sql = """
-                             INSERT INTO payroll_monthly_records (record_id, cost_month, emp_id, dept_name, \
-                                                                  base_salary, perf_standard, perf_base, \
-                                                                  ss_pension_pers, ss_medical_mix, ss_unemp_pers, \
-                                                                  ss_fund_pers, ss_annuity_pers, arrangement_id, \
-                                                                  business_type_snapshot, payroll_entity_code, \
-                                                                  actual_work_unit_code, ultimate_cost_bearer_code, salary_source) \
-                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(record_id) DO \
-                             UPDATE SET
-                                 dept_name=excluded.dept_name, \
-                                 base_salary=excluded.base_salary, \
-                                 perf_standard=excluded.perf_standard, \
-                                 perf_base=excluded.perf_base, \
-                                 ss_pension_pers=excluded.ss_pension_pers, \
-                                 ss_medical_mix=excluded.ss_medical_mix, \
-                                 ss_unemp_pers=excluded.ss_unemp_pers, \
-                                 ss_fund_pers=excluded.ss_fund_pers, \
-                                 ss_annuity_pers=excluded.ss_annuity_pers, \
-                                 arrangement_id=excluded.arrangement_id, \
-                                 business_type_snapshot=excluded.business_type_snapshot, \
-                                 payroll_entity_code=excluded.payroll_entity_code, \
-                                 actual_work_unit_code=excluded.actual_work_unit_code, \
-                                 ultimate_cost_bearer_code=excluded.ultimate_cost_bearer_code, \
-                                 salary_source=excluded.salary_source \
-                             """
-                cursor.execute(upsert_sql, (
-                    rec_id, calc_month, eid, row['dept_name'],
-                    base_sal, perf_base_val, pack_base,
-                    row['ss_pension'], row['ss_medical'], row['ss_unemp'], row['ss_fund'], row['ss_annuity'],
-                    arrangement.get('arrangement_id'), arrangement.get('arrangement_type', 'normal'),
-                    arrangement.get('payroll_entity_code'), arrangement.get('actual_work_unit_code'),
-                    arrangement.get('ultimate_cost_bearer_code'), '本单位发放'
-                ))
-                count += 1
-
-            conn.commit()
-            st.success(f"✅ 底盘备料成功！已匹配 {count} 人；按有效用工关系排除 {excluded_count} 名非本系统发薪人员。")
-        except Exception as e:
-            st.error(f"提取失败: {e}")
-        finally:
-            conn.close()
-
-    st.divider()
-    st.write("🔥 **2. 执行浮动绩效算力 (调整KPI后点火)**")
-
-    conn = _get_db_connection()
-    # SQL语法净化：使用双引号，去除了所有单引号和中文括号
-    sql_perf = """
-               SELECT p.emp_id           AS "__内部人员ID", \
-                      COALESCE(e.employee_no, '待分配') AS "工号", \
-                      e.name             AS "姓名", \
-                      p.base_salary      AS "系统查表_岗位工资", \
-                      p.perf_standard    AS "系统查表_绩效基数", \
-                      p.perf_base        AS "激励包基数", \
-                      p.perf_pack_coef   AS "激励包倍数", \
-                      p.perf_kpi_score   AS "本月KPI", \
-                      p.perf_leader_coef AS "负责人系数", \
-                      p.perf_salary_calc AS "已算出的绩效"
-               FROM payroll_monthly_records p
-                        JOIN employees e ON p.emp_id = e.emp_id
-               WHERE p.cost_month = ? \
-               """
-    df_perf = pd.read_sql_query(sql_perf, conn, params=[calc_month])
-
-    if not df_perf.empty:
-        # ==========================================================
-        # 绩效计算状态提醒
-        # ==========================================================
-        # 为什么要加这个提醒？
-        # ----------------------------------------------------------
-        # Tab2 里“生成底表”和“计算绩效”是两个动作。
-        # 只生成底表时，系统只会写入岗位工资、绩效基数、激励包基数、社保扣款；
-        # 但真正的绩效工资 perf_salary_calc 要点击下面的“计算理论绩效总额并入库”才会生成。
-        #
-        # 如果忘记点这个按钮，Tab3 里就会出现“有岗位工资，但没有绩效工资”的情况。
-        # 所以这里提前给出状态提示，避免以后每个月漏操作。
-        total_perf_rows = len(df_perf)
-        zero_perf_rows = (df_perf["已算出的绩效"].fillna(0) == 0).sum()
-        nonzero_perf_rows = total_perf_rows - zero_perf_rows
-
-        c_status_1, c_status_2, c_status_3 = st.columns(3)
-        c_status_1.metric("本月薪酬底表人数", f"{total_perf_rows} 人")
-        c_status_2.metric("已计算绩效人数", f"{nonzero_perf_rows} 人")
-        c_status_3.metric("绩效仍为0人数", f"{zero_perf_rows} 人")
-
-        if zero_perf_rows > 0:
-            st.warning(
-                "⚠️ 当前仍有人员的【已算出的绩效】为 0。"
-                "如果你还没有点击下方【计算理论绩效总额并入库】，请先点击。"
-                "如果已经点击过，则需要检查这些人的绩效基数、激励包基数或岗位规则是否缺失。"
-            )
-        else:
-            st.success("✅ 当前底表中的绩效工资均已计算。")
-
-        # 在 Python 层面为用户显示友好的列名，避开 SQL 解析雷区
-        df_perf.rename(columns={"本月KPI": "本月KPI(修改这里)"}, inplace=True)
-
-        edited_perf = st.data_editor(
-            df_perf,
-            column_config={
-                "__内部人员ID": None,
-                "本月KPI(修改这里)": st.column_config.NumberColumn(min_value=0, max_value=150, step=1),
-                "激励包倍数": st.column_config.NumberColumn(format="%.2f"),
-                "负责人系数": st.column_config.NumberColumn(format="%.2f"),
-            },
-            disabled=["__内部人员ID", "工号", "姓名", "系统查表_岗位工资", "系统查表_绩效基数", "激励包基数", "已算出的绩效"],
-            use_container_width=True, hide_index=True
+            default_performance_month = previous_month(calc_month)
+        except ValueError:
+            default_performance_month = previous_month(default_month)
+        performance_month = st.text_input(
+            "绩效所属月份",
+            value=default_performance_month,
+            key="payroll_performance_month",
+            help="默认上一个月，例如7月发放6月绩效。",
         )
 
-        if st.button("🧮 计算理论绩效总额并入库"):
-            cursor = conn.cursor()
-            for _, row in edited_perf.iterrows():
-                std = row['系统查表_绩效基数'] or 0
-                p_base = row['激励包基数'] or 0
-                p_coef = row['激励包倍数'] or 1.0
-                kpi = row['本月KPI(修改这里)'] or 100
-                l_coef = row['负责人系数'] or 1.0
+    try:
+        previous_month(calc_month)
+        previous_month(performance_month)
+        payroll_months_valid = True
+    except ValueError:
+        payroll_months_valid = False
+        st.error("发薪月份和绩效所属月份必须使用 YYYY-MM 格式，例如 2026-07。")
 
-                calc_val = round((std + p_base * p_coef) * (kpi / 100.0) * l_coef, 2)
+    st.info(
+        "生成前请先完成人员变动和岗位岗级维护。社保本月尚未生成时也可以先算工资，"
+        "但个人社保扣款会暂时为0，并在下方提示。"
+    )
+    if st.button(
+        "生成或刷新本月工资底稿", type="primary",
+        disabled=not payroll_months_valid,
+    ):
+        try:
+            summary = generate_payroll_draft(calc_month, performance_month)
+            st.session_state["payroll_generate_summary"] = summary
+            status_text = "正式规则" if summary["rule_status"] == "active" else "草稿规则（试运行）"
+            st.success(
+                f"已生成 {summary['generated']} 人，排除非本系统发薪人员 "
+                f"{summary['excluded']} 人；使用{status_text}：{summary['rule_name']}。"
+            )
+        except Exception as exc:
+            st.error(f"生成失败：{exc}")
 
-                cursor.execute("""
-                               UPDATE payroll_monthly_records
-                               SET perf_kpi_score   = ?,
-                                   perf_pack_coef   = ?,
-                                   perf_leader_coef = ?,
-                                   perf_salary_calc = ?
-                               WHERE cost_month = ?
-                                 AND emp_id = ?
-                               """, (kpi, p_coef, l_coef, calc_val, calc_month, row['__内部人员ID']))
-            conn.commit()
-            st.success(f"✅ 绩效核算完毕！底层数据库已刷新。")
+    summary = st.session_state.get("payroll_generate_summary")
+    if summary and summary.get("pay_month") == calc_month:
+        if summary.get("warning_people"):
+            warning_df = pd.DataFrame([
+                {
+                    "姓名": item["name"],
+                    "待处理事项": "；".join(item["warnings"]),
+                }
+                for item in summary["warning_people"]
+            ])
+            with st.expander(
+                f"有 {len(warning_df)} 人存在待处理事项，点击查看",
+                expanded=False,
+            ):
+                st.dataframe(warning_df, use_container_width=True, hide_index=True)
+
+    st.divider()
+    st.write("#### 导入部门提交的人员评分")
+    st.caption(
+        "表格只需要“姓名+分数”两列，也兼容“员工姓名、KPI评分、得分”等常见列名。"
+        "系统按唯一姓名匹配，重名或未找到的人不会写入。"
+    )
+    score_template = pd.DataFrame(columns=["姓名", "分数"])
+    score_buffer = io.BytesIO()
+    with pd.ExcelWriter(score_buffer, engine="openpyxl") as writer:
+        score_template.to_excel(writer, index=False, sheet_name="人员评分")
+    st.download_button(
+        "下载简易评分模板",
+        data=score_buffer.getvalue(),
+        file_name=f"{performance_month}_人员评分模板.xlsx",
+    )
+    score_file = st.file_uploader(
+        "上传姓名和分数表",
+        type=["xlsx", "xls", "csv"],
+        key="payroll_score_upload",
+    )
+    if score_file and st.button("导入评分并重新计算绩效"):
+        try:
+            if score_file.name.lower().endswith(".csv"):
+                score_df = pd.read_csv(score_file)
+            else:
+                score_df = pd.read_excel(score_file)
+            score_df.columns = [str(col).replace("\n", "").strip() for col in score_df.columns]
+            name_col = next(
+                (col for col in ["姓名", "员工姓名", "人员姓名"] if col in score_df.columns),
+                None,
+            )
+            score_col = next(
+                (col for col in ["分数", "KPI评分", "得分", "评分"] if col in score_df.columns),
+                None,
+            )
+            if not name_col or not score_col:
+                raise ValueError("没有识别到姓名列和分数列")
+            conn_score = _get_db_connection()
+            matched = {}
+            unmatched = []
+            try:
+                for _, row in score_df.iterrows():
+                    name = str(row.get(name_col) or "").strip()
+                    if not name:
+                        continue
+                    emp_id = resolve_employee_reference(name=name, conn=conn_score)
+                    score = pd.to_numeric(row.get(score_col), errors="coerce")
+                    if not emp_id or pd.isna(score):
+                        unmatched.append(name)
+                        continue
+                    matched[emp_id] = float(score)
+            finally:
+                conn_score.close()
+            save_person_scores(calc_month, matched, score_file.name)
+            summary = generate_payroll_draft(calc_month, performance_month)
+            st.session_state["payroll_generate_summary"] = summary
+            st.success(f"成功导入并计算 {len(matched)} 人的评分。")
+            if unmatched:
+                st.warning("以下人员未匹配或分数无效：" + "、".join(dict.fromkeys(unmatched)))
             st.rerun()
-    else:
-        st.info("👆 请先在上方执行【抓取固定底薪与社保】按钮生成底表。")
+        except Exception as exc:
+            st.error(f"评分导入失败：{exc}")
+
+    st.divider()
+    conn = _get_db_connection()
+    df_perf = pd.read_sql_query(
+        """
+        SELECT p.emp_id AS "__内部人员ID",
+               COALESCE(e.employee_no, '待分配') AS "工号",
+               e.name AS "姓名", p.dept_name AS "归属部门",
+               p.pos_name_snapshot AS "绩效岗位",
+               p.performance_month AS "绩效月份",
+               p.base_salary AS "岗位工资",
+               p.perf_standard AS "原绩效",
+               p.perf_base AS "激励包",
+               p.perf_pack_coef AS "激励包倍数",
+               p.perf_kpi_score AS "人员分数",
+               p.perf_leader_coef AS "负责人激励系数",
+               p.perf_excel_coef AS "人才身份系数",
+               p.perf_salary_calc AS "已算绩效",
+               CASE p.calculation_mode
+                 WHEN 'external_notice' THEN '外部来函核定'
+                 WHEN 'manual' THEN '人工核定'
+                 ELSE '系统规则计算'
+               END AS "核定方式",
+               p.calculation_warnings AS "待处理事项"
+        FROM payroll_monthly_records p
+        JOIN employees e ON p.emp_id=e.emp_id
+        WHERE p.cost_month=?
+        ORDER BY p.dept_name, e.name
+        """,
+        conn,
+        params=[calc_month],
+    )
     conn.close()
+    if df_perf.empty:
+        st.info("请先生成本月工资底稿。")
+    else:
+        def _warning_label(raw):
+            try:
+                return "；".join(json.loads(raw or "[]"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return str(raw or "")
+
+        df_perf["待处理事项"] = df_perf["待处理事项"].map(_warning_label)
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("本月发薪人数", f"{len(df_perf)} 人")
+        m2.metric("岗位工资合计", f"{df_perf['岗位工资'].sum():,.2f}")
+        m3.metric("绩效合计", f"{df_perf['已算绩效'].sum():,.2f}")
+        m4.metric("待处理人数", f"{(df_perf['待处理事项'] != '').sum()} 人")
+        edited_perf = st.data_editor(
+            df_perf,
+            use_container_width=True,
+            hide_index=True,
+            disabled=[
+                "__内部人员ID", "工号", "姓名", "归属部门", "绩效岗位",
+                "绩效月份", "岗位工资", "原绩效", "激励包", "人才身份系数",
+                "已算绩效", "核定方式", "待处理事项",
+            ],
+            column_config={
+                "__内部人员ID": None,
+                "人员分数": st.column_config.NumberColumn(min_value=0, max_value=150, step=0.01),
+                "激励包倍数": st.column_config.NumberColumn(format="%.2f"),
+                "负责人激励系数": st.column_config.NumberColumn(format="%.2f"),
+            },
+        )
+        if st.button("保存调整并重新计算绩效", type="primary"):
+            updates = [
+                {
+                    "emp_id": row["__内部人员ID"],
+                    "score": row["人员分数"],
+                    "pack_coef": row["激励包倍数"],
+                    "leader_coef": row["负责人激励系数"],
+                }
+                for _, row in edited_perf.iterrows()
+            ]
+            recalculate_payroll_performance(calc_month, updates)
+            st.success("评分和月度系数已保存，绩效及应发实发已重新计算。")
+            st.rerun()
 
 # ------------------------------------------------------------------------------
 # Tab 3: 财务个税回灌与结算
@@ -1100,16 +1118,21 @@ with tab3:
             IFNULL(p.base_salary, 0)                                   AS "岗位工资",
             IFNULL(p.seniority_pay, 0)                                 AS "工龄工资",
             IFNULL(p.comp_subsidy, 0)                                  AS "综合补贴",
+            IFNULL(p.perf_float_subsidy, 0)                            AS "岗位绩效浮动补贴",
             IFNULL(p.telecom_subsidy, 0)                               AS "通讯补贴",
             IFNULL(p.position_adj, 0)                                  AS "岗位补/扣",
+            IFNULL(p.intern_subsidy, 0)                                AS "实习补贴",
+            IFNULL(p.graduate_allowance, 0)                            AS "高校毕业生津贴",
             IFNULL(p.expert_allowance, 0)                              AS "专家/特殊津贴",
 
             IFNULL(p.perf_salary_calc, 0)                              AS "已算绩效",
             IFNULL(p.perf_adj, 0)                                      AS "绩效补/扣",
 
             IFNULL(p.promotion_backpay, 0)                             AS "晋升补发",
-            IFNULL(p.special_bonus_total, 0)                           AS "专项奖惩及提成合计",
+            IFNULL(p.commission_pay, 0)                                AS "提成",
+            IFNULL(p.special_bonus_total, 0)                           AS "专项奖惩合计",
             IFNULL(p.history_clearance, 0)                             AS "历史清算",
+            IFNULL(p.female_labor_subsidy, 0)                          AS "女工劳保费",
 
             IFNULL(p.ss_pension_pers, 0)                               AS "养老个人",
             IFNULL(p.ss_medical_mix, 0)                                AS "医疗个人含大病",
@@ -1124,7 +1147,8 @@ with tab3:
              + IFNULL(p.ss_annuity_pers, 0))                           AS "五险两金代扣",
 
             IFNULL(p.tax_deduction, 0)                                 AS "代扣个税",
-            IFNULL(p.gross_salary_total, 0)                            AS "系统算_应发总计",
+            IFNULL(p.gross_salary_total, 0)                            AS "系统算_人工成本应发",
+            IFNULL(p.cash_payable_total, 0)                            AS "系统算_现金应发",
             IFNULL(p.net_salary, 0)                                    AS "系统算_最终实发"
 
         FROM payroll_monthly_records p
@@ -1166,13 +1190,17 @@ with tab3:
                 float(row["岗位工资"] or 0)
                 + float(row["工龄工资"] or 0)
                 + float(row["综合补贴"] or 0)
+                + float(row["岗位绩效浮动补贴"] or 0)
                 + float(row["通讯补贴"] or 0)
                 + float(row["岗位补/扣"] or 0)
+                + float(row["实习补贴"] or 0)
+                + float(row["高校毕业生津贴"] or 0)
                 + float(row["专家/特殊津贴"] or 0)
                 + float(row["已算绩效"] or 0)
                 + float(row["绩效补/扣"] or 0)
                 + float(row["晋升补发"] or 0)
-                + float(row["专项奖惩及提成合计"] or 0)
+                + float(row["提成"] or 0)
+                + float(row["专项奖惩合计"] or 0)
                 + float(row["历史清算"] or 0)
             )
 
@@ -1212,9 +1240,12 @@ with tab3:
         # 这里的“理论”只是用于页面预览；
         # 真正写入数据库，要点击后面的按钮。
         preview_df["页面测算_应发"] = preview_df.apply(calc_gross_from_row, axis=1)
+        preview_df["页面测算_现金应发"] = (
+            preview_df["页面测算_应发"] + preview_df["女工劳保费"]
+        ).round(2)
         preview_df["页面测算_五险两金"] = preview_df.apply(calc_social_total_from_row, axis=1)
         preview_df["页面测算_实发"] = (
-            preview_df["页面测算_应发"]
+            preview_df["页面测算_现金应发"]
             - preview_df["页面测算_五险两金"]
             - preview_df["代扣个税"]
         ).round(2)
@@ -1244,16 +1275,22 @@ with tab3:
             "岗位工资",
             "工龄工资",
             "综合补贴",
+            "岗位绩效浮动补贴",
             "通讯补贴",
             "岗位补/扣",
+            "实习补贴",
+            "高校毕业生津贴",
             "专家/特殊津贴",
             "已算绩效",
             "绩效补/扣",
             "晋升补发",
-            "专项奖惩及提成合计",
+            "提成",
+            "专项奖惩合计",
             "历史清算",
+            "女工劳保费",
 
             "页面测算_应发",
+            "页面测算_现金应发",
 
             "养老个人",
             "医疗个人含大病",
@@ -1269,6 +1306,7 @@ with tab3:
         # 改成更适合财务看的列名。
         finance_export_df.rename(columns={
             "页面测算_应发": "应发工资合计",
+            "页面测算_现金应发": "含女工劳保费现金应发",
             "页面测算_五险两金": "五险两金个人合计",
             "页面测算_实发": "实发工资测算"
         }, inplace=True)
@@ -1374,7 +1412,7 @@ with tab3:
                         cursor.execute(
                             """
                             SELECT
-                                IFNULL(gross_salary_total, 0),
+                                IFNULL(cash_payable_total, 0),
                                 IFNULL(ss_pension_pers, 0),
                                 IFNULL(ss_medical_mix, 0),
                                 IFNULL(ss_unemp_pers, 0),
@@ -1393,7 +1431,7 @@ with tab3:
                             skipped_not_in_main += 1
                             continue
 
-                        gross_salary = safe_money_to_float(found[0])
+                        cash_payable = safe_money_to_float(found[0])
                         social_total = (
                             safe_money_to_float(found[1])
                             + safe_money_to_float(found[2])
@@ -1405,7 +1443,7 @@ with tab3:
                         # 如果还没点击过“重新计算薪酬草稿应发/实发”，
                         # gross_salary_total 可能还是 0。
                         # 这里仍然照实计算，但后面会给提示。
-                        net_salary = round(gross_salary - social_total - tax_amount, 2)
+                        net_salary = round(cash_payable - social_total - tax_amount, 2)
 
                         cursor.execute(
                             """
@@ -1448,7 +1486,8 @@ with tab3:
         st.write("### 3️⃣ 手工调整与草稿结账")
 
         st.caption(
-            "这里可以人工改：岗位补/扣、专家/特殊津贴、绩效补/扣、晋升补发、专项奖惩及提成、历史清算、个税。"
+            "这里可以人工改：岗位补/扣、实习及毕业生津贴、专家/特殊津贴、绩效补/扣、"
+            "女工劳保费、提成、专项奖惩、晋升补发、历史清算和个税。"
             "底薪、已算绩效、五险两金代扣暂时锁定，避免误改。"
         )
 
@@ -1457,11 +1496,15 @@ with tab3:
             column_config={
                 "__内部人员ID": None,
                 "岗位补/扣": st.column_config.NumberColumn(format="%.2f"),
+                "实习补贴": st.column_config.NumberColumn(format="%.2f"),
+                "高校毕业生津贴": st.column_config.NumberColumn(format="%.2f"),
                 "专家/特殊津贴": st.column_config.NumberColumn(format="%.2f"),
                 "绩效补/扣": st.column_config.NumberColumn(format="%.2f"),
                 "晋升补发": st.column_config.NumberColumn(format="%.2f"),
-                "专项奖惩及提成合计": st.column_config.NumberColumn(format="%.2f"),
+                "提成": st.column_config.NumberColumn(format="%.2f"),
+                "专项奖惩合计": st.column_config.NumberColumn(format="%.2f"),
                 "历史清算": st.column_config.NumberColumn(format="%.2f"),
+                "女工劳保费": st.column_config.NumberColumn(format="%.2f"),
                 "代扣个税": st.column_config.NumberColumn(format="%.2f"),
             },
             disabled=[
@@ -1471,6 +1514,7 @@ with tab3:
                 "岗位工资",
                 "工龄工资",
                 "综合补贴",
+                "岗位绩效浮动补贴",
                 "通讯补贴",
                 "已算绩效",
                 "养老个人",
@@ -1479,7 +1523,8 @@ with tab3:
                 "公积金个人",
                 "年金个人",
                 "五险两金代扣",
-                "系统算_应发总计",
+                "系统算_人工成本应发",
+                "系统算_现金应发",
                 "系统算_最终实发"
             ],
             use_container_width=True,
@@ -1503,9 +1548,12 @@ with tab3:
                 # 计算个人社保公积金代扣合计。
                 social_total = calc_social_total_from_row(row)
 
+                # 女工劳保费参与现金发放和实发，但不进入人工成本应发。
+                cash_payable = gross + float(row["女工劳保费"] or 0)
+
                 # 计算实发工资。
                 net = (
-                    gross
+                    cash_payable
                     - social_total
                     - float(row["代扣个税"] or 0)
                 )
@@ -1515,26 +1563,36 @@ with tab3:
                     """
                     UPDATE payroll_monthly_records
                     SET position_adj        = ?,
+                        intern_subsidy      = ?,
+                        graduate_allowance = ?,
                         expert_allowance    = ?,
                         perf_adj            = ?,
                         promotion_backpay   = ?,
+                        commission_pay      = ?,
                         special_bonus_total = ?,
                         history_clearance   = ?,
+                        female_labor_subsidy = ?,
                         tax_deduction       = ?,
                         gross_salary_total  = ?,
+                        cash_payable_total  = ?,
                         net_salary          = ?
                     WHERE cost_month = ?
                       AND emp_id = ?
                     """,
                     (
                         float(row["岗位补/扣"] or 0),
+                        float(row["实习补贴"] or 0),
+                        float(row["高校毕业生津贴"] or 0),
                         float(row["专家/特殊津贴"] or 0),
                         float(row["绩效补/扣"] or 0),
                         float(row["晋升补发"] or 0),
-                        float(row["专项奖惩及提成合计"] or 0),
+                        float(row["提成"] or 0),
+                        float(row["专项奖惩合计"] or 0),
                         float(row["历史清算"] or 0),
+                        float(row["女工劳保费"] or 0),
                         float(row["代扣个税"] or 0),
                         round(gross, 2),
+                        round(cash_payable, 2),
                         round(net, 2),
                         final_month,
                         row["__内部人员ID"]
@@ -1595,8 +1653,11 @@ with tab4:
             IFNULL(p.base_salary, 0)                                    AS "岗位工资",
             IFNULL(p.seniority_pay, 0)                                  AS "工龄工资",
             IFNULL(p.comp_subsidy, 0)                                   AS "综合补贴",
+            IFNULL(p.perf_float_subsidy, 0)                             AS "岗位绩效浮动补贴",
             IFNULL(p.telecom_subsidy, 0)                                AS "通讯补贴",
             IFNULL(p.position_adj, 0)                                   AS "岗位补/扣",
+            IFNULL(p.intern_subsidy, 0)                                 AS "实习补贴",
+            IFNULL(p.graduate_allowance, 0)                             AS "高校毕业生津贴",
             IFNULL(p.expert_allowance, 0)                               AS "专家/特殊津贴",
 
             IFNULL(p.perf_standard, 0)                                  AS "绩效标准",
@@ -1608,8 +1669,10 @@ with tab4:
             IFNULL(p.perf_adj, 0)                                       AS "绩效补/扣",
 
             IFNULL(p.promotion_backpay, 0)                              AS "晋升补发",
-            IFNULL(p.special_bonus_total, 0)                            AS "专项奖惩及提成合计",
+            IFNULL(p.commission_pay, 0)                                 AS "提成",
+            IFNULL(p.special_bonus_total, 0)                            AS "专项奖惩合计",
             IFNULL(p.history_clearance, 0)                              AS "历史清算",
+            IFNULL(p.female_labor_subsidy, 0)                           AS "女工劳保费",
 
             IFNULL(p.ss_pension_pers, 0)                                AS "养老个人",
             IFNULL(p.ss_medical_mix, 0)                                 AS "医疗个人含大病",
@@ -1618,7 +1681,8 @@ with tab4:
             IFNULL(p.ss_annuity_pers, 0)                                AS "年金个人",
 
             IFNULL(p.tax_deduction, 0)                                  AS "代扣个税",
-            IFNULL(p.gross_salary_total, 0)                             AS "应发工资合计",
+            IFNULL(p.gross_salary_total, 0)                             AS "人工成本应发合计",
+            IFNULL(p.cash_payable_total, 0)                             AS "现金应发合计",
             IFNULL(p.net_salary, 0)                                     AS "实发工资",
 
             IFNULL(p.audit_status, '草稿')                              AS "状态",
@@ -1655,25 +1719,33 @@ with tab4:
             payroll_df["岗位工资"]
             + payroll_df["工龄工资"]
             + payroll_df["综合补贴"]
+            + payroll_df["岗位绩效浮动补贴"]
             + payroll_df["通讯补贴"]
             + payroll_df["岗位补/扣"]
+            + payroll_df["实习补贴"]
+            + payroll_df["高校毕业生津贴"]
             + payroll_df["专家/特殊津贴"]
             + payroll_df["绩效工资"]
             + payroll_df["绩效补/扣"]
             + payroll_df["晋升补发"]
-            + payroll_df["专项奖惩及提成合计"]
+            + payroll_df["提成"]
+            + payroll_df["专项奖惩合计"]
             + payroll_df["历史清算"]
         ).round(2)
 
+        payroll_df["页面复核_现金应发"] = (
+            payroll_df["页面复核_应发"] + payroll_df["女工劳保费"]
+        ).round(2)
+
         payroll_df["页面复核_实发"] = (
-            payroll_df["页面复核_应发"]
+            payroll_df["页面复核_现金应发"]
             - payroll_df["五险两金个人合计"]
             - payroll_df["代扣个税"]
         ).round(2)
 
         payroll_df["应发差异"] = (
             payroll_df["页面复核_应发"]
-            - payroll_df["应发工资合计"]
+            - payroll_df["人工成本应发合计"]
         ).round(2)
 
         payroll_df["实发差异"] = (
@@ -1688,7 +1760,7 @@ with tab4:
         m1, m2, m3, m4, m5 = st.columns(5)
 
         m1.metric("薪酬人数", f"{len(payroll_df)} 人")
-        m2.metric("应发合计", f"{payroll_df['应发工资合计'].sum():,.2f}")
+        m2.metric("人工成本应发", f"{payroll_df['人工成本应发合计'].sum():,.2f}")
         m3.metric("五险两金个人合计", f"{payroll_df['五险两金个人合计'].sum():,.2f}")
         m4.metric("个税合计", f"{payroll_df['代扣个税'].sum():,.2f}")
         m5.metric("实发合计", f"{payroll_df['实发工资'].sum():,.2f}")
@@ -1701,7 +1773,7 @@ with tab4:
 
         gross_diff_count = (payroll_df["应发差异"].abs() > 0.01).sum()
         net_diff_count = (payroll_df["实发差异"].abs() > 0.01).sum()
-        zero_gross_count = (payroll_df["应发工资合计"].fillna(0) == 0).sum()
+        zero_gross_count = (payroll_df["人工成本应发合计"].fillna(0) == 0).sum()
         zero_net_count = (payroll_df["实发工资"].fillna(0) == 0).sum()
         zero_perf_count = (payroll_df["绩效工资"].fillna(0) == 0).sum()
         zero_tax_count = (payroll_df["代扣个税"].fillna(0) == 0).sum()
@@ -1793,9 +1865,12 @@ with tab4:
             "绩效工资",
             "绩效补/扣",
             "晋升补发",
-            "专项奖惩及提成合计",
+            "女工劳保费",
+            "提成",
+            "专项奖惩合计",
             "历史清算",
-            "应发工资合计",
+            "人工成本应发合计",
+            "现金应发合计",
             "五险两金个人合计",
             "代扣个税",
             "实发工资",
@@ -1823,9 +1898,11 @@ with tab4:
                 "工号": "count",
                 "岗位工资": "sum",
                 "绩效工资": "sum",
-                "专项奖惩及提成合计": "sum",
+                "提成": "sum",
+                "专项奖惩合计": "sum",
                 "历史清算": "sum",
-                "应发工资合计": "sum",
+                "人工成本应发合计": "sum",
+                "现金应发合计": "sum",
                 "五险两金个人合计": "sum",
                 "代扣个税": "sum",
                 "实发工资": "sum"
@@ -1873,15 +1950,21 @@ with tab4:
             "岗位工资",
             "工龄工资",
             "综合补贴",
+            "岗位绩效浮动补贴",
             "通讯补贴",
             "岗位补/扣",
+            "实习补贴",
+            "高校毕业生津贴",
             "专家/特殊津贴",
             "绩效工资",
             "绩效补/扣",
             "晋升补发",
-            "专项奖惩及提成合计",
+            "女工劳保费",
+            "提成",
+            "专项奖惩合计",
             "历史清算",
-            "应发工资合计",
+            "人工成本应发合计",
+            "现金应发合计",
             "代扣个税",
             "实发工资"
         ]].copy()
@@ -1952,8 +2035,8 @@ with tab4:
 with tab5:
     st.subheader("⚙️ 薪酬规则总阀门")
     st.caption(
-        "先维护规则、完成岗位归类并通过试算，再接入正式月度算薪。"
-        "本页不会回写已经生成的历史工资。"
+        "草稿规则可用于本月试算；完成岗位归类并通过全部检查后，再启用为正式规则。"
+        "维护规则不会自动回写已经生成的历史工资。"
     )
 
     rule_versions = get_rule_versions()
@@ -2002,12 +2085,13 @@ with tab5:
             else:
                 st.error(msg)
 
-    rule_tab1, rule_tab2, rule_tab3, rule_tab4, rule_tab5 = st.tabs([
+    rule_tab1, rule_tab2, rule_tab3, rule_tab4, rule_tab5, rule_tab6 = st.tabs([
         "① 基础参数与检查",
         "② 岗位工资",
         "③ 原绩效",
         "④ 激励包",
         "⑤ 岗位归类与试算",
+        "⑥ 优才与专家规则",
     ])
 
     with rule_tab1:
@@ -2114,7 +2198,8 @@ with tab5:
             leader_rules_df,
             use_container_width=True,
             hide_index=True,
-            disabled=['公司领导岗位'],
+            disabled=['岗位ID', '公司领导岗位', '当前在职人数'],
+            column_config={'岗位ID': None},
             key=f"leader_rules_{selected_version_id}",
         )
         if st.button("保存公司领导标准", key=f"save_leader_{selected_version_id}"):
@@ -2270,3 +2355,43 @@ with tab5:
         )
         for issue in trial_result['问题']:
             st.warning(issue)
+
+    with rule_tab6:
+        st.write("#### 优才、技术精英与省公司专家待遇规则")
+        st.caption(
+            "这里维护规则，不维护人员名单。具体谁具有什么身份、聘期何时开始结束，"
+            "统一在人员模块的“特殊人员与待遇 → 薪酬身份与聘期”设置。"
+        )
+        identity_rule_df = get_identity_rules(selected_version_id)
+        if identity_rule_df.empty:
+            st.info("当前规则版本尚未建立人才身份待遇规则。")
+        else:
+            display_identity_rules = identity_rule_df[[
+                '规则ID', '身份规则', '绩效倍数', '年度津贴',
+                '月度发放比例', '年度考评比例', '启用', '说明',
+            ]].copy()
+            edited_identity_rules = st.data_editor(
+                display_identity_rules,
+                use_container_width=True,
+                hide_index=True,
+                disabled=['规则ID', '身份规则'],
+                column_config={
+                    '规则ID': None,
+                    '绩效倍数': st.column_config.NumberColumn(format="%.2f"),
+                    '年度津贴': st.column_config.NumberColumn(format="%.2f"),
+                    '月度发放比例': st.column_config.NumberColumn(format="%.2f"),
+                    '年度考评比例': st.column_config.NumberColumn(format="%.2f"),
+                    '启用': st.column_config.CheckboxColumn(),
+                },
+                key=f"identity_rules_{selected_version_id}",
+            )
+            if st.button("保存人才身份待遇规则", key=f"save_identity_rules_{selected_version_id}"):
+                ok, msg = save_identity_rules(
+                    selected_version_id, edited_identity_rules
+                )
+                st.success(msg) if ok else st.error(msg)
+        st.info(
+            "多重身份不会叠加：普通身份、集团优才和省级优才分别形成绩效候选值，"
+            "系统取其中最高值。技术精英3万/首席技术精英6万元的50%按月发放；"
+            "省公司一级、二级专家需维护聘任前基线后才启用历史差额自动计算。"
+        )

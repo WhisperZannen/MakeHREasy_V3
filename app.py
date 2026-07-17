@@ -9,6 +9,7 @@ import sqlite3
 import os
 
 from database.init_db import init_database
+from modules.core_personnel import get_organization_integrity_issues
 
 st.set_page_config(page_title="MakeHREasy 系统中枢", layout="wide")
 
@@ -28,13 +29,16 @@ initialize_runtime_database()
 # ------------------------------------------------------------------------------
 def get_dashboard_metrics():
     current_dir = os.path.dirname(os.path.abspath(__file__))
-    db_path = os.path.join(current_dir, 'database', 'hr_core.db')
+    db_path = os.environ.get(
+        'MAKE_HR_DB_PATH', os.path.join(current_dir, 'database', 'hr_core.db')
+    )
     metrics = {
         "total_active": 0,
         "interns_count": 0,
         "special_arrangements": 0,
         "expiring_arrangements": 0,
         "db_status": "离线",
+        "organization_issues": [],
     }
     try:
         if os.path.exists(db_path):
@@ -72,6 +76,7 @@ def get_dashboard_metrics():
             """)
             metrics["expiring_arrangements"] = cursor.fetchone()[0]
             conn.close()
+            metrics["organization_issues"] = get_organization_integrity_issues()
     except Exception as e:
         metrics["db_status"] = f"连接异常: {e}"
     return metrics
@@ -100,7 +105,8 @@ def render_home_page():
         m2.metric("在期实习生 (真实)", f"{real_data['interns_count']} 人")
         m3.metric("特殊用工关系", f"{real_data['special_arrangements']} 人")
         m4.metric("90天内到期", f"{real_data['expiring_arrangements']} 人")
-        m5.metric("台账库对齐状态", "正常")
+        issue_count = len(real_data['organization_issues'])
+        m5.metric("人员组织关联", "正常" if issue_count == 0 else f"{issue_count}项异常")
 
         st.write("<br>", unsafe_allow_html=True)
 
@@ -120,10 +126,23 @@ def render_home_page():
         comp_df = pd.DataFrame([
             {"组件名称": "1_personnel.py", "功能定位": "人事档案与组织管理", "状态": "✅ 正常"},
             {"组件名称": "2_social.py", "功能定位": "社保五险两金算力层", "状态": "✅ 正常"},
-            {"组件名称": "3_payroll.py", "功能定位": "薪酬回溯与结算引擎", "状态": "⏳ 正在构建"},
+            {"组件名称": "3_payroll.py", "功能定位": "薪酬回溯与结算引擎", "状态": "✅ 正常"},
             {"组件名称": "4_ledger.py", "功能定位": "人工成本财务总账", "状态": "✅ 正常"},
         ])
         st.dataframe(comp_df, use_container_width=True, hide_index=True)
+
+        st.markdown("#### 🔗 跨模块人员组织关联")
+        if real_data['organization_issues']:
+            issue_df = pd.DataFrame(real_data['organization_issues']).rename(columns={
+                'employee_no': '工号', 'name': '姓名', 'issue': '异常事项',
+            })
+            st.error(f"发现 {len(issue_df)} 项会影响社保、薪酬或人工成本的关联异常。")
+            st.dataframe(
+                issue_df[['工号', '姓名', '异常事项']],
+                use_container_width=True, hide_index=True,
+            )
+        else:
+            st.success("当前在职及挂靠人员的部门、岗位和特殊关系均有效。")
 
 
 # ==============================================================================

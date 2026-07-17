@@ -37,6 +37,20 @@ RULE_STATUS_LABELS = {
     'retired': '已停用',
 }
 
+IDENTITY_TYPE_LABELS = {
+    'talent': '优才',
+    'technical_elite': '技术精英',
+    'province_expert': '省公司专家',
+}
+IDENTITY_LEVEL_LABELS = {
+    ('talent', 'group'): '集团优才',
+    ('talent', 'province'): '省级优才',
+    ('technical_elite', 'elite'): '技术精英',
+    ('technical_elite', 'chief'): '首席技术精英',
+    ('province_expert', 'level_1'): '一级专家',
+    ('province_expert', 'level_2'): '二级专家',
+}
+
 
 def _get_db_connection():
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -65,6 +79,66 @@ def get_rule_versions():
             ''',
             conn,
         )
+    finally:
+        conn.close()
+
+
+def get_identity_rules(version_id):
+    conn = _get_db_connection()
+    try:
+        df = pd.read_sql_query(
+            '''
+            SELECT identity_rule_id AS 规则ID, identity_type, identity_level,
+                   calculation_mode,
+                   performance_multiplier AS 绩效倍数,
+                   annual_allowance AS 年度津贴,
+                   monthly_share AS 月度发放比例,
+                   annual_share AS 年度考评比例,
+                   enabled AS 启用,
+                   COALESCE(remarks, '') AS 说明
+            FROM payroll_identity_rules
+            WHERE rule_version_id=?
+            ORDER BY identity_type, identity_level
+            ''', conn, params=[int(version_id)],
+        )
+        if not df.empty:
+            df['身份规则'] = df.apply(
+                lambda row: IDENTITY_LEVEL_LABELS.get(
+                    (row['identity_type'], row['identity_level']),
+                    f"{row['identity_type']}:{row['identity_level']}",
+                ), axis=1,
+            )
+        return df
+    finally:
+        conn.close()
+
+
+def save_identity_rules(version_id, dataframe):
+    conn = _get_db_connection()
+    try:
+        for _, row in dataframe.iterrows():
+            conn.execute(
+                '''
+                UPDATE payroll_identity_rules
+                SET performance_multiplier=?, annual_allowance=?,
+                    monthly_share=?, annual_share=?, enabled=?, remarks=?
+                WHERE identity_rule_id=? AND rule_version_id=?
+                ''',
+                (
+                    _number(row.get('绩效倍数'), allow_none=True),
+                    _number(row.get('年度津贴'), allow_none=True),
+                    _number(row.get('月度发放比例'), allow_none=True),
+                    _number(row.get('年度考评比例'), allow_none=True),
+                    1 if bool(row.get('启用', True)) else 0,
+                    str(row.get('说明') or '').strip(),
+                    int(row['规则ID']), int(version_id),
+                ),
+            )
+        conn.commit()
+        return True, '人才身份待遇规则已保存'
+    except Exception as exc:
+        conn.rollback()
+        return False, str(exc)
     finally:
         conn.close()
 
@@ -181,8 +255,8 @@ def copy_rule_version(source_version_id, rule_name, effective_from_month):
                 'source_order, remarks',
             ),
             'payroll_company_leader_rules': (
-                'leader_position_name, standard_amount, remarks',
-                'leader_position_name, standard_amount, remarks',
+                'pos_id, leader_position_name, standard_amount, remarks',
+                'pos_id, leader_position_name, standard_amount, remarks',
             ),
             'payroll_position_rule_mappings': (
                 'pos_id, payroll_category, management_role, official_position_name, '
@@ -193,6 +267,14 @@ def copy_rule_version(source_version_id, rule_name, effective_from_month):
             'payroll_person_calculation_overrides': (
                 'emp_id, calculation_mode, counterparty_name, remarks, enabled',
                 'emp_id, calculation_mode, counterparty_name, remarks, enabled',
+            ),
+            'payroll_identity_rules': (
+                'identity_type, identity_level, calculation_mode, '
+                'performance_multiplier, annual_allowance, monthly_share, '
+                'annual_share, parameters_json, enabled, remarks',
+                'identity_type, identity_level, calculation_mode, '
+                'performance_multiplier, annual_allowance, monthly_share, '
+                'annual_share, parameters_json, enabled, remarks',
             ),
         }
         for table, (target_columns, source_columns) in copy_specs.items():
@@ -430,12 +512,22 @@ def get_company_leader_rules(version_id):
     try:
         return pd.read_sql_query(
             '''
-            SELECT leader_position_name AS 公司领导岗位,
-                   standard_amount AS 省公司绩效标准,
-                   COALESCE(remarks, '') AS 备注
-            FROM payroll_company_leader_rules
-            WHERE rule_version_id = ?
-            ORDER BY leader_position_name
+            SELECT p.pos_id AS 岗位ID, p.pos_name AS 公司领导岗位,
+                   r.standard_amount AS 省公司绩效标准,
+                   COALESCE(r.remarks, '') AS 备注,
+                   COUNT(CASE WHEN e.status = '在职' THEN 1 END) AS 当前在职人数
+            FROM positions p
+            JOIN payroll_position_rule_mappings m
+              ON m.pos_id=p.pos_id AND m.rule_version_id=?
+             AND m.payroll_category='company_leader' AND m.enabled=1
+            LEFT JOIN payroll_company_leader_rules r
+              ON r.rule_version_id=m.rule_version_id
+             AND (r.pos_id=p.pos_id OR (r.pos_id IS NULL AND p.pos_name=r.leader_position_name))
+            LEFT JOIN employee_profiles ep ON ep.pos_id = p.pos_id
+            LEFT JOIN employees e ON e.emp_id = ep.emp_id
+            WHERE p.status = 1
+            GROUP BY p.pos_id, p.pos_name, r.standard_amount, r.remarks
+            ORDER BY p.sort_order, p.pos_id
             ''', conn, params=[int(version_id)],
         )
     finally:
@@ -445,26 +537,41 @@ def get_company_leader_rules(version_id):
 def save_company_leader_rules(version_id, dataframe):
     conn = _get_db_connection()
     try:
-        rows = []
         for _, row in dataframe.iterrows():
             name = str(row.get('公司领导岗位') or '').strip()
-            if name:
-                rows.append((
-                    int(version_id), name,
-                    _number(row.get('省公司绩效标准'), allow_none=True),
-                    str(row.get('备注') or '').strip(),
-                ))
-        conn.execute(
-            'DELETE FROM payroll_company_leader_rules WHERE rule_version_id = ?',
-            (int(version_id),),
-        )
-        conn.executemany(
-            '''
-            INSERT INTO payroll_company_leader_rules(
-                rule_version_id, leader_position_name, standard_amount, remarks
-            ) VALUES (?, ?, ?, ?)
-            ''', rows,
-        )
+            pos_id = row.get('岗位ID')
+            if not name or pos_id is None or pd.isna(pos_id):
+                continue
+            amount = _number(row.get('省公司绩效标准'), allow_none=True)
+            remarks = str(row.get('备注') or '').strip()
+            existing = conn.execute(
+                '''
+                SELECT leader_position_name
+                FROM payroll_company_leader_rules
+                WHERE rule_version_id=? AND pos_id=?
+                ''', (int(version_id), int(pos_id)),
+            ).fetchone()
+            if existing:
+                conn.execute(
+                    '''
+                    UPDATE payroll_company_leader_rules
+                    SET leader_position_name=?, standard_amount=?, remarks=?
+                    WHERE rule_version_id=? AND pos_id=?
+                    ''', (name, amount, remarks, int(version_id), int(pos_id)),
+                )
+            else:
+                conn.execute(
+                    '''
+                    INSERT INTO payroll_company_leader_rules(
+                        rule_version_id, pos_id, leader_position_name,
+                        standard_amount, remarks
+                    ) VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(rule_version_id, leader_position_name)
+                    DO UPDATE SET pos_id=excluded.pos_id,
+                                  standard_amount=excluded.standard_amount,
+                                  remarks=excluded.remarks
+                    ''', (int(version_id), int(pos_id), name, amount, remarks),
+                )
         conn.commit()
         return True, '公司领导绩效标准已保存'
     except Exception as exc:
@@ -484,11 +591,12 @@ def get_position_mappings(version_id):
                    m.management_role,
                    m.official_position_name AS 对应文件岗位,
                    COALESCE(m.enabled, 1) AS enabled,
-                   COUNT(ep.emp_id) AS 当前人数
+                   COUNT(CASE WHEN e.status = '在职' THEN 1 END) AS 当前人数
             FROM positions p
             LEFT JOIN payroll_position_rule_mappings m
               ON p.pos_id = m.pos_id AND m.rule_version_id = ?
             LEFT JOIN employee_profiles ep ON p.pos_id = ep.pos_id
+            LEFT JOIN employees e ON e.emp_id = ep.emp_id
             WHERE p.status = 1
             GROUP BY p.pos_id, p.pos_name, m.payroll_category,
                      m.management_role, m.official_position_name, m.enabled
@@ -606,10 +714,33 @@ def validate_rule_version(version_id):
             f'{active_unclassified}人在未归类岗位',
         ))
 
+        invalid_assignments = conn.execute(
+            '''
+            SELECT COUNT(DISTINCT e.emp_id)
+            FROM employees e
+            LEFT JOIN departments d ON d.dept_id=e.dept_id
+            LEFT JOIN employee_profiles ep ON ep.emp_id=e.emp_id
+            LEFT JOIN positions p ON p.pos_id=ep.pos_id
+            WHERE e.status IN ('在职', '挂靠人员')
+              AND (d.dept_id IS NULL OR d.status<>1 OR p.pos_id IS NULL OR p.status<>1)
+            ''',
+        ).fetchone()[0]
+        checks.append((
+            '当前人员组织有效性', invalid_assignments == 0,
+            '全部有效' if invalid_assignments == 0 else f'{invalid_assignments}人存在停用或缺失的部门岗位',
+        ))
+
         missing_leaders = conn.execute(
             '''
-            SELECT COUNT(*) FROM payroll_company_leader_rules
-            WHERE rule_version_id = ? AND standard_amount IS NULL
+            SELECT COUNT(*)
+            FROM positions p
+            JOIN payroll_position_rule_mappings m
+              ON m.pos_id=p.pos_id AND m.rule_version_id=?
+             AND m.payroll_category='company_leader' AND m.enabled=1
+            LEFT JOIN payroll_company_leader_rules r
+              ON r.rule_version_id=m.rule_version_id
+             AND (r.pos_id=p.pos_id OR (r.pos_id IS NULL AND r.leader_position_name=p.pos_name))
+            WHERE p.status=1 AND r.standard_amount IS NULL
             ''', (int(version_id),),
         ).fetchone()[0]
         checks.append((
@@ -650,9 +781,16 @@ def calculate_rule_preview(version_id, post_rank, post_grade, payroll_category,
         if payroll_category == 'company_leader':
             row = conn.execute(
                 '''
-                SELECT standard_amount FROM payroll_company_leader_rules
-                WHERE rule_version_id = ? AND leader_position_name = ?
-                ''', (int(version_id), str(leader_position_name or '')),
+                SELECT r.standard_amount
+                FROM payroll_company_leader_rules r
+                LEFT JOIN positions p ON p.pos_id=r.pos_id
+                WHERE r.rule_version_id = ?
+                  AND (p.pos_name = ? OR r.leader_position_name = ?)
+                LIMIT 1
+                ''', (
+                    int(version_id), str(leader_position_name or ''),
+                    str(leader_position_name or ''),
+                ),
             ).fetchone()
             original_performance = float(row[0]) if row and row[0] is not None else None
             if original_performance is None:

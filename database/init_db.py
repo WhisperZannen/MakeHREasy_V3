@@ -60,6 +60,38 @@ def ensure_payroll_schema_patch(cursor):
         "promotion_backpay": "REAL DEFAULT 0.0",
         # 晋升补发。
         # 最终结账页面会读取/更新这个字段。
+
+        "performance_month": "TEXT",
+        # 绩效所属月份。比如7月发放工资时，这里通常是6月。
+
+        "payroll_run_id": "TEXT",
+        # 本条工资属于哪一次月度办理批次。
+
+        "rule_version_id": "INTEGER",
+        # 本次计算实际使用的薪酬总阀门版本。
+
+        "dept_id_snapshot": "INTEGER",
+        "pos_id_snapshot": "INTEGER",
+        "pos_name_snapshot": "TEXT",
+        "post_rank_snapshot": "REAL",
+        "post_grade_snapshot": "TEXT",
+        "tech_grade_snapshot": "TEXT",
+        # 上述字段保存算薪时的人员档案快照，防止人员以后变动后历史工资失真。
+
+        "calculation_mode": "TEXT DEFAULT 'automatic'",
+        # automatic=系统规则计算；external_notice=外部函件核定；manual=人工核定。
+
+        "rule_explanation": "TEXT DEFAULT '{}'",
+        "calculation_warnings": "TEXT DEFAULT '[]'",
+        # 保存可解释的公式来源和待处理问题，不要求使用者自己反推金额。
+
+        "perf_float_subsidy": "REAL DEFAULT 0.0",
+        "intern_subsidy": "REAL DEFAULT 0.0",
+        "graduate_allowance": "REAL DEFAULT 0.0",
+        "female_labor_subsidy": "REAL DEFAULT 0.0",
+        "commission_pay": "REAL DEFAULT 0.0",
+        "cash_payable_total": "REAL DEFAULT 0.0",
+        # 补齐现有签字工资表中的独立项目。女工劳保费单列，不混入人工成本应发。
     }
 
     # 逐个检查必需字段。
@@ -75,6 +107,16 @@ def ensure_payroll_schema_patch(cursor):
         cursor.execute(
             f"ALTER TABLE payroll_monthly_records ADD COLUMN {column_name} {column_sql}"
         )
+
+    # 旧工资记录没有“现金应发”字段。迁移时只补出等于原应发的兼容值，
+    # 不重算也不改写任何历史工资明细；以后有女工劳保费的月份再由新引擎单列。
+    cursor.execute('''
+        UPDATE payroll_monthly_records
+        SET cash_payable_total = COALESCE(gross_salary_total, 0)
+                              + COALESCE(female_labor_subsidy, 0)
+        WHERE cash_payable_total IS NULL
+           OR (cash_payable_total = 0 AND COALESCE(gross_salary_total, 0) <> 0)
+    ''')
 
 def ensure_payroll_items_schema_patch(cursor):
     """
@@ -278,8 +320,8 @@ def seed_payroll_item_mapping(cursor):
         ("专项奖", "专项奖", "special_bonus_total", "专项奖", "signed_amount", 1,
          "专项奖合计的一部分，可正可负。"),
 
-        ("提成", "提成", "special_bonus_total", "提成", "signed_amount", 1,
-         "提成并入专项奖惩合计。"),
+        ("提成", "提成", "commission_pay", "提成", "signed_amount", 1,
+         "提成单列展示，不与专项奖惩混在一起。"),
 
         ("考勤扣罚", "考勤扣罚", "special_bonus_total", "考勤扣罚", "signed_amount", 1,
          "考勤扣罚并入专项奖惩合计，通常为负数。"),
@@ -289,11 +331,17 @@ def seed_payroll_item_mapping(cursor):
         # 女工劳保费虽然不再计入省公司人工成本，
         # 但仍然随工资发放，因此属于薪酬应发项目。
         #
-        # 暂时不单独给 payroll_monthly_records 增加字段，
-        # 而是通过月度薪酬项目池保存明细，
-        # 最后汇总到 special_bonus_total。
-        ("女工劳保费", "女工劳保费", "special_bonus_total", "女工劳保费", "signed_amount", 1,
-         "随工资发放，计入薪酬应发；人工成本模块单独记录，但不计入省公司人工成本。"),
+        ("女工劳保费", "女工劳保费", "female_labor_subsidy", "女工劳保费", "signed_amount", 1,
+         "随工资现金发放，但不进入人工成本应发。"),
+
+        ("女工补贴", "女工劳保费", "female_labor_subsidy", "女工劳保费", "signed_amount", 1,
+         "工资表常用简称，口径同女工劳保费。"),
+
+        ("实习补贴", "实习补贴", "intern_subsidy", "实习补贴", "signed_amount", 1,
+         "实习期人员随工资发放的补贴。"),
+
+        ("高校毕业生津贴", "高校毕业生津贴", "graduate_allowance", "高校毕业生津贴", "signed_amount", 1,
+         "高校毕业生津贴单列。"),
 
         ("清算", "清算", "history_clearance", "清算", "signed_amount", 1,
          "历史清算、绩效清算等补扣款。"),
@@ -320,6 +368,16 @@ def seed_payroll_item_mapping(cursor):
             (source_column, item_type, target_field, item_name, sign_rule, enabled, remarks)
             VALUES (?, ?, ?, ?, ?, ?, ?)
         """, row)
+    # 修正旧数据库里已经存在的历史默认映射；只改系统内置的明确口径。
+    cursor.execute(
+        "UPDATE payroll_item_mapping SET target_field='commission_pay', "
+        "remarks='提成单列展示，不与专项奖惩混在一起。' WHERE source_column='提成'"
+    )
+    cursor.execute(
+        "UPDATE payroll_item_mapping SET target_field='female_labor_subsidy', "
+        "remarks='随工资现金发放，但不进入人工成本应发。' "
+        "WHERE source_column IN ('女工劳保费', '女工补贴')"
+    )
 
 
 def _add_columns_if_missing(cursor, table_name, required_columns):
@@ -951,12 +1009,26 @@ def ensure_payroll_rule_dictionary_schema(cursor):
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS payroll_company_leader_rules (
             rule_version_id INTEGER NOT NULL,
+            pos_id INTEGER,
             leader_position_name TEXT NOT NULL,
             standard_amount REAL,
             remarks TEXT,
             PRIMARY KEY(rule_version_id, leader_position_name),
-            FOREIGN KEY(rule_version_id) REFERENCES payroll_rule_versions(rule_version_id)
+            FOREIGN KEY(rule_version_id) REFERENCES payroll_rule_versions(rule_version_id),
+            FOREIGN KEY(pos_id) REFERENCES positions(pos_id)
         )
+    ''')
+    _add_columns_if_missing(cursor, 'payroll_company_leader_rules', {
+        'pos_id': 'INTEGER',
+    })
+    cursor.execute('''
+        UPDATE payroll_company_leader_rules
+        SET pos_id = (
+            SELECT p.pos_id FROM positions p
+            WHERE p.pos_name = payroll_company_leader_rules.leader_position_name
+            LIMIT 1
+        )
+        WHERE pos_id IS NULL
     ''')
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS payroll_position_rule_mappings (
@@ -1093,12 +1165,13 @@ def ensure_payroll_rule_dictionary_schema(cursor):
 
     cursor.executemany('''
         INSERT INTO payroll_company_leader_rules(
-            rule_version_id, leader_position_name, standard_amount, remarks
-        ) VALUES (?, ?, NULL, '等待省公司下发标准')
+            rule_version_id, pos_id, leader_position_name, standard_amount, remarks
+        ) VALUES (?, (SELECT pos_id FROM positions WHERE pos_name=? LIMIT 1),
+                  ?, NULL, '等待省公司下发标准')
     ''', [
-        (version_id, '总经理'),
-        (version_id, '副总经理'),
-        (version_id, '总经理助理兼安全主任'),
+        (version_id, '总经理', '总经理'),
+        (version_id, '副总经理', '副总经理'),
+        (version_id, '总经理助理兼安全主任', '总经理助理兼安全主任'),
     ])
 
     position_rows = cursor.execute(
@@ -1133,6 +1206,118 @@ def ensure_payroll_rule_dictionary_schema(cursor):
         ) VALUES (?, ?, ?, ?, ?, ?)
     ''', mapping_rows)
     _apply_confirmed_payroll_rule_upgrades(cursor)
+
+
+def ensure_payroll_workflow_schema(cursor):
+    """建立发薪批次、评分和薪酬身份底座，兼容既有月度工资主表。"""
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS payroll_runs (
+            payroll_run_id TEXT PRIMARY KEY,
+            pay_month TEXT NOT NULL UNIQUE,
+            performance_month TEXT NOT NULL,
+            rule_version_id INTEGER,
+            rule_status_snapshot TEXT,
+            run_status TEXT NOT NULL DEFAULT 'draft',
+            generated_at TIMESTAMP,
+            closed_at TIMESTAMP,
+            remarks TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(rule_version_id) REFERENCES payroll_rule_versions(rule_version_id)
+        )
+    ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS payroll_score_inputs (
+            score_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            payroll_run_id TEXT NOT NULL,
+            score_scope TEXT NOT NULL,
+            emp_id TEXT,
+            dept_id INTEGER,
+            score REAL NOT NULL,
+            source_file TEXT,
+            source_name TEXT,
+            remarks TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(payroll_run_id, score_scope, emp_id, dept_id),
+            FOREIGN KEY(payroll_run_id) REFERENCES payroll_runs(payroll_run_id),
+            FOREIGN KEY(emp_id) REFERENCES employees(emp_id),
+            FOREIGN KEY(dept_id) REFERENCES departments(dept_id)
+        )
+    ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS employee_payroll_identities (
+            identity_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            emp_id TEXT NOT NULL,
+            identity_type TEXT NOT NULL,
+            identity_level TEXT NOT NULL DEFAULT '',
+            start_date DATE NOT NULL,
+            end_date DATE,
+            source_document TEXT,
+            baseline_snapshot TEXT DEFAULT '{}',
+            status TEXT NOT NULL DEFAULT 'active',
+            remarks TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(emp_id, identity_type, identity_level, start_date),
+            FOREIGN KEY(emp_id) REFERENCES employees(emp_id)
+        )
+    ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS payroll_identity_rules (
+            identity_rule_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            rule_version_id INTEGER NOT NULL,
+            identity_type TEXT NOT NULL,
+            identity_level TEXT NOT NULL DEFAULT '',
+            calculation_mode TEXT NOT NULL,
+            performance_multiplier REAL,
+            annual_allowance REAL,
+            monthly_share REAL,
+            annual_share REAL,
+            parameters_json TEXT DEFAULT '{}',
+            enabled INTEGER NOT NULL DEFAULT 1,
+            remarks TEXT,
+            UNIQUE(rule_version_id, identity_type, identity_level),
+            FOREIGN KEY(rule_version_id) REFERENCES payroll_rule_versions(rule_version_id)
+        )
+    ''')
+    cursor.execute('''
+        CREATE INDEX IF NOT EXISTS idx_payroll_identity_effective
+        ON employee_payroll_identities(emp_id, start_date, end_date, status)
+    ''')
+    cursor.execute('''
+        CREATE INDEX IF NOT EXISTS idx_payroll_scores_run
+        ON payroll_score_inputs(payroll_run_id, score_scope)
+    ''')
+
+    version_ids = [
+        row[0] for row in cursor.execute(
+            'SELECT rule_version_id FROM payroll_rule_versions'
+        ).fetchall()
+    ]
+    identity_rules = [
+        ('talent', 'group', 'performance_multiplier', 2.0, None, None, None,
+         '集团优才：形成绩效候选值，和其他身份比较后取最高值'),
+        ('talent', 'province', 'performance_multiplier', 1.5, None, None, None,
+         '省级优才：形成绩效候选值，和其他身份比较后取最高值'),
+        ('technical_elite', 'elite', 'annual_allowance', None, 30000, 0.5, 0.5,
+         '技术精英：年度津贴3万元，50%按月发放，50%按年度考评发放'),
+        ('technical_elite', 'chief', 'annual_allowance', None, 60000, 0.5, 0.5,
+         '首席技术精英：年度津贴6万元，50%按月发放，50%按年度考评发放'),
+        ('province_expert', 'level_1', 'historical_adjustment', None, None, None, None,
+         '一级专家按聘任前后待遇差额计算，启用自动计算前须维护聘任基线'),
+        ('province_expert', 'level_2', 'historical_adjustment', None, None, None, None,
+         '二级专家按聘任前后待遇差额计算，启用自动计算前须维护聘任基线'),
+    ]
+    for version_id in version_ids:
+        cursor.executemany('''
+            INSERT OR IGNORE INTO payroll_identity_rules(
+                rule_version_id, identity_type, identity_level,
+                calculation_mode, performance_multiplier, annual_allowance,
+                monthly_share, annual_share, remarks
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', [
+            (version_id,) + row for row in identity_rules
+        ])
 
 
 def _apply_confirmed_payroll_rule_upgrades(cursor):
@@ -1999,6 +2184,7 @@ def init_database(db_path=None):
         ensure_work_arrangement_schema(cursor)
         ensure_finance_labor_schema(cursor)
         ensure_payroll_rule_dictionary_schema(cursor)
+        ensure_payroll_workflow_schema(cursor)
 
         conn.commit()
         print("✅ V3.6 用工关系、社保路由与结算底座初始化成功！")

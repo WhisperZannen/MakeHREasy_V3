@@ -13,7 +13,9 @@ def _get_db_connection():
     # 实现了什么具体逻辑：统一定位数据库物理位置。
     current_dir = os.path.dirname(os.path.abspath(__file__))
     project_root = os.path.dirname(current_dir)
-    db_path = os.path.join(project_root, 'database', 'hr_core.db')
+    db_path = os.environ.get(
+        'MAKE_HR_DB_PATH', os.path.join(project_root, 'database', 'hr_core.db')
+    )
     conn = sqlite3.connect(db_path)
     conn.execute("PRAGMA foreign_keys = ON;")
     conn.row_factory = sqlite3.Row
@@ -59,6 +61,25 @@ def update_position(pos_id, new_name, new_category, new_sort_order=999, new_stat
     conn = _get_db_connection()
     cursor = conn.cursor()
     try:
+        current = cursor.execute(
+            "SELECT status FROM positions WHERE pos_id = ?", (int(pos_id),)
+        ).fetchone()
+        if not current:
+            return False, "修改失败：找不到该岗位记录。"
+        if int(new_status) == 0 and int(current['status'] or 0) != 0:
+            assigned = cursor.execute(
+                """
+                SELECT COUNT(*)
+                FROM employee_profiles ep
+                JOIN employees e ON e.emp_id=ep.emp_id
+                WHERE ep.pos_id=? AND e.status IN ('在职', '挂靠人员')
+                """, (int(pos_id),),
+            ).fetchone()[0]
+            if assigned:
+                return False, (
+                    f"该岗位仍有 {assigned} 名在职或挂靠人员，不能停用。"
+                    "请先在人员档案中完成岗位调整。"
+                )
         cursor.execute("""
             UPDATE positions 
             SET pos_name = ?, pos_category = ?, sort_order = ?, status = ?

@@ -46,6 +46,11 @@ from modules.core_arrangements import (
     save_simple_arrangement,
     set_business_entity_active,
 )
+from modules.core_payroll import (
+    end_payroll_identity,
+    get_payroll_identities,
+    save_payroll_identity,
+)
 
 st.set_page_config(page_title="组织人事中枢", layout="wide")
 
@@ -638,8 +643,24 @@ elif current_page == "👥 人员档案":
                 cur_g = str(t_emp_sel.get('post_grade', 'E')) if t_emp_sel is not None and pd.notna(t_emp_sel.get('post_grade')) else 'E'
                 fgrade = st.selectbox("档次*", g_opts, index=g_opts.index(cur_g) if cur_g in g_opts else 5)
             with f3:
-                vp = df_positions[df_positions['status']==1]; pm = {r['pos_id']: r['pos_name'] for _, r in vp.iterrows()}
                 def_p = t_emp_sel.get('pos_id') if t_emp_sel is not None else None
+                vp = df_positions[df_positions['status']==1].copy()
+                # 与部门处理保持一致：当前岗位即使刚被停用，也要原样展示，
+                # 避免编辑其他字段时下拉框静默跳到第一个有效岗位。
+                if def_p is not None and def_p not in vp['pos_id'].tolist():
+                    current_inactive_pos = df_positions[df_positions['pos_id'] == def_p]
+                    if not current_inactive_pos.empty:
+                        vp = pd.concat([current_inactive_pos, vp], ignore_index=True)
+                pos_name_map = {
+                    r['pos_id']: r['pos_name'] for _, r in vp.iterrows()
+                }
+                pm = {
+                    r['pos_id']: (
+                        f"{r['pos_name']}（已停用，请调整）"
+                        if r['status'] != 1 else r['pos_name']
+                    )
+                    for _, r in vp.iterrows()
+                }
                 fpos = st.selectbox("岗位*", options=list(pm.keys()), format_func=lambda x: pm[x], index=list(pm.keys()).index(def_p) if def_p in pm else 0) if pm else None
 
                 ftg = st.text_input("T级", value=str(t_emp_sel.get('tech_grade', "")) if t_emp_sel is not None and pd.notna(t_emp_sel.get('tech_grade')) else "")
@@ -674,7 +695,7 @@ elif current_page == "👥 人员档案":
                     f_first_work_val = pd.to_datetime(first_work_raw).date() if pd.notna(first_work_raw) and str(first_work_raw).strip() != '' else None
                     f_first_work = st.date_input("参加工作时间*", value=f_first_work_val, min_value=date(1950, 1, 1))
 
-                is_intern_position = pm.get(fpos) == '实习岗' if fpos else False
+                is_intern_position = pos_name_map.get(fpos) == '实习岗' if fpos else False
                 existing_first_employment = bool(
                     int(t_emp_sel.get('first_employment', 0) or 0)
                 ) if t_emp_sel is not None else False
@@ -739,8 +760,10 @@ elif current_page == "👥 人员档案":
 # 模块 D: 特殊人员与待遇（业务人员简化入口）
 # ==============================================================================
 elif current_page == "🧭 特殊人员与待遇":
-    person_settings_tab, default_rules_tab = st.tabs([
-        "人员情形与个人待遇例外", "下沉/地市转入默认规则"
+    person_settings_tab, default_rules_tab, payroll_identity_tab = st.tabs([
+        "人员情形与个人待遇例外",
+        "下沉/地市转入默认规则",
+        "薪酬身份与聘期",
     ])
     with person_settings_tab:
         st.subheader("🧭 特殊人员与待遇设置")
@@ -1163,6 +1186,124 @@ elif current_page == "🧭 特殊人员与待遇":
                     set_msg_and_rerun(msg)
                 else:
                     st.error(msg)
+
+    with payroll_identity_tab:
+        st.subheader("优才、技术精英与专家身份")
+        st.info(
+            "这里只给人员登记身份和有效期，不在人员档案里增加永久标签。"
+            "工资生成时会按发薪月份自动判断是否有效；多重优才身份只采用绩效倍数最高的一项，"
+            "不会叠加发放。"
+        )
+
+        identity_options = {
+            "集团优才": ("talent", "group"),
+            "省级优才": ("talent", "province"),
+            "技术精英": ("technical_elite", "elite"),
+            "首席技术精英": ("technical_elite", "chief"),
+            "一级专家（历史调整口径）": ("province_expert", "level_1"),
+            "二级专家（历史调整口径）": ("province_expert", "level_2"),
+        }
+        identity_labels = {value: label for label, value in identity_options.items()}
+
+        selectable_employees = df_emps[
+            df_emps["status"].isin(["在职", "实习", "挂靠人员"])
+        ].copy()
+        if selectable_employees.empty:
+            st.warning("当前没有可登记薪酬身份的人员。")
+        else:
+            employee_ids = selectable_employees["emp_id"].astype(str).tolist()
+            employee_labels = {
+                str(row["emp_id"]): (
+                    f"{row['name']}（{row.get('employee_no') or '工号待分配'}）"
+                    f"｜{row.get('dept_name') or '未分配部门'}"
+                )
+                for _, row in selectable_employees.iterrows()
+            }
+
+            with st.form("payroll_identity_form"):
+                identity_person = st.selectbox(
+                    "人员*", employee_ids,
+                    format_func=lambda value: employee_labels.get(value, value),
+                )
+                identity_name = st.selectbox("身份*", list(identity_options))
+                idc1, idc2 = st.columns(2)
+                with idc1:
+                    identity_start = st.date_input("开始日期*", value=date.today())
+                with idc2:
+                    identity_has_end = st.checkbox("已明确结束日期")
+                    identity_end = st.date_input(
+                        "结束日期", value=date.today(), disabled=not identity_has_end,
+                    )
+                identity_document = st.text_input(
+                    "依据文件（可选）", placeholder="例如：中电信鄂公众〔2024〕53号"
+                )
+                identity_remarks = st.text_input(
+                    "说明（可选）", placeholder="仅记录这次聘任需要记住的特殊情况"
+                )
+                if st.form_submit_button("保存身份与聘期", type="primary"):
+                    identity_type, identity_level = identity_options[identity_name]
+                    ok, msg = save_payroll_identity(
+                        identity_person, identity_type, identity_level,
+                        identity_start.isoformat(),
+                        identity_end.isoformat() if identity_has_end else None,
+                        identity_document, identity_remarks,
+                    )
+                    if ok:
+                        set_msg_and_rerun(msg)
+                    else:
+                        st.error(msg)
+
+        identity_rows = get_payroll_identities()
+        if not identity_rows:
+            st.caption("尚未登记优才、技术精英或专家身份。")
+        else:
+            identity_df = pd.DataFrame(identity_rows)
+            identity_df["身份"] = identity_df.apply(
+                lambda row: identity_labels.get(
+                    (row["identity_type"], row["identity_level"]),
+                    f"{row['identity_type']} / {row['identity_level']}",
+                ), axis=1,
+            )
+            identity_df["状态"] = identity_df["status"].map({
+                "active": "有效/待生效", "ended": "已结束",
+            }).fillna(identity_df["status"])
+            st.write("### 已登记身份")
+            st.dataframe(
+                identity_df[[
+                    "employee_no", "employee_name", "身份", "start_date", "end_date",
+                    "状态", "source_document", "remarks",
+                ]].rename(columns={
+                    "employee_no": "工号", "employee_name": "姓名",
+                    "start_date": "开始日期", "end_date": "结束日期",
+                    "source_document": "依据文件", "remarks": "说明",
+                }),
+                use_container_width=True, hide_index=True,
+            )
+
+            active_identity_df = identity_df[identity_df["status"] == "active"]
+            if not active_identity_df.empty:
+                with st.expander("提前结束一项身份", expanded=False):
+                    active_ids = active_identity_df["identity_id"].astype(int).tolist()
+                    active_labels = {
+                        int(row["identity_id"]): (
+                            f"{row['employee_name']}｜{row['身份']}｜{row['start_date']}起"
+                        )
+                        for _, row in active_identity_df.iterrows()
+                    }
+                    with st.form("end_payroll_identity_form"):
+                        ending_identity = st.selectbox(
+                            "选择身份", active_ids,
+                            format_func=lambda value: active_labels[value],
+                        )
+                        ending_date = st.date_input("实际结束日期", value=date.today())
+                        if st.form_submit_button("保存结束日期"):
+                            ok, msg = end_payroll_identity(
+                                ending_identity, ending_date.isoformat()
+                            )
+                            if ok:
+                                set_msg_and_rerun(msg)
+                            else:
+                                st.error(msg)
 
 # 旧版复杂入口保留在代码中用于兼容，但不再出现在导航中。
 elif current_page == "🔄 特殊用工与结算关系":

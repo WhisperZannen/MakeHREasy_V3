@@ -128,6 +128,53 @@ def _get_db_connection():
     return conn
 
 
+def get_organization_integrity_issues():
+    """返回会影响社保、薪酬和人工成本的当前组织关联异常。"""
+    conn = _get_db_connection()
+    try:
+        rows = conn.execute(
+            """
+            SELECT e.emp_id, COALESCE(e.employee_no, '待分配') AS employee_no,
+                   e.name,
+                   CASE
+                     WHEN d.dept_id IS NULL THEN '部门不存在'
+                     WHEN d.status<>1 THEN '人员仍归属已撤销部门'
+                     WHEN p.pos_id IS NULL THEN '岗位不存在'
+                     WHEN p.status<>1 THEN '人员仍任已停用岗位'
+                   END AS issue
+            FROM employees e
+            LEFT JOIN departments d ON d.dept_id=e.dept_id
+            LEFT JOIN employee_profiles ep ON ep.emp_id=e.emp_id
+            LEFT JOIN positions p ON p.pos_id=ep.pos_id
+            WHERE e.status IN ('在职', '挂靠人员')
+              AND (d.dept_id IS NULL OR d.status<>1 OR p.pos_id IS NULL OR p.status<>1)
+            ORDER BY e.name
+            """
+        ).fetchall()
+        issues = [dict(row) for row in rows]
+        duplicated = conn.execute(
+            """
+            SELECT a.emp_id, COALESCE(e.employee_no, '待分配') AS employee_no,
+                   e.name, COUNT(*) AS relation_count
+            FROM employee_arrangements a
+            JOIN employees e ON e.emp_id=a.emp_id
+            WHERE a.status='active'
+            GROUP BY a.emp_id, e.employee_no, e.name
+            HAVING COUNT(*)>1
+            ORDER BY e.name
+            """
+        ).fetchall()
+        issues.extend({
+            'emp_id': row['emp_id'],
+            'employee_no': row['employee_no'],
+            'name': row['name'],
+            'issue': f"存在{row['relation_count']}条同时生效的特殊关系",
+        } for row in duplicated)
+        return issues
+    finally:
+        conn.close()
+
+
 def _add_calendar_months(date_text, months):
     try:
         source = datetime.strptime(str(date_text)[:10], '%Y-%m-%d').date()
@@ -151,6 +198,29 @@ def _prepare_lifecycle(profile_data, join_date, actual_date=None, was_intern=Fal
     return result
 
 
+def _validate_active_assignment(conn, emp_data, profile_data):
+    """在职及挂靠人员只能归入有效部门和岗位，离退历史池不受此限制。"""
+    if emp_data.get('status', '在职') not in {'在职', '挂靠人员'}:
+        return None
+    dept = conn.execute(
+        "SELECT dept_name, status FROM departments WHERE dept_id=?",
+        (emp_data.get('dept_id'),),
+    ).fetchone()
+    if not dept:
+        return "所选部门不存在"
+    if int(dept['status'] or 0) != 1:
+        return f"部门“{dept['dept_name']}”已经撤销，请选择有效部门"
+    position = conn.execute(
+        "SELECT pos_name, status FROM positions WHERE pos_id=?",
+        (profile_data.get('pos_id'),),
+    ).fetchone()
+    if not position:
+        return "所选岗位不存在"
+    if int(position['status'] or 0) != 1:
+        return f"岗位“{position['pos_name']}”已经停用，请选择有效岗位"
+    return None
+
+
 def add_employee(emp_data, profile_data, reason="新员工入职", change_date=None):
     join_date = emp_data.get('join_company_date')
     if join_date:
@@ -163,6 +233,9 @@ def add_employee(emp_data, profile_data, reason="新员工入职", change_date=N
     conn = _get_db_connection()
     cursor = conn.cursor()
     try:
+        assignment_error = _validate_active_assignment(conn, emp_data, profile_data)
+        if assignment_error:
+            return False, assignment_error
         employee_no = normalize_employee_no(
             emp_data.get('employee_no', emp_data.get('emp_id'))
         )
@@ -227,6 +300,9 @@ def update_employee(emp_id, emp_data, profile_data, reason="档案更新", chang
     conn = _get_db_connection()
     cursor = conn.cursor()
     try:
+        assignment_error = _validate_active_assignment(conn, emp_data, profile_data)
+        if assignment_error:
+            return False, assignment_error
         employee_no = normalize_employee_no(
             emp_data.get('employee_no', emp_data.get('emp_id'))
         )
