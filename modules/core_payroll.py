@@ -40,6 +40,60 @@ def previous_month(value):
     return f"{year:04d}-{number:02d}"
 
 
+def save_new_hire_backpay(emp_id, source_month, pay_month, amount, remarks=""):
+    """登记新入职工资补发；金额由业务确认，系统不擅自猜测入职月折算规则。"""
+    source = _normalize_month(source_month)
+    pay = _normalize_month(pay_month)
+    if pay <= source:
+        return False, "补发月份必须晚于原工资所属月份"
+    conn = _get_db_connection()
+    try:
+        employee = conn.execute(
+            "SELECT name FROM employees WHERE emp_id=?", (str(emp_id),)
+        ).fetchone()
+        if not employee:
+            return False, "人员不存在，请刷新后重试"
+        conn.execute(
+            """
+            INSERT INTO payroll_deferred_items(
+                emp_id, source_month, pay_month, amount, status, remarks
+            ) VALUES (?, ?, ?, ?, 'pending', ?)
+            ON CONFLICT(emp_id, source_month, pay_month) DO UPDATE SET
+                amount=excluded.amount, status='pending', remarks=excluded.remarks,
+                updated_at=CURRENT_TIMESTAMP
+            """,
+            (str(emp_id), source, pay, float(amount), str(remarks or "").strip()),
+        )
+        conn.commit()
+        return True, f"已登记{employee['name']}的{source}工资于{pay}补发"
+    except Exception as exc:
+        conn.rollback()
+        return False, str(exc)
+    finally:
+        conn.close()
+
+
+def get_new_hire_backpay_items(pay_month=None):
+    """返回新入职补发登记，供薪酬页面核对。"""
+    conn = _get_db_connection()
+    try:
+        where = "WHERE d.pay_month=?" if pay_month else ""
+        params = (_normalize_month(pay_month),) if pay_month else ()
+        return [dict(row) for row in conn.execute(
+            f"""
+            SELECT d.*, COALESCE(e.employee_no, '待分配') AS employee_no,
+                   e.name AS employee_name
+            FROM payroll_deferred_items d
+            JOIN employees e ON e.emp_id=d.emp_id
+            {where}
+            ORDER BY d.pay_month DESC, d.source_month DESC, e.name
+            """,
+            params,
+        ).fetchall()]
+    finally:
+        conn.close()
+
+
 def _payroll_rank(value):
     if value is None or str(value).strip() in {"", "None", "nan"}:
         return None
@@ -55,10 +109,16 @@ def get_effective_payroll_snapshot(target_month, conn=None):
         rows = conn.execute(
             """
             SELECT e.emp_id, e.name, e.status, e.dept_id, e.post_rank,
-                   e.post_grade, ep.pos_id, ep.tech_grade
+                   e.post_grade, e.join_company_date, ep.pos_id, ep.tech_grade,
+                   ep.payroll_start_month
             FROM employees e
             LEFT JOIN employee_profiles ep ON ep.emp_id = e.emp_id
+            WHERE e.join_company_date IS NULL
+               OR DATE(e.join_company_date) <= DATE(?)
             """
+            , (
+                f"{month}-{calendar.monthrange(int(month[:4]), int(month[5:7]))[1]:02d}",
+            )
         ).fetchall()
         snapshots = {str(row["emp_id"]): dict(row) for row in rows}
         deadline = f"{month}-15 23:59:59"
@@ -80,6 +140,11 @@ def get_effective_payroll_snapshot(target_month, conn=None):
         for change in changes:
             snapshot = snapshots.get(str(change["emp_id"]))
             if not snapshot:
+                continue
+            if any(label in str(change["change_type"] or "") for label in (
+                "首次部门分配", "首次岗位分配",
+            )):
+                # 待分配池到真实部门是入职建档的补全，不适用15日调动回退。
                 continue
             for target, old_field, new_field in field_pairs:
                 if change[old_field] is not None and change[new_field] is not None:
@@ -461,15 +526,38 @@ def generate_payroll_draft(pay_month, performance_month=None):
         }
         generated = 0
         excluded = 0
+        deferred = 0
         warning_people = []
         for emp_id, pay_person in pay_snapshot.items():
             if pay_person.get("status") != "在职":
+                continue
+            payroll_start_month = str(pay_person.get("payroll_start_month") or "").strip()
+            if payroll_start_month and payroll_start_month > pay_month:
+                deferred += 1
+                existing_deferred_record = current_records.get(emp_id)
+                if existing_deferred_record:
+                    audit_status = str(
+                        existing_deferred_record.get("audit_status") or "草稿"
+                    ).strip()
+                    if audit_status == "草稿":
+                        conn.execute(
+                            "DELETE FROM payroll_monthly_records WHERE cost_month=? AND emp_id=?",
+                            (pay_month, emp_id),
+                        )
+                    else:
+                        warning_people.append({
+                            "emp_id": emp_id,
+                            "name": pay_person["name"],
+                            "warnings": [
+                                f"首次发薪月份为{payroll_start_month}，但{pay_month}已有{audit_status}工资记录，请人工核对"
+                            ],
+                        })
                 continue
             arrangement = get_effective_arrangement(emp_id, pay_month, conn)
             if not int(arrangement.get("payroll_included", 1)):
                 excluded += 1
                 continue
-            perf_person = performance_snapshot.get(emp_id, pay_person)
+            perf_person = performance_snapshot.get(emp_id)
             carry = _carry_values(conn, emp_id, pay_month)
             current = current_records.get(emp_id, {})
             warnings = []
@@ -500,7 +588,19 @@ def generate_payroll_draft(pay_month, performance_month=None):
                 )
                 if salary_warning:
                     warnings.append(salary_warning)
-                components = _performance_components(conn, version, perf_person)
+                if perf_person is None:
+                    components = {
+                        "category": "not_employed",
+                        "management_role": None,
+                        "official_position": None,
+                        "original_performance": 0.0,
+                        "incentive_pack": 0.0,
+                        "original_coefficient": None,
+                        "incentive_coefficient": None,
+                        "warnings": [f"{performance_month}尚未入职，本月不计该月绩效"],
+                    }
+                else:
+                    components = _performance_components(conn, version, perf_person)
             warnings.extend(components["warnings"])
             identity = _identity_effects(
                 conn, version_id, emp_id, performance_month
@@ -535,6 +635,17 @@ def generate_payroll_draft(pay_month, performance_month=None):
                 2,
             )
             expert_allowance = float(identity["monthly_allowance"] or 0)
+            new_hire_backpay = float(current.get("new_hire_backpay") or 0)
+            deferred_row = conn.execute(
+                """
+                SELECT COALESCE(SUM(amount), 0) AS amount
+                FROM payroll_deferred_items
+                WHERE emp_id=? AND pay_month=? AND status IN ('pending', 'included')
+                """,
+                (emp_id, pay_month),
+            ).fetchone()
+            if deferred_row and float(deferred_row["amount"] or 0) != 0:
+                new_hire_backpay = float(deferred_row["amount"] or 0)
             social = social_rows.get(emp_id, {})
             explanation = {
                 "rule_version": version["rule_name"],
@@ -542,7 +653,7 @@ def generate_payroll_draft(pay_month, performance_month=None):
                 "pay_month": pay_month,
                 "performance_month": performance_month,
                 "pay_position": pay_person.get("pos_name"),
-                "performance_position": perf_person.get("pos_name"),
+                "performance_position": perf_person.get("pos_name") if perf_person else "入职前",
                 "category": components["category"],
                 "original_coefficient": components["original_coefficient"],
                 "incentive_coefficient": components["incentive_coefficient"],
@@ -559,7 +670,7 @@ def generate_payroll_draft(pay_month, performance_month=None):
                     post_grade_snapshot, tech_grade_snapshot, calculation_mode,
                     base_salary, seniority_pay, comp_subsidy, telecom_subsidy,
                     perf_float_subsidy, intern_subsidy, graduate_allowance,
-                    expert_allowance, perf_standard, perf_base,
+                    expert_allowance, new_hire_backpay, perf_standard, perf_base,
                     perf_kpi_score, perf_pack_coef, perf_leader_coef,
                     perf_excel_coef, perf_salary_calc,
                     ss_pension_pers, ss_medical_mix, ss_unemp_pers,
@@ -569,7 +680,7 @@ def generate_payroll_draft(pay_month, performance_month=None):
                     salary_source, rule_explanation, calculation_warnings
                 ) VALUES (
                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                 )
                 ON CONFLICT(record_id) DO UPDATE SET
@@ -586,6 +697,7 @@ def generate_payroll_draft(pay_month, performance_month=None):
                     calculation_mode=excluded.calculation_mode,
                     base_salary=excluded.base_salary,
                     expert_allowance=excluded.expert_allowance,
+                    new_hire_backpay=excluded.new_hire_backpay,
                     perf_standard=excluded.perf_standard,
                     perf_base=excluded.perf_base,
                     perf_kpi_score=excluded.perf_kpi_score,
@@ -621,7 +733,7 @@ def generate_payroll_draft(pay_month, performance_month=None):
                     float(current.get("perf_float_subsidy") or carry.get("perf_float_subsidy") or 0),
                     float(current.get("intern_subsidy") or carry.get("intern_subsidy") or 0),
                     float(current.get("graduate_allowance") or carry.get("graduate_allowance") or 0),
-                    expert_allowance, components["original_performance"],
+                    expert_allowance, new_hire_backpay, components["original_performance"],
                     components["incentive_pack"], score, pack_coef,
                     leader_coef, identity_coef, performance,
                     float(social.get("pension_pers") or 0),
@@ -647,6 +759,19 @@ def generate_payroll_draft(pay_month, performance_month=None):
                     "name": pay_person["name"],
                     "warnings": list(dict.fromkeys(warnings)),
                 })
+        conn.execute(
+            """
+            UPDATE payroll_deferred_items
+            SET status='included', updated_at=CURRENT_TIMESTAMP
+            WHERE pay_month=? AND status='pending'
+              AND EXISTS (
+                  SELECT 1 FROM payroll_monthly_records p
+                  WHERE p.cost_month=payroll_deferred_items.pay_month
+                    AND p.emp_id=payroll_deferred_items.emp_id
+              )
+            """,
+            (pay_month,),
+        )
         conn.commit()
         recalculate_payroll_totals(pay_month, conn=conn)
         return {
@@ -658,6 +783,7 @@ def generate_payroll_draft(pay_month, performance_month=None):
             "rule_status": version["status"],
             "generated": generated,
             "excluded": excluded,
+            "deferred": deferred,
             "warning_people": warning_people,
         }
     except Exception:
@@ -741,6 +867,7 @@ def recalculate_payroll_totals(pay_month, conn=None):
                 "intern_subsidy", "graduate_allowance", "expert_allowance",
                 "perf_salary_calc", "perf_adj", "commission_pay",
                 "special_bonus_total", "history_clearance", "promotion_backpay",
+                "new_hire_backpay",
             )), 2)
             cash_payable = round(gross + float(row["female_labor_subsidy"] or 0), 2)
             deductions = sum(float(row[name] or 0) for name in (

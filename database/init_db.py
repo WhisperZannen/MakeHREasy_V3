@@ -61,6 +61,9 @@ def ensure_payroll_schema_patch(cursor):
         # 晋升补发。
         # 最终结账页面会读取/更新这个字段。
 
+        "new_hire_backpay": "REAL DEFAULT 0.0",
+        # 新入职工资补发。与晋升补发分开，保留“入职当月未发、以后月份补发”的口径。
+
         "performance_month": "TEXT",
         # 绩效所属月份。比如7月发放工资时，这里通常是6月。
 
@@ -352,6 +355,12 @@ def seed_payroll_item_mapping(cursor):
         ("晋升补发", "晋升补发", "promotion_backpay", "晋升补发", "signed_amount", 1,
          "岗级、档次、岗位晋升产生的补发。"),
 
+        ("新入职工资补发", "新入职补发", "new_hire_backpay", "新入职工资补发", "signed_amount", 1,
+         "新员工入职当月未发工资，在后续月份补发；不包含重复绩效。"),
+
+        ("入职工资补发", "新入职补发", "new_hire_backpay", "新入职工资补发", "signed_amount", 1,
+         "兼容简称，口径同新入职工资补发。"),
+
         ("专家补贴", "专家调整", "expert_allowance", "专家补贴", "signed_amount", 1,
          "专家待遇调整，可能为正数，也可能为负数。"),
 
@@ -423,6 +432,7 @@ def ensure_person_lifecycle_schema(cursor):
         'first_employment': 'INTEGER DEFAULT 0',
         'expected_regularization_date': 'DATE',
         'actual_regularization_date': 'DATE',
+        'payroll_start_month': 'TEXT',
     })
     cursor.execute("""
         UPDATE employee_profiles
@@ -1227,6 +1237,21 @@ def ensure_payroll_workflow_schema(cursor):
         )
     ''')
     cursor.execute('''
+        CREATE TABLE IF NOT EXISTS payroll_deferred_items (
+            deferred_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            emp_id TEXT NOT NULL,
+            source_month TEXT NOT NULL,
+            pay_month TEXT NOT NULL,
+            amount REAL NOT NULL DEFAULT 0.0,
+            status TEXT NOT NULL DEFAULT 'pending',
+            remarks TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(emp_id, source_month, pay_month),
+            FOREIGN KEY(emp_id) REFERENCES employees(emp_id)
+        )
+    ''')
+    cursor.execute('''
         CREATE TABLE IF NOT EXISTS payroll_score_inputs (
             score_id INTEGER PRIMARY KEY AUTOINCREMENT,
             payroll_run_id TEXT NOT NULL,
@@ -1437,17 +1462,30 @@ def init_database(db_path=None):
             sort_order INTEGER DEFAULT 999,             -- 排序号 (数字越小，导出Excel时排得越靠前，比如领导部门写1)
             status INTEGER DEFAULT 1,                   -- 部门死活状态 (1代表部门还在，0代表已经被撤销了)
             is_virtual_pool INTEGER DEFAULT 0,          -- 1代表离退休/挂靠等系统人员池，不属于正式组织架构
+            is_pending_pool INTEGER DEFAULT 0,          -- 1代表新员工待分配池，不得承接人工成本
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, -- 这个部门是哪天在系统里建的
             FOREIGN KEY (parent_dept_id) REFERENCES departments(dept_id)
         )
         """)
         _add_columns_if_missing(cursor, 'departments', {
             'is_virtual_pool': 'INTEGER DEFAULT 0',
+            'is_pending_pool': 'INTEGER DEFAULT 0',
         })
         cursor.execute('''
             UPDATE departments
             SET is_virtual_pool = 1
             WHERE dept_name IN ('离退休公共池', '挂靠代缴社保', '外部代缴人员池')
+        ''')
+        cursor.execute('''
+            INSERT OR IGNORE INTO departments(
+                dept_name, parent_dept_id, dept_category, sort_order,
+                status, is_virtual_pool, is_pending_pool
+            ) VALUES ('新员工待分配池', NULL, '系统人员池', 9997, 1, 1, 1)
+        ''')
+        cursor.execute('''
+            UPDATE departments
+            SET status=1, is_virtual_pool=1, is_pending_pool=1
+            WHERE dept_name='新员工待分配池'
         ''')
 
         # --- 表 2: 岗位核心表 (positions) ---
@@ -1494,6 +1532,7 @@ def init_database(db_path=None):
             major TEXT,                                 -- 所学专业
             graduation_date DATE,                       -- 毕业日期 (算大学生补贴期限用)
             first_job_date DATE,                        -- 人生第一次参加工作的日期 (算国家连读工龄用，比如离职了能领几个月失业金)
+            payroll_start_month TEXT,                   -- 首次实际发薪月份；不影响社保缴费
             FOREIGN KEY (emp_id) REFERENCES employees(emp_id) ON DELETE CASCADE,
             FOREIGN KEY (pos_id) REFERENCES positions(pos_id)
         )
@@ -1912,6 +1951,9 @@ def init_database(db_path=None):
                 -- 晋升补发。
                 -- 用于处理岗级/档次/岗位晋升后产生的补发金额。
                 -- 例如：3月批了晋升，4月工资才补发差额，就可以放这里。
+
+                new_hire_backpay REAL DEFAULT 0.0,
+                -- 新入职工资补发。专门记录入职当月未发、后续月份补发的工资。
 
 
                 -- ==============================================================

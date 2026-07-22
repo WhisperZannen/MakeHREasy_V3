@@ -65,6 +65,18 @@ class PersonnelHistoryLabelTest(unittest.TestCase):
         }
         self.assertEqual(rebuild_history_change_type(row), "跨部门调动")
 
+    def test_first_assignment_labels_are_not_rewritten_as_normal_transfers(self):
+        row = {
+            "change_type": "首次岗位分配",
+            "old_dept_id": 22, "new_dept_id": 22,
+            "old_pos_id": 1, "new_pos_id": 45,
+            "old_pos_name": "无岗位",
+            "old_tech_grade": "", "new_tech_grade": "",
+            "old_post_rank": 11, "new_post_rank": 11,
+            "old_post_grade": "E", "new_post_grade": "E",
+        }
+        self.assertEqual(rebuild_history_change_type(row), "首次岗位分配")
+
 
 if __name__ == "__main__":
     unittest.main()

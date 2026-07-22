@@ -16,6 +16,9 @@ from datetime import datetime
 from modules.core_identity import employee_no_exists, normalize_employee_no
 
 
+PENDING_POOL_NAME = "新员工待分配池"
+
+
 def _normalize_text(value):
     """统一空值及普通文本的比较口径。"""
     if value is None:
@@ -34,6 +37,21 @@ def _normalize_rank_value(value):
         return str(int(number)) if number.is_integer() else format(number, ".12g")
     except (TypeError, ValueError):
         return text
+
+
+def _validate_payroll_start_month(profile_data, join_date=None):
+    """校验首次发薪月份；空值兼容旧档案，有值必须为YYYY-MM且不得早于入职月。"""
+    value = _normalize_text(profile_data.get('payroll_start_month'))
+    if not value:
+        profile_data['payroll_start_month'] = str(join_date)[:7] if join_date else None
+        return
+    try:
+        normalized = datetime.strptime(value, '%Y-%m').strftime('%Y-%m')
+    except ValueError as exc:
+        raise ValueError("首次实际发薪月份必须使用 YYYY-MM 格式") from exc
+    if join_date and normalized < str(join_date)[:7]:
+        raise ValueError("首次实际发薪月份不能早于入职月份")
+    profile_data['payroll_start_month'] = normalized
 
 
 def build_personnel_change_tags(old, emp_data, profile_data):
@@ -62,12 +80,17 @@ def rebuild_history_change_type(row):
 
     parts = [part.strip() for part in original.split("+") if part.strip()]
     recognized = {"跨部门调动", "岗位调整", "实习转正", "T级变动", "岗级调整", "档次调整"}
-    tags = [part for part in parts if part.startswith("变为") or part not in recognized]
+    tags = [
+        part for part in parts
+        if part.startswith("变为") or part not in recognized
+    ]
 
     if _normalize_rank_value(row.get('old_dept_id')) != _normalize_rank_value(row.get('new_dept_id')):
-        tags.append("跨部门调动")
+        if "首次部门分配" not in tags:
+            tags.append("跨部门调动")
     if _normalize_rank_value(row.get('old_pos_id')) != _normalize_rank_value(row.get('new_pos_id')):
-        tags.append("实习转正" if _normalize_text(row.get('old_pos_name')) == "实习岗" else "岗位调整")
+        if "首次岗位分配" not in tags:
+            tags.append("实习转正" if _normalize_text(row.get('old_pos_name')) == "实习岗" else "岗位调整")
     if _normalize_text(row.get('old_tech_grade')) != _normalize_text(row.get('new_tech_grade')):
         tags.append("T级变动")
     if _normalize_rank_value(row.get('old_post_rank')) != _normalize_rank_value(row.get('new_post_rank')):
@@ -190,7 +213,8 @@ def _prepare_lifecycle(profile_data, join_date, actual_date=None, was_intern=Fal
     result = dict(profile_data)
     stage = result.get('employment_stage') or 'regular'
     education = _normalize_text(result.get('education_level'))
-    if stage == 'intern' and not result.get('expected_regularization_date'):
+    if stage == 'intern':
+        # 预计转正日是学历和入职日的派生值，不允许保留界面切换学历前的旧结果。
         months = 3 if education in {'硕士', '研究生'} else 6
         result['expected_regularization_date'] = _add_calendar_months(join_date, months)
     if was_intern and stage == 'regular' and not result.get('actual_regularization_date'):
@@ -249,6 +273,7 @@ def add_employee(emp_data, profile_data, reason="新员工入职", change_date=N
         profile_data = _prepare_lifecycle(
             profile_data, emp_data.get('join_company_date'), change_date
         )
+        _validate_payroll_start_month(profile_data, emp_data.get('join_company_date'))
         cursor.execute("""
                        INSERT INTO employees (emp_id, person_id, employee_no, name, id_card, dept_id, post_rank, post_grade, status,
                                               join_company_date)
@@ -260,8 +285,9 @@ def add_employee(emp_data, profile_data, reason="新员工入职", change_date=N
                        INSERT INTO employee_profiles (emp_id, pos_id, tech_grade, title_order, education_level, degree,
                                                       school_name, major, graduation_date, first_job_date,
                                                       employment_stage, first_employment,
-                                                      expected_regularization_date, actual_regularization_date)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                                      expected_regularization_date, actual_regularization_date,
+                                                      payroll_start_month)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                        """, (internal_emp_id, profile_data.get('pos_id'), profile_data.get('tech_grade'),
                              profile_data.get('title_order', 999), profile_data.get('education_level'),
                              profile_data.get('degree'), profile_data.get('school_name'), profile_data.get('major'),
@@ -269,7 +295,8 @@ def add_employee(emp_data, profile_data, reason="新员工入职", change_date=N
                              profile_data.get('employment_stage', 'regular'),
                              int(profile_data.get('first_employment', 0) or 0),
                              profile_data.get('expected_regularization_date'),
-                             profile_data.get('actual_regularization_date')))
+                             profile_data.get('actual_regularization_date'),
+                             profile_data.get('payroll_start_month')))
         cursor.execute("""
             INSERT OR IGNORE INTO ss_emp_matrix (
                 emp_id, cost_center,
@@ -310,12 +337,15 @@ def update_employee(emp_id, emp_data, profile_data, reason="档案更新", chang
             return False, f"工号 {employee_no} 已被其他人员使用"
         cursor.execute("""
             SELECT e.dept_id, e.post_rank, e.post_grade, e.status,
+                   e.join_company_date,
                    p.pos_id, p.tech_grade, p.employment_stage, p.first_employment,
                    p.expected_regularization_date, p.actual_regularization_date,
-                   pos.pos_name as old_pos_name
+                   p.payroll_start_month, pos.pos_name as old_pos_name,
+                   COALESCE(d.is_pending_pool, 0) AS old_is_pending_pool
             FROM employees e
             LEFT JOIN employee_profiles p ON e.emp_id = p.emp_id
             LEFT JOIN positions pos ON p.pos_id = pos.pos_id
+            LEFT JOIN departments d ON e.dept_id = d.dept_id
             WHERE e.emp_id = ?
         """, (emp_id,))
         old = cursor.fetchone()
@@ -325,6 +355,7 @@ def update_employee(emp_id, emp_data, profile_data, reason="档案更新", chang
             for field in (
                 'employment_stage', 'first_employment',
                 'expected_regularization_date', 'actual_regularization_date',
+                'payroll_start_month',
             ):
                 if field not in profile_data:
                     profile_data[field] = old_snapshot.get(field)
@@ -333,7 +364,45 @@ def update_employee(emp_id, emp_data, profile_data, reason="档案更新", chang
                 profile_data, emp_data.get('join_company_date'), actual_date,
                 was_intern=was_intern,
             )
+            _validate_payroll_start_month(profile_data, emp_data.get('join_company_date'))
             change_tags = build_personnel_change_tags(old_snapshot, emp_data, profile_data)
+            target_department = cursor.execute(
+                "SELECT COALESCE(is_pending_pool, 0) FROM departments WHERE dept_id=?",
+                (emp_data.get('dept_id'),),
+            ).fetchone()
+            target_position = cursor.execute(
+                "SELECT pos_name FROM positions WHERE pos_id=?",
+                (profile_data.get('pos_id'),),
+            ).fetchone()
+            is_first_assignment = (
+                int(old_snapshot.get('old_is_pending_pool') or 0) == 1
+                and target_department is not None
+                and int(target_department[0] or 0) == 0
+                and _normalize_rank_value(old_snapshot.get('dept_id'))
+                != _normalize_rank_value(emp_data.get('dept_id'))
+            )
+            is_first_position_assignment = (
+                int(old_snapshot.get('old_is_pending_pool') or 0) == 1
+                and _normalize_text(old_snapshot.get('old_pos_name')) in {'无岗位', '待分配岗位'}
+                and target_position is not None
+                and _normalize_text(target_position[0]) not in {'', '无岗位', '待分配岗位'}
+                and _normalize_rank_value(old_snapshot.get('pos_id'))
+                != _normalize_rank_value(profile_data.get('pos_id'))
+            )
+            if is_first_assignment or is_first_position_assignment:
+                # 首次分配不是普通调动。无论入职日在15日前后，部门和岗位都从
+                # 入职日起归入真实部门，待分配池永远不承接人工成本。
+                join_date = emp_data.get('join_company_date') or old_snapshot.get('join_company_date')
+                if join_date:
+                    actual_date = f"{str(join_date)[:10]} 00:00:00"
+                change_tags = [
+                    "首次部门分配" if tag == "跨部门调动" else tag
+                    for tag in change_tags
+                ]
+                change_tags = [
+                    "首次岗位分配" if tag == "岗位调整" else tag
+                    for tag in change_tags
+                ]
 
             if change_tags:
                 cursor.execute("""
@@ -355,7 +424,7 @@ def update_employee(emp_id, emp_data, profile_data, reason="档案更新", chang
             SET pos_id=?, tech_grade=?, title_order=?, education_level=?, degree=?,
                 school_name=?, major=?, graduation_date=?, first_job_date=?,
                 employment_stage=?, first_employment=?, expected_regularization_date=?,
-                actual_regularization_date=?
+                actual_regularization_date=?, payroll_start_month=?
             WHERE emp_id=?
         """, (
             profile_data.get('pos_id'), profile_data.get('tech_grade'),
@@ -365,7 +434,8 @@ def update_employee(emp_id, emp_data, profile_data, reason="档案更新", chang
             profile_data.get('first_job_date'), profile_data.get('employment_stage', 'regular'),
             int(profile_data.get('first_employment', 0) or 0),
             profile_data.get('expected_regularization_date'),
-            profile_data.get('actual_regularization_date'), emp_id,
+            profile_data.get('actual_regularization_date'),
+            profile_data.get('payroll_start_month'), emp_id,
         ))
 
         saved_row = cursor.execute(
@@ -388,7 +458,10 @@ def get_all_employees(dept_id=None, include_resigned=False):
     try:
         sql = """
             SELECT 
-                a.*, b.pos_id, b.tech_grade, b.education_level, c.dept_name, p.pos_name,
+                a.*, b.pos_id, b.tech_grade, b.education_level,
+                b.employment_stage, b.first_employment,
+                b.expected_regularization_date, b.actual_regularization_date,
+                b.payroll_start_month, c.dept_name, c.is_pending_pool, p.pos_name,
                 (SELECT h.change_date FROM personnel_changes h 
                  LEFT JOIN positions hp ON h.new_pos_id = hp.pos_id
                  WHERE h.emp_id = a.emp_id AND hp.pos_name = '实习岗'
@@ -483,17 +556,30 @@ def get_effective_department_snapshot(target_month, conn=None):
         if len(str(target_month)) < 7:
             raise ValueError("目标月份必须为 YYYY-MM")
         departments = {
-            int(row['dept_id']): str(row['dept_name'])
-            for row in conn.execute("SELECT dept_id, dept_name FROM departments").fetchall()
+            int(row['dept_id']): {
+                'dept_name': str(row['dept_name']),
+                'is_pending_pool': int(row['is_pending_pool'] or 0),
+            }
+            for row in conn.execute(
+                "SELECT dept_id, dept_name, COALESCE(is_pending_pool, 0) AS is_pending_pool FROM departments"
+            ).fetchall()
         }
+        year, month_number = map(int, str(target_month)[:7].split('-'))
+        month_end = f"{year:04d}-{month_number:02d}-{calendar.monthrange(year, month_number)[1]:02d}"
         effective = {
             str(row['emp_id']).strip(): int(row['dept_id'])
-            for row in conn.execute("SELECT emp_id, dept_id FROM employees").fetchall()
+            for row in conn.execute(
+                """
+                SELECT emp_id, dept_id FROM employees
+                WHERE join_company_date IS NULL OR DATE(join_company_date) <= DATE(?)
+                """,
+                (month_end,),
+            ).fetchall()
         }
         deadline = f"{str(target_month)[:7]}-15 23:59:59"
         changes = conn.execute(
             """
-            SELECT emp_id, old_dept_id
+            SELECT emp_id, old_dept_id, change_type
             FROM personnel_changes
             WHERE change_date > ?
               AND old_dept_id IS NOT NULL AND new_dept_id IS NOT NULL
@@ -503,12 +589,15 @@ def get_effective_department_snapshot(target_month, conn=None):
         ).fetchall()
         for row in changes:
             emp_id = str(row['emp_id']).strip()
+            if '首次部门分配' in str(row['change_type'] or ''):
+                continue
             if emp_id in effective:
                 effective[emp_id] = int(row['old_dept_id'])
         return {
             emp_id: {
                 'dept_id': dept_id,
-                'dept_name': departments.get(dept_id, '未分配部门'),
+                'dept_name': departments.get(dept_id, {}).get('dept_name', '未分配部门'),
+                'is_pending_pool': departments.get(dept_id, {}).get('is_pending_pool', 0),
             }
             for emp_id, dept_id in effective.items()
         }
@@ -576,9 +665,11 @@ def batch_transfer_department_members(
         rows = conn.execute(
             f"""
             SELECT e.emp_id, e.dept_id, e.post_rank, e.post_grade,
-                   p.pos_id, p.tech_grade
+                   e.join_company_date, p.pos_id, p.tech_grade,
+                   COALESCE(d.is_pending_pool, 0) AS old_is_pending_pool
             FROM employees e
             LEFT JOIN employee_profiles p ON e.emp_id = p.emp_id
+            LEFT JOIN departments d ON d.dept_id = e.dept_id
             WHERE e.emp_id IN ({placeholders})
             """,
             selected_ids,
@@ -596,6 +687,12 @@ def batch_transfer_department_members(
             return False, "所选人员中有人已经在承接部门"
 
         for row in rows:
+            is_first_assignment = int(row['old_is_pending_pool'] or 0) == 1
+            row_change_type = '首次部门分配' if is_first_assignment else '跨部门调动'
+            row_change_date = (
+                f"{str(row['join_company_date'])[:10]} 00:00:00"
+                if is_first_assignment and row['join_company_date'] else actual_date
+            )
             conn.execute(
                 """
                 INSERT INTO personnel_changes(
@@ -603,13 +700,13 @@ def batch_transfer_department_members(
                     old_pos_id, new_pos_id, old_tech_grade, new_tech_grade,
                     old_post_rank, new_post_rank, old_post_grade, new_post_grade,
                     change_date, change_reason
-                ) VALUES (?, '跨部门调动', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    row['emp_id'], row['dept_id'], int(target_dept_id),
+                    row['emp_id'], row_change_type, row['dept_id'], int(target_dept_id),
                     row['pos_id'], row['pos_id'], row['tech_grade'], row['tech_grade'],
                     row['post_rank'], row['post_rank'], row['post_grade'], row['post_grade'],
-                    actual_date, str(reason).strip(),
+                    row_change_date, str(reason).strip(),
                 ),
             )
             conn.execute(

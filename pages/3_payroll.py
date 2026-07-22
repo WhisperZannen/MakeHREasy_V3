@@ -16,10 +16,12 @@ from modules.core_arrangements import get_effective_arrangement
 from modules.core_identity import resolve_employee_reference
 from modules.core_payroll import (
     generate_payroll_draft,
+    get_new_hire_backpay_items,
     previous_month,
     recalculate_payroll_performance,
     recalculate_payroll_totals,
     save_person_scores,
+    save_new_hire_backpay,
 )
 from modules.core_payroll_rules import (
     CATEGORY_CODES,
@@ -752,6 +754,7 @@ with tab1:
                 "special_bonus_total",
                 "history_clearance",
                 "promotion_backpay",
+                "new_hire_backpay",
                 "perf_adj"
             ]
 
@@ -875,6 +878,82 @@ with tab2:
         "生成前请先完成人员变动和岗位岗级维护。社保本月尚未生成时也可以先算工资，"
         "但个人社保扣款会暂时为0，并在下方提示。"
     )
+    with st.expander("🧾 新入职延后发薪与补发登记", expanded=False):
+        st.caption(
+            "人员模块的“首次实际发薪月份”会自动阻止提前生成工资；"
+            "入职当月应补发的岗位工资、补贴等金额在这里登记，系统不会把绩效重复补发。"
+        )
+        conn_new_hire = _get_db_connection()
+        new_hire_people = pd.read_sql_query(
+            """
+            SELECT e.emp_id, COALESCE(e.employee_no, '待分配') AS employee_no,
+                   e.name, e.join_company_date, ep.payroll_start_month
+            FROM employees e
+            LEFT JOIN employee_profiles ep ON ep.emp_id=e.emp_id
+            WHERE e.status='在职'
+            ORDER BY e.join_company_date DESC, e.name
+            """,
+            conn_new_hire,
+        )
+        conn_new_hire.close()
+        if new_hire_people.empty:
+            st.info("当前没有可登记人员。")
+        else:
+            person_map = {
+                row['emp_id']: f"{row['name']}（{row['employee_no']}）"
+                for _, row in new_hire_people.iterrows()
+            }
+            bc1, bc2, bc3, bc4 = st.columns(4)
+            with bc1:
+                backpay_emp = st.selectbox(
+                    "人员", list(person_map), format_func=lambda value: person_map[value],
+                    key="new_hire_backpay_emp",
+                )
+            selected_hire = new_hire_people[new_hire_people['emp_id'] == backpay_emp].iloc[0]
+            join_value = selected_hire.get('join_company_date')
+            start_value = selected_hire.get('payroll_start_month')
+            default_source = (
+                str(join_value)[:7] if pd.notna(join_value) and str(join_value).strip()
+                else calc_month
+            )
+            default_pay = (
+                str(start_value)[:7] if pd.notna(start_value) and str(start_value).strip()
+                else calc_month
+            )
+            with bc2:
+                backpay_source = st.text_input("原工资所属月份", default_source, max_chars=7)
+            with bc3:
+                backpay_pay = st.text_input("实际补发月份", default_pay, max_chars=7)
+            with bc4:
+                backpay_amount = st.number_input("补发金额", value=0.0, step=100.0, format="%.2f")
+            backpay_remarks = st.text_input(
+                "说明", value="新入职首月工资延后发放（不重复计算绩效）"
+            )
+            if st.button("保存补发登记", type="primary"):
+                ok, message = save_new_hire_backpay(
+                    backpay_emp, backpay_source, backpay_pay,
+                    backpay_amount, backpay_remarks,
+                )
+                if ok:
+                    st.success(message + "；重新生成该补发月份工资底稿后自动带入。")
+                else:
+                    st.error(message)
+            saved_backpay = pd.DataFrame(get_new_hire_backpay_items(calc_month))
+            if not saved_backpay.empty:
+                saved_backpay['status'] = saved_backpay['status'].map({
+                    'pending': '待带入工资底稿',
+                    'included': '已带入工资底稿',
+                    'paid': '已发放',
+                    'cancelled': '已取消',
+                }).fillna('待处理')
+                st.dataframe(
+                    saved_backpay.rename(columns={
+                        'employee_no': '工号', 'employee_name': '姓名',
+                        'source_month': '原工资月份', 'pay_month': '补发月份',
+                        'amount': '补发金额', 'status': '状态', 'remarks': '说明',
+                    })[["工号", "姓名", "原工资月份", "补发月份", "补发金额", "状态", "说明"]],
+                    use_container_width=True, hide_index=True,
+                )
     if st.button(
         "生成或刷新本月工资底稿", type="primary",
         disabled=not payroll_months_valid,
@@ -885,7 +964,8 @@ with tab2:
             status_text = "正式规则" if summary["rule_status"] == "active" else "草稿规则（试运行）"
             st.success(
                 f"已生成 {summary['generated']} 人，排除非本系统发薪人员 "
-                f"{summary['excluded']} 人；使用{status_text}：{summary['rule_name']}。"
+                f"{summary['excluded']} 人，按首次发薪月份暂缓 {summary.get('deferred', 0)} 人；"
+                f"使用{status_text}：{summary['rule_name']}。"
             )
         except Exception as exc:
             st.error(f"生成失败：{exc}")
@@ -1129,6 +1209,7 @@ with tab3:
             IFNULL(p.perf_adj, 0)                                      AS "绩效补/扣",
 
             IFNULL(p.promotion_backpay, 0)                             AS "晋升补发",
+            IFNULL(p.new_hire_backpay, 0)                              AS "新入职工资补发",
             IFNULL(p.commission_pay, 0)                                AS "提成",
             IFNULL(p.special_bonus_total, 0)                           AS "专项奖惩合计",
             IFNULL(p.history_clearance, 0)                             AS "历史清算",
@@ -1199,6 +1280,7 @@ with tab3:
                 + float(row["已算绩效"] or 0)
                 + float(row["绩效补/扣"] or 0)
                 + float(row["晋升补发"] or 0)
+                + float(row["新入职工资补发"] or 0)
                 + float(row["提成"] or 0)
                 + float(row["专项奖惩合计"] or 0)
                 + float(row["历史清算"] or 0)
@@ -1284,6 +1366,7 @@ with tab3:
             "已算绩效",
             "绩效补/扣",
             "晋升补发",
+            "新入职工资补发",
             "提成",
             "专项奖惩合计",
             "历史清算",
@@ -1501,6 +1584,7 @@ with tab3:
                 "专家/特殊津贴": st.column_config.NumberColumn(format="%.2f"),
                 "绩效补/扣": st.column_config.NumberColumn(format="%.2f"),
                 "晋升补发": st.column_config.NumberColumn(format="%.2f"),
+                "新入职工资补发": st.column_config.NumberColumn(format="%.2f"),
                 "提成": st.column_config.NumberColumn(format="%.2f"),
                 "专项奖惩合计": st.column_config.NumberColumn(format="%.2f"),
                 "历史清算": st.column_config.NumberColumn(format="%.2f"),
@@ -1568,6 +1652,7 @@ with tab3:
                         expert_allowance    = ?,
                         perf_adj            = ?,
                         promotion_backpay   = ?,
+                        new_hire_backpay    = ?,
                         commission_pay      = ?,
                         special_bonus_total = ?,
                         history_clearance   = ?,
@@ -1586,6 +1671,7 @@ with tab3:
                         float(row["专家/特殊津贴"] or 0),
                         float(row["绩效补/扣"] or 0),
                         float(row["晋升补发"] or 0),
+                        float(row["新入职工资补发"] or 0),
                         float(row["提成"] or 0),
                         float(row["专项奖惩合计"] or 0),
                         float(row["历史清算"] or 0),
@@ -1669,6 +1755,7 @@ with tab4:
             IFNULL(p.perf_adj, 0)                                       AS "绩效补/扣",
 
             IFNULL(p.promotion_backpay, 0)                              AS "晋升补发",
+            IFNULL(p.new_hire_backpay, 0)                               AS "新入职工资补发",
             IFNULL(p.commission_pay, 0)                                 AS "提成",
             IFNULL(p.special_bonus_total, 0)                            AS "专项奖惩合计",
             IFNULL(p.history_clearance, 0)                              AS "历史清算",
@@ -1728,6 +1815,7 @@ with tab4:
             + payroll_df["绩效工资"]
             + payroll_df["绩效补/扣"]
             + payroll_df["晋升补发"]
+            + payroll_df["新入职工资补发"]
             + payroll_df["提成"]
             + payroll_df["专项奖惩合计"]
             + payroll_df["历史清算"]
@@ -1865,6 +1953,7 @@ with tab4:
             "绩效工资",
             "绩效补/扣",
             "晋升补发",
+            "新入职工资补发",
             "女工劳保费",
             "提成",
             "专项奖惩合计",
@@ -1959,6 +2048,7 @@ with tab4:
             "绩效工资",
             "绩效补/扣",
             "晋升补发",
+            "新入职工资补发",
             "女工劳保费",
             "提成",
             "专项奖惩合计",

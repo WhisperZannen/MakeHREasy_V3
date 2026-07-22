@@ -62,6 +62,8 @@ def init_virtual_pools():
     if ok_d:
         d_names = [d['dept_name'] for d in d_list]
         if "离退休公共池" not in d_names: add_department("离退休公共池", "其他", None, 9999)
+        if "新员工待分配池" not in d_names:
+            add_department("新员工待分配池", "系统人员池", None, 9997)
 
     ok_p, p_list = get_all_positions(include_inactive=True)
     if ok_p:
@@ -364,6 +366,41 @@ elif current_page == "🎯 岗位字典":
 # ==============================================================================
 elif current_page == "👥 人员档案":
 
+    pending_people = (
+        df_emps[
+            (df_emps.get('is_pending_pool', 0) == 1)
+            & (df_emps['status'] == '在职')
+        ].copy()
+        if not df_emps.empty and 'is_pending_pool' in df_emps.columns
+        else pd.DataFrame()
+    )
+    with st.expander(
+        f"🧺 新员工待分配（{len(pending_people)}人）",
+        expanded=not pending_people.empty,
+    ):
+        st.caption(
+            "待分配人员仍进入社保月度名单，但不会生成工资；正式部门确定后，"
+            "在下方勾选该人员并修改部门即可。系统会自动以入职日记录“首次部门分配”，"
+            "即使入职日在15日之后，人工成本也只会归入正式部门，不会落在待分配池。"
+        )
+        if pending_people.empty:
+            st.success("当前没有待分配的新员工。")
+        else:
+            st.dataframe(
+                pending_people[[
+                    c for c in ['employee_no', 'name', 'join_company_date',
+                                'payroll_start_month', 'pos_name', 'education_level']
+                    if c in pending_people.columns
+                ]].rename(columns={
+                    'employee_no': '工号', 'name': '姓名',
+                    'join_company_date': '入职日期',
+                    'payroll_start_month': '首次发薪月份',
+                    'pos_name': '暂定岗位', 'education_level': '学历',
+                }),
+                use_container_width=True,
+                hide_index=True,
+            )
+
     with st.expander("⏳ 实习生转正预警看板"):
         if not df_emps.empty and 'pos_name' in df_emps.columns:
             interns_df = df_emps[(df_emps['pos_name'] == '实习岗') & (df_emps['status'] == '在职')].copy()
@@ -529,7 +566,7 @@ elif current_page == "👥 人员档案":
         st.info("💡 若状态填为【离职/退休】，部门岗位可留空，系统将自动编入【离退休公共池】；若状态为【挂靠人员】，工号可填入社保编号。")
         t1, t2 = st.columns(2)
         with t1:
-            icols = ['工号', '姓名', '状态', '所属部门', '岗位', '技术等级(T级)', '身份证号', '岗级', '档次', '入职日期', '参加工作日期', '首次就业(是/否)', '学历', '学位', '毕业院校', '专业', '毕业日期']
+            icols = ['工号', '姓名', '状态', '所属部门', '岗位', '技术等级(T级)', '身份证号', '岗级', '档次', '入职日期', '首次发薪月份', '参加工作日期', '首次就业(是/否)', '学历', '学位', '毕业院校', '专业', '毕业日期']
             tmp = pd.DataFrame(columns=icols); tout = io.BytesIO()
             with pd.ExcelWriter(tout) as w: tmp.to_excel(w, index=False)
             st.download_button("下载人员模板", data=tout.getvalue(), file_name="人员导入模板.xlsx")
@@ -559,7 +596,7 @@ elif current_page == "👥 人员档案":
                     if status_val in ['离职', '退休']:
                         idn = "离退休公共池"; ipn = "无岗位"; rank_val = 0; grade_val = "-"
                     else:
-                        idn = clean_str(row.get('所属部门')) or clean_str(row.get('部门'))
+                        idn = clean_str(row.get('所属部门')) or clean_str(row.get('部门')) or "新员工待分配池"
                         ipn = clean_str(row.get('岗位')) or clean_str(row.get('岗位名称'))
                         rank_val = int(row.get('岗级', 11)) if pd.notna(row.get('岗级')) else 11
                         grade_val = clean_str(row.get('档次')) or 'E'
@@ -592,6 +629,11 @@ elif current_page == "👥 人员档案":
                         'first_job_date': clean_date(row.get('参加工作日期')),
                         'employment_stage': 'intern' if ipn == '实习岗' else 'regular',
                         'first_employment': 1 if clean_str(row.get('首次就业(是/否)')) in {'是', '1', 'true', 'True'} else 0,
+                        'payroll_start_month': clean_str(row.get('首次发薪月份')) or (
+                            (pd.to_datetime(row.get('入职日期')) + relativedelta(months=1)).strftime('%Y-%m')
+                            if idn == '新员工待分配池' and pd.notna(pd.to_datetime(row.get('入职日期'), errors='coerce'))
+                            else clean_date(row.get('入职日期'))[:7] if clean_date(row.get('入职日期')) else None
+                        ),
                     }
 
                     if internal_id:
@@ -607,7 +649,9 @@ elif current_page == "👥 人员档案":
 
     with st.expander("📝 单条维护区", expanded=True):
         if t_emp_sel is None: st.info("新增人员时工号可以暂缺，系统会自动建立隐藏内部编号；正式工号下发后再回到这里补录。")
-        with st.form("emp_form", clear_on_submit=True):
+        # 不使用 st.form：学历、入职日和岗位变化后应立即刷新实习期提示，
+        # 否则表单提交前会一直展示首次渲染时的本科6个月结果。
+        with st.container(border=True):
             f1, f2, f3 = st.columns(3)
             with f1:
                 fid = st.text_input(
@@ -633,7 +677,26 @@ elif current_page == "👥 人员档案":
                     )
                     for _, r in vd.iterrows()
                 }
-                fdept = st.selectbox("部门*", options=list(dm.keys()), format_func=lambda x: dm[x], index=list(dm.keys()).index(def_d) if def_d in dm else 0) if dm else None
+                pending_ids = set(
+                    vd.loc[vd.get('is_pending_pool', 0) == 1, 'dept_id'].tolist()
+                ) if 'is_pending_pool' in vd.columns else set()
+                current_is_pending = def_d in pending_ids
+                pending_assignment = st.checkbox(
+                    "部门暂未分配",
+                    value=current_is_pending or t_emp_sel is None,
+                    help="勾选后先进入新员工待分配池：社保照常办理，工资按首次发薪月份控制，人工成本不会落入该池。",
+                )
+                if pending_assignment and pending_ids:
+                    fdept = next(iter(pending_ids))
+                    st.info("当前归入“新员工待分配池”；以后改成正式部门时，系统自动按入职日完成首次分配。")
+                else:
+                    selectable_dm = {key: value for key, value in dm.items() if key not in pending_ids}
+                    fdept = st.selectbox(
+                        "部门*", options=list(selectable_dm.keys()),
+                        format_func=lambda x: selectable_dm[x],
+                        index=(list(selectable_dm.keys()).index(def_d)
+                               if def_d in selectable_dm else 0),
+                    ) if selectable_dm else None
 
                 frank = st.number_input("岗级*", 0.0, 28.0,
                                         float(t_emp_sel.get('post_rank', 11.0)) if t_emp_sel is not None and pd.notna(
@@ -645,6 +708,10 @@ elif current_page == "👥 人员档案":
             with f3:
                 def_p = t_emp_sel.get('pos_id') if t_emp_sel is not None else None
                 vp = df_positions[df_positions['status']==1].copy()
+                if t_emp_sel is None:
+                    intern_rows = vp[vp['pos_name'] == '实习岗']
+                    if not intern_rows.empty:
+                        def_p = int(intern_rows.iloc[0]['pos_id'])
                 # 与部门处理保持一致：当前岗位即使刚被停用，也要原样展示，
                 # 避免编辑其他字段时下拉框静默跳到第一个有效岗位。
                 if def_p is not None and def_p not in vp['pos_id'].tolist():
@@ -668,6 +735,26 @@ elif current_page == "👥 人员档案":
                 fjoin_val = pd.to_datetime(t_emp_sel.get('join_company_date')) if t_emp_sel is not None and pd.notna(
                     t_emp_sel.get('join_company_date')) else date.today()
                 fjoin = st.date_input("入职日", value=fjoin_val, min_value=date(1950, 1, 1))
+
+                stored_start_value = (
+                    t_emp_sel.get('payroll_start_month')
+                    if t_emp_sel is not None else None
+                )
+                stored_start_month = (
+                    str(stored_start_value).strip()
+                    if pd.notna(stored_start_value) and str(stored_start_value).strip()
+                    else ''
+                )
+                default_start_month = stored_start_month or (
+                    (fjoin + relativedelta(months=1)).strftime('%Y-%m')
+                    if pending_assignment else fjoin.strftime('%Y-%m')
+                )
+                f_payroll_start_month = st.text_input(
+                    "首次实际发薪月份*",
+                    value=default_start_month,
+                    max_chars=7,
+                    help="格式YYYY-MM。只控制工资，不影响入职当月社保；例如7月入职、8月首次发薪就填2026-08。",
+                )
 
                 st.write("**--- 附加学籍与工作时间 ---**")
                 fp1, fp2, fp3 = st.columns(3)
@@ -721,7 +808,7 @@ elif current_page == "👥 人员档案":
             with cs2: fcd = st.date_input("生效日期*", value=date.today())
             with cs3: frsn = st.text_input("变动说明*", placeholder="必填")
 
-            if st.form_submit_button("保存并生成快照"):
+            if st.button("保存并生成快照", type="primary", key="save_employee_snapshot"):
                 if not fname or fdept is None: st.error("姓名和部门不能为空")
                 elif t_emp_sel is not None and not frsn: st.error("必填说明")
                 else:
@@ -749,6 +836,7 @@ elif current_page == "👥 人员档案":
                             t_emp_sel.get('actual_regularization_date')
                             if t_emp_sel is not None else None
                         ),
+                        'payroll_start_month': f_payroll_start_month.strip(),
                     }
                     ad_str = fcd.strftime('%Y-%m-%d %H:%M:%S')
                     if t_emp_sel is not None: ok, msg = update_employee(str(t_emp_sel['emp_id']), ed, pd_i, reason=frsn, change_date=ad_str)

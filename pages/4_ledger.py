@@ -265,6 +265,12 @@ def upsert_labor_cost_dataframe(in_df):
                 department_snapshots[cost_month] = get_effective_department_snapshot(cost_month, conn)
             department = department_snapshots[cost_month].get(internal_emp_id)
             if department:
+                if int(department.get('is_pending_pool', 0) or 0) == 1:
+                    raise ValueError(
+                        f"{employee_name}在{cost_month}仍处于“新员工待分配池”。"
+                        "请先在人员模块分配正式部门，再导入人工成本；"
+                        "待分配池不允许承接人工成本。"
+                    )
                 db_data['dept_id'] = department['dept_id']
                 db_data['dept_name'] = department['dept_name']
             if relation_type == 'city_transfer':
@@ -1238,6 +1244,9 @@ with tab3:
                         target_department = effective_dept_map.get(emp_id)
                         if not target_department:
                             continue
+                        if int(target_department.get('is_pending_pool', 0) or 0) == 1:
+                            # 待分配池只是录入过渡状态，绝不能成为人工成本归属部门。
+                            continue
                         snapshot_change = classify_department_snapshot_change(
                             old_dept_id,
                             old_dept_name,
@@ -1416,6 +1425,11 @@ with tab3:
                     db_data['ultimate_cost_bearer_code'] = arrangement.get('ultimate_cost_bearer_code') or 'province_public'
                     department = get_effective_department_snapshot(c_month, conn).get(internal_emp_id)
                     if department:
+                        if int(department.get('is_pending_pool', 0) or 0) == 1:
+                            raise ValueError(
+                                f"{e_name}在{c_month}仍处于“新员工待分配池”。"
+                                "请先在人员模块分配正式部门，再导入人工成本。"
+                            )
                         db_data['dept_id'] = department['dept_id']
                         db_data['dept_name'] = department['dept_name']
                     if relation_type == 'city_transfer':

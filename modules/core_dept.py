@@ -65,10 +65,16 @@ def update_department(dept_id, new_name, new_category, new_parent_id=None, new_s
     cursor = conn.cursor()
     try:
         current = cursor.execute(
-            "SELECT status FROM departments WHERE dept_id = ?", (int(dept_id),)
+            "SELECT dept_name, status, COALESCE(is_pending_pool, 0) AS is_pending_pool "
+            "FROM departments WHERE dept_id = ?", (int(dept_id),)
         ).fetchone()
         if not current:
             return False, f"修改失败：找不到 ID 为 {dept_id} 的部门。"
+        if int(current['is_pending_pool'] or 0) == 1 and (
+            str(new_name).strip() != str(current['dept_name']).strip()
+            or int(new_status) != 1
+        ):
+            return False, "“新员工待分配池”是系统过渡池，不能改名或撤销。"
         if int(new_status) == 0 and int(current['status'] or 0) != 0:
             assigned_count = cursor.execute(
                 """
@@ -117,6 +123,12 @@ def soft_delete_department(dept_id):
     conn = _get_db_connection()
     cursor = conn.cursor()
     try:
+        pool = cursor.execute(
+            "SELECT COALESCE(is_pending_pool, 0) FROM departments WHERE dept_id=?",
+            (dept_id,),
+        ).fetchone()
+        if pool and int(pool[0] or 0) == 1:
+            return False, "“新员工待分配池”是系统过渡池，不能撤销。"
         cursor.execute(
             """
             SELECT COUNT(*) FROM employees
