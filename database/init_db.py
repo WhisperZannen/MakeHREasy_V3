@@ -1537,6 +1537,8 @@ def _apply_confirmed_payroll_rule_upgrades(cursor):
         '体系赋能员-项目助理': '体系赋能员-项目助理岗',
         '体系赋能员-体系运营': '体系赋能员-体系运营岗',
         '系统架构师-技术总监': '系统架构师',
+        '初级项目经理': '项目经理',
+        '中级项目经理': '项目经理',
         '产品设计师-UI': 'UI设计工程师',
         '研发工程师-应用': '应用研发工程师',
         '研发工程师-大数据': '大数据研发工程师',
@@ -1546,17 +1548,31 @@ def _apply_confirmed_payroll_rule_upgrades(cursor):
         '档案与机要',
         '初级产品经理',
         '中级产品经理',
+        '产品经理',
         '劳动用工与员工队伍建设',
         '全面预算与分析',
     }
     control_group_2 = {
         '安全与保卫', '采购管理', '党建管理', '档案与发票管理',
         '法律事务', '工会管理', '合规风控（保密员）', '会计核算',
+        '会计核算支撑', '财务管理',
         '纪检与信访', '教育培训与人才队伍建设', '客户经理',
         '业务流程管理', '业务流程支撑', '业务管理', '业务价值管理',
-        '信息与安全', '网信安管理', '资金收入管理', 'IT需求与应用管理',
+        '信息与安全', '网信安管理', '资金收入管理', 'IT需求和应用管理',
     }
     for version_id in version_ids:
+        # 岗位字典允许独立维护。新增岗位后先为每个规则版本补一条“待归类”
+        # 映射，再由下面已确认的岗位口径自动归类；这样人员模块新增/导入岗位
+        # 后，薪酬总阀门不会出现岗位存在但映射行缺失的断链。
+        cursor.execute('''
+            INSERT OR IGNORE INTO payroll_position_rule_mappings(
+                rule_version_id, pos_id, payroll_category,
+                management_role, official_position_name, enabled
+            )
+            SELECT ?, pos_id, 'unclassified', NULL, NULL, 1
+            FROM positions
+            WHERE status = 1
+        ''', (version_id,))
         cursor.execute('''
             INSERT OR IGNORE INTO payroll_derived_management_rules(
                 rule_version_id, special_role, base_management_role,

@@ -22,7 +22,12 @@ class OrganizationLinkageTest(unittest.TestCase):
             self.dept_id = conn.execute(
                 "SELECT dept_id FROM departments WHERE dept_name='测试部门'"
             ).fetchone()[0]
-            for name in ('总经理', '副总经理', '总经理助理兼安全主任', '测试岗位'):
+            for name in (
+                '总经理', '副总经理', '总经理助理兼安全主任', '测试岗位',
+                '初级项目经理', '中级项目经理', '产品经理',
+                '会计核算支撑', '财务管理',
+                'IT需求和应用管理',
+            ):
                 conn.execute(
                     "INSERT INTO positions(pos_name, pos_category, status) "
                     "VALUES (?, '测试', 1)", (name,),
@@ -168,9 +173,9 @@ class OrganizationLinkageTest(unittest.TestCase):
             )
             conn.execute(
                 """
-                INSERT INTO payroll_position_rule_mappings(
-                    rule_version_id, pos_id, payroll_category, enabled
-                ) VALUES (?, ?, 'unclassified', 1)
+                UPDATE payroll_position_rule_mappings
+                SET payroll_category='unclassified', enabled=1
+                WHERE rule_version_id=? AND pos_id=?
                 """, (self.version_id, self.position_ids['测试岗位']),
             )
             conn.commit()
@@ -180,6 +185,19 @@ class OrganizationLinkageTest(unittest.TestCase):
         mappings = get_position_mappings(self.version_id)
         row = mappings[mappings['系统岗位'] == '测试岗位'].iloc[0]
         self.assertEqual(int(row['当前人数']), 1)
+
+    def test_new_positions_are_linked_and_confirmed_names_auto_classify(self):
+        from modules.core_payroll_rules import get_position_mappings
+
+        mappings = get_position_mappings(self.version_id).set_index('系统岗位')
+        self.assertEqual(mappings.loc['测试岗位', 'payroll_category'], 'unclassified')
+        self.assertEqual(mappings.loc['初级项目经理', 'payroll_category'], 'professional')
+        self.assertEqual(mappings.loc['初级项目经理', '对应文件岗位'], '项目经理')
+        self.assertEqual(mappings.loc['中级项目经理', '对应文件岗位'], '项目经理')
+        self.assertEqual(mappings.loc['产品经理', '对应文件岗位'], '管控岗1')
+        self.assertEqual(mappings.loc['会计核算支撑', '对应文件岗位'], '管控岗2')
+        self.assertEqual(mappings.loc['财务管理', '对应文件岗位'], '管控岗2')
+        self.assertEqual(mappings.loc['IT需求和应用管理', '对应文件岗位'], '管控岗2')
 
     def test_integrity_scan_detects_forced_cross_module_error(self):
         from modules.core_personnel import get_organization_integrity_issues
