@@ -449,6 +449,7 @@ elif current_page == "👥 人员档案":
 
             # 1. 部门大权重
             if status == '退休' or '离退休' in d_name: d_weight = 9999
+            elif status == '在职' and '新员工' in d_name and '待分配' in d_name: d_weight = 8999
             elif status == '挂靠人员': d_weight = 9000
             elif status == '公共账目' or '统筹' in d_name or '公共' in d_name: d_weight = 9998
             else: d_weight = dept_weight_map.get(d_name, 999)
@@ -1224,8 +1225,9 @@ elif current_page == "🧭 特殊人员与待遇":
             if not default_rule_df.empty else pd.DataFrame()
         )
         current_rule = current_rule_rows.iloc[0] if not current_rule_rows.empty else None
-        payer_choices = ['province_public', 'province_company', 'related_branch']
+        payer_choices = ['normal_default', 'province_public', 'province_company', 'related_branch']
         payer_labels = {
+            'normal_default': '跟随本单位普通员工',
             'province_public': '省公众',
             'province_company': '省公司',
             'related_branch': '关联地市/原单位',

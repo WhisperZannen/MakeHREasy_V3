@@ -226,11 +226,40 @@ class ArrangementRoutingTest(unittest.TestCase):
         self.assertEqual(route["settlement_cycle"], "monthly")
 
     def test_special_arrangement_defaults_follow_business_rules(self):
+        # 其他测试创建的临时高级路由不应覆盖本用例要核对的系统默认规则。
+        conn = sqlite3.connect(self.db_path)
+        conn.execute(
+            "UPDATE social_route_policies SET active=0 "
+            "WHERE policy_name='下沉医疗由派出单位代缴'"
+        )
+        dept_id = conn.execute(
+            "SELECT dept_id FROM departments WHERE dept_name='测试部门'"
+        ).fetchone()[0]
+        conn.execute(
+            "INSERT OR IGNORE INTO employees(emp_id,name,dept_id,status) "
+            "VALUES ('E_NORMAL','普通员工',?,'在职')",
+            (dept_id,),
+        )
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO ss_emp_matrix(
+                emp_id, medical_account, maternity_account,
+                fund_account, annuity_account
+            ) VALUES ('E_NORMAL','省公司','省公司','省公众','省公司')
+            """
+        )
+        conn.commit()
+        conn.close()
+
         city_defaults = self.arrangements.get_arrangement_route_defaults(
             "city_transfer", "2026-07"
         ).set_index("项目")
-        for item in ["养老", "基本医疗", "失业", "工伤", "生育"]:
+        for item in ["养老", "失业", "工伤"]:
             self.assertEqual(city_defaults.loc[item, "办理单位"], "省公众")
+        for item in ["基本医疗", "生育"]:
+            self.assertEqual(
+                city_defaults.loc[item, "办理单位"], "跟随本单位普通员工"
+            )
         for item in ["住房公积金", "企业年金"]:
             self.assertEqual(
                 city_defaults.loc[item, "办理单位"], "关联地市/原单位"
@@ -243,17 +272,35 @@ class ArrangementRoutingTest(unittest.TestCase):
             "E001", "2026-07"
         ).set_index("项目")
         self.assertEqual(down_routes.loc["养老", "办理单位"], "省公司")
-        self.assertEqual(down_routes.loc["基本医疗", "办理单位"], "省公众")
+        self.assertEqual(down_routes.loc["基本医疗", "办理单位"], "省公司")
         self.assertEqual(down_routes.loc["失业", "办理单位"], "测试分公司")
         self.assertEqual(down_routes.loc["工伤", "办理单位"], "测试分公司")
         self.assertEqual(down_routes.loc["住房公积金", "办理单位"], "省公众")
+        self.assertEqual(down_routes.loc["企业年金", "办理单位"], "省公司")
         self.assertTrue(
             (down_routes["成本归属"] == "测试分公司").all()
         )
+        for item in ["失业", "工伤"]:
+            route = self.arrangements.resolve_social_route(
+                "E001",
+                {"失业": "unemp", "工伤": "injury", "企业年金": "annuity"}[item],
+                "2026-07", legacy_enabled=1,
+                legacy_payer_name="省公众", legacy_cost_center="本级",
+            )
+            self.assertEqual(route["payer_entity_name"], "测试分公司")
+            self.assertEqual(route["amount_source"], "external_actual")
 
-        ok, message = self.arrangements.save_arrangement_route_default(
-            "down_secondment", "medical", True, "province_company", False,
-            "2026-08", "测试新版本",
+        annuity_route = self.arrangements.resolve_social_route(
+            "E001", "annuity", "2026-07", legacy_enabled=1,
+            legacy_payer_name="省公司", legacy_cost_center="本级",
+        )
+        self.assertEqual(annuity_route["payer_entity_name"], "省公司")
+        self.assertEqual(annuity_route["cost_bearer_name"], "测试分公司")
+        self.assertEqual(annuity_route["amount_source"], "external_actual")
+        self.assertEqual(annuity_route["settlement_mode"], "record_only")
+
+        ok, message = self.arrangements.save_normal_route_default(
+            "medical", "province_public", "2026-08", "普通员工医保转回省公众",
         )
         self.assertTrue(ok, message)
         july = self.arrangements.resolve_social_route(
@@ -264,8 +311,8 @@ class ArrangementRoutingTest(unittest.TestCase):
             "E001", "medical", "2026-08", legacy_enabled=1,
             legacy_payer_name="省公众", legacy_cost_center="本级",
         )
-        self.assertEqual(july["payer_entity_name"], "省公众")
-        self.assertEqual(august["payer_entity_name"], "省公司")
+        self.assertEqual(july["payer_entity_name"], "省公司")
+        self.assertEqual(august["payer_entity_name"], "省公众")
         self.assertEqual(august["cost_bearer_name"], "测试分公司")
 
     def test_schema_rerun_does_not_overwrite_people_rules(self):

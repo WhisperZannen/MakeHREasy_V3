@@ -3,6 +3,8 @@ import sqlite3
 import tempfile
 import unittest
 
+import pandas as pd
+
 
 class SocialLifecycleTest(unittest.TestCase):
     @classmethod
@@ -73,6 +75,35 @@ class SocialLifecycleTest(unittest.TestCase):
         self.assertEqual(base, 21977)
         self.assertEqual(company, 2637.24)
         self.assertEqual(personal, 2637.24)
+
+    def test_internal_approval_summary_uses_person_id_and_normalizes_local_name(self):
+        source = pd.DataFrame([
+            {
+                'emp_id': 'P001', 'employee_no': '1001', '姓名': '同一员工',
+                'cost_month': '2026-06', 'cost_center': '本级',
+                'pension_comp': 100.0, 'pension_pers': 50.0,
+            },
+            {
+                'emp_id': 'P001', 'employee_no': '1001', '姓名': '同一员工',
+                'cost_month': '2026-07', 'cost_center': '省公众',
+                'pension_comp': 120.0, 'pension_pers': 60.0,
+            },
+            {
+                'emp_id': 'P002', 'employee_no': '', '姓名': '无工号新人',
+                'cost_month': '2026-07', 'cost_center': '省公众',
+                'pension_comp': 80.0, 'pension_pers': 40.0,
+            },
+        ])
+
+        result = self.social.prepare_internal_approval_person_summary(
+            source, ['pension_comp', 'pension_pers']
+        )
+
+        self.assertEqual(len(result), 2)
+        employee = result[result['姓名'] == '同一员工'].iloc[0]
+        self.assertEqual(employee['cost_center'], '省公众')
+        self.assertEqual(employee['pension_comp'], 220.0)
+        self.assertEqual(employee['pension_pers'], 110.0)
 
     def test_new_intern_gets_internal_id_expected_date_and_regularization(self):
         from modules.core_personnel import add_employee, update_employee
@@ -147,7 +178,7 @@ class SocialLifecycleTest(unittest.TestCase):
             50000, 4000, 0.004,
             50000, 4000, 0.007,
             50000, 4000, 0.12, 0.12,
-            0.08, 0.04, 34550, 4000,
+            0.08, 0.06, 0.02, 0.04, 34550, 4000,
             1, 1, 'round_to_ten',
         )
         ok, message = self.social.upsert_policy_rules(params)
@@ -186,6 +217,24 @@ class SocialLifecycleTest(unittest.TestCase):
             'I001', 'annuity', '2027-01', rules
         )
         self.assertTrue(enabled)
+
+        roster = {
+            '工号': 'I001', '姓名': '实习生', '财务归属': '本级',
+            '已录入原始基数': 5000.0, '独立公积金基数(选填)': 0.0,
+            '养老参保(1是0否)': 0, '养老缴纳主体': '省公众',
+            '医疗参保(1是0否)': 0, '医疗缴纳主体': '省公众',
+            '失业参保(1是0否)': 0, '失业缴纳主体': '省公众',
+            '工伤参保(1是0否)': 0, '工伤缴纳主体': '省公众',
+            '生育参保(1是0否)': 0, '生育缴纳主体': '省公众',
+            '公积金参保(1是0否)': 0, '公积金缴纳主体': '省公众',
+            '年金参保(1是0否)': 1, '年金缴纳主体': '省公众',
+        }
+        bill = self.social.calculate_complete_bill(roster, '2027', '2027-01')
+        self.assertEqual(bill['annuity_企'], 400.0)
+        self.assertEqual(bill['annuity_personal_account_企'], 300.0)
+        self.assertEqual(bill['annuity_public_account_企'], 100.0)
+        self.assertEqual(bill['annuity_个'], 200.0)
+        self.assertEqual(bill['年金执行基数'], 5000.0)
 
 
 if __name__ == '__main__':

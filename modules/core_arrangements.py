@@ -27,6 +27,7 @@ SPECIAL_ARRANGEMENT_TYPES = {
 PAYER_RULE_LABELS = {
     "legacy": "沿用原参保配置",
     "fixed": "固定单位",
+    "normal_default": "跟随本单位普通员工",
     "contract_entity": "劳动合同主体",
     "payroll_entity": "工资发放主体",
     "actual_work_unit": "实际工作单位",
@@ -249,9 +250,59 @@ def _resolve_rule_entity(
     fixed_code: Optional[str],
     arrangement: Dict[str, Any],
     legacy_code: Optional[str],
+    insurance_item: Optional[str] = None,
+    target_month: Optional[str] = None,
 ) -> Optional[str]:
     if rule == "fixed":
         return fixed_code
+    if rule == "normal_default" and insurance_item and target_month:
+        policy = conn.execute(
+            """
+            SELECT payer_entity_code
+            FROM social_route_policies
+            WHERE arrangement_type = 'normal' AND insurance_item = ?
+              AND active = 1 AND effective_from_month <= ?
+              AND (effective_to_month IS NULL OR effective_to_month >= ?)
+            ORDER BY priority DESC, effective_from_month DESC, route_policy_id DESC
+            LIMIT 1
+            """,
+            (insurance_item, target_month, target_month),
+        ).fetchone()
+        if policy and policy["payer_entity_code"]:
+            return policy["payer_entity_code"]
+
+        account_columns = {
+            "pension": "pension_account", "medical": "medical_account",
+            "unemp": "unemp_account", "injury": "injury_account",
+            "maternity": "maternity_account", "fund": "fund_account",
+            "annuity": "annuity_account",
+        }
+        account_column = account_columns.get(insurance_item)
+        if account_column:
+            legacy = conn.execute(
+                f"""
+                SELECT m.{account_column} AS payer_name, COUNT(*) AS people_count
+                FROM ss_emp_matrix m
+                JOIN employees e ON e.emp_id = m.emp_id
+                WHERE e.status = '在职'
+                  AND trim(COALESCE(m.{account_column}, '')) <> ''
+                  AND NOT EXISTS (
+                      SELECT 1 FROM employee_arrangements a
+                      WHERE a.emp_id = e.emp_id AND a.status = 'active'
+                        AND a.arrangement_type != 'normal'
+                        AND date(a.start_date) <= date(? || '-01', '+1 month', '-1 day')
+                        AND date(COALESCE(a.actual_end_date, a.planned_end_date, '9999-12-31'))
+                            >= date(? || '-01')
+                  )
+                GROUP BY m.{account_column}
+                ORDER BY people_count DESC, payer_name ASC
+                LIMIT 1
+                """,
+                (target_month, target_month),
+            ).fetchone()
+            if legacy and legacy["payer_name"]:
+                return entity_code_from_name(conn, legacy["payer_name"])
+        return arrangement.get("contract_entity_code") or legacy_code
     if rule == "contract_entity":
         return arrangement.get("contract_entity_code") or legacy_code
     if rule == "payroll_entity":
@@ -367,6 +418,8 @@ def resolve_social_route(
                 p.get("payer_entity_code"),
                 arrangement,
                 legacy_payer_code,
+                insurance_item,
+                target_month,
             )
             context["cost_bearer_code"] = _resolve_rule_entity(
                 conn,
@@ -374,6 +427,8 @@ def resolve_social_route(
                 p.get("cost_bearer_code"),
                 arrangement,
                 context["cost_bearer_code"],
+                insurance_item,
+                target_month,
             )
             for field in [
                 "calculation_policy_entity",
@@ -936,6 +991,7 @@ SPECIAL_DEFAULT_ARRANGEMENT_TYPES = {
 }
 
 SPECIAL_ROUTE_UNIT_LABELS = {
+    "normal_default": "跟随本单位普通员工",
     "province_public": "省公众",
     "province_company": "省公司",
     "related_branch": "关联地市/原单位",
@@ -950,6 +1006,8 @@ def _policy_rule_display(
 ) -> str:
     if rule == "related_branch":
         return "关联地市/原单位"
+    if rule == "normal_default":
+        return "跟随本单位普通员工"
     if rule == "actual_work_unit":
         return "实际工作单位"
     if rule in {"fixed", None, ""} and entity_code:
@@ -1039,8 +1097,11 @@ def save_arrangement_route_default(
     if not re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", str(effective_from_month or "")):
         return False, "生效月份必须为 YYYY-MM"
 
-    payer_rule = "related_branch" if payer_choice == "related_branch" else "fixed"
-    payer_code = None if payer_rule == "related_branch" else payer_choice
+    payer_rule = (
+        payer_choice if payer_choice in {"related_branch", "normal_default"}
+        else "fixed"
+    )
+    payer_code = None if payer_rule in {"related_branch", "normal_default"} else payer_choice
     cost_rule = "fixed" if include_company_cost else "related_branch"
     cost_code = "province_public" if include_company_cost else None
     calculation_entity = (
@@ -1048,14 +1109,22 @@ def save_arrangement_route_default(
     )
     if payer_rule == cost_rule == "related_branch":
         settlement_mode, settlement_cycle = "none", "none"
+        amount_source = "external_actual"
     elif include_company_cost and payer_rule == "related_branch":
         settlement_mode, settlement_cycle = "annual_labor_cost_reallocation", "annual"
+        amount_source = "system_calculated"
     elif not include_company_cost and payer_choice == "province_public":
         settlement_mode, settlement_cycle = "annual_reimbursement", "annual"
+        amount_source = "system_calculated"
     elif not include_company_cost and payer_choice == "province_company":
         settlement_mode, settlement_cycle = "mixed_by_item", "annual"
+        amount_source = "system_calculated"
+    elif not include_company_cost and payer_rule == "normal_default":
+        settlement_mode, settlement_cycle = "annual_reimbursement", "annual"
+        amount_source = "system_calculated"
     else:
         settlement_mode, settlement_cycle = "none", "none"
+        amount_source = "system_calculated"
 
     conn = _get_db_connection()
     try:
@@ -1103,13 +1172,13 @@ def save_arrangement_route_default(
                 settlement_mode, settlement_cycle, amount_source,
                 priority, active, remarks
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                      'system_calculated', 200, 1, ?)
+                      ?, 200, 1, ?)
             """,
             (
                 f"{SPECIAL_DEFAULT_ARRANGEMENT_TYPES[arrangement_type]}{INSURANCE_LABELS[insurance_item]}默认规则",
                 arrangement_type, insurance_item, effective_from_month, effective_to,
                 1 if enabled else 0, calculation_entity, payer_rule, payer_code,
-                cost_rule, cost_code, settlement_mode, settlement_cycle,
+                cost_rule, cost_code, settlement_mode, settlement_cycle, amount_source,
                 str(remarks or "").strip(),
             ),
         )
@@ -1269,7 +1338,12 @@ def save_person_social_override(
             "settlement_counterparty_code": counterparty,
             "settlement_mode": settlement_mode,
             "settlement_cycle": settlement_cycle,
-            "amount_source": "system_calculated",
+            "amount_source": (
+                "external_actual"
+                if payer_entity_code == cost_bearer_code
+                and payer_entity_code not in {"province_public", "province_company", "ct_digital"}
+                else "system_calculated"
+            ),
             "payment_channel_code": None,
             "special_reason": str(special_reason).strip(),
             "source_document_no": str(source_document_no or "").strip(),

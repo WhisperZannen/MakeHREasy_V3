@@ -459,7 +459,10 @@ def ensure_social_policy_versions_schema(cursor):
             injury_upper REAL, injury_lower REAL, injury_comp_rate REAL,
             maternity_upper REAL, maternity_lower REAL, maternity_comp_rate REAL,
             fund_upper REAL, fund_lower REAL, fund_comp_rate REAL, fund_pers_rate REAL,
-            annuity_comp_rate REAL, annuity_pers_rate REAL,
+            annuity_comp_rate REAL,
+            annuity_personal_account_comp_rate REAL DEFAULT 0.06,
+            annuity_public_account_comp_rate REAL DEFAULT 0.02,
+            annuity_pers_rate REAL,
             rounding_mode TEXT DEFAULT 'round_to_ten',
             fund_calc_method TEXT DEFAULT 'reverse_from_ss',
             fund_soe_upper REAL DEFAULT 0.0,
@@ -474,6 +477,12 @@ def ensure_social_policy_versions_schema(cursor):
     ''')
     _add_columns_if_missing(cursor, 'ss_policy_versions', {
         'base_generation_rounding_mode': "TEXT DEFAULT 'round_to_ten'",
+        'annuity_personal_account_comp_rate': 'REAL DEFAULT 0.06',
+        'annuity_public_account_comp_rate': 'REAL DEFAULT 0.02',
+    })
+    _add_columns_if_missing(cursor, 'ss_policy_rules', {
+        'annuity_personal_account_comp_rate': 'REAL DEFAULT 0.06',
+        'annuity_public_account_comp_rate': 'REAL DEFAULT 0.02',
     })
     version_count = cursor.execute("SELECT COUNT(*) FROM ss_policy_versions").fetchone()[0]
     if version_count == 0:
@@ -487,7 +496,9 @@ def ensure_social_policy_versions_schema(cursor):
                 injury_upper, injury_lower, injury_comp_rate,
                 maternity_upper, maternity_lower, maternity_comp_rate,
                 fund_upper, fund_lower, fund_comp_rate, fund_pers_rate,
-                annuity_comp_rate, annuity_pers_rate, rounding_mode, fund_calc_method,
+                annuity_comp_rate, annuity_personal_account_comp_rate,
+                annuity_public_account_comp_rate, annuity_pers_rate,
+                rounding_mode, fund_calc_method,
                 fund_soe_upper, fund_soe_lower
             )
             SELECT rule_year || '-01', manage_entity,
@@ -498,7 +509,9 @@ def ensure_social_policy_versions_schema(cursor):
                 injury_upper, injury_lower, injury_comp_rate,
                 maternity_upper, maternity_lower, maternity_comp_rate,
                 fund_upper, fund_lower, fund_comp_rate, fund_pers_rate,
-                annuity_comp_rate, annuity_pers_rate, rounding_mode, fund_calc_method,
+                annuity_comp_rate, annuity_personal_account_comp_rate,
+                annuity_public_account_comp_rate, annuity_pers_rate,
+                rounding_mode, fund_calc_method,
                 fund_soe_upper, fund_soe_lower
             FROM ss_policy_rules
         ''')
@@ -733,41 +746,51 @@ def ensure_work_arrangement_schema(cursor):
     # 特殊人员默认待遇。这里只负责初始化一次；页面以后保存的新版本会按
     # 生效月份接替旧版本，数据库初始化不会覆盖用户已经维护过的规则。
     default_special_routes = [
-        # 下沉人员：工资及全部人工成本由地市承担，办理单位按省公司文件执行。
+        # 下沉人员：工资及全部人工成本由地市承担。地市直接办理的项目只记录
+        # 外部归属，不得在本单位核算底稿中再次计算金额。
         ('down_secondment', 'pension', 'fixed', 'province_company', 'related_branch', None,
-         'province_company', 'mixed_by_item', 'annual', '省公司集中缴纳，成本由下沉地市承担'),
-        ('down_secondment', 'medical', 'fixed', 'province_public', 'related_branch', None,
-         'province_public', 'annual_reimbursement', 'annual', '派出单位代缴，年末与下沉地市结算'),
+         'province_company', 'mixed_by_item', 'annual', 'system_calculated',
+         '省公司集中缴纳，成本由下沉地市承担'),
+        ('down_secondment', 'medical', 'normal_default', None, 'related_branch', None,
+         'province_public', 'annual_reimbursement', 'annual', 'system_calculated',
+         '随派出单位普通员工同批缴纳，年末与下沉地市结算'),
         ('down_secondment', 'unemp', 'related_branch', None, 'related_branch', None,
-         'province_public', 'none', 'none', '下沉地市属地缴纳并承担'),
+         'province_public', 'none', 'none', 'external_actual', '下沉地市属地缴纳并承担'),
         ('down_secondment', 'injury', 'related_branch', None, 'related_branch', None,
-         'province_public', 'none', 'none', '下沉地市属地缴纳并承担'),
-        ('down_secondment', 'maternity', 'fixed', 'province_public', 'related_branch', None,
-         'province_public', 'annual_reimbursement', 'annual', '派出单位代缴，年末与下沉地市结算'),
-        ('down_secondment', 'fund', 'fixed', 'province_public', 'related_branch', None,
-         'province_public', 'annual_reimbursement', 'annual', '派出单位代缴，年末与下沉地市结算'),
+         'province_public', 'none', 'none', 'external_actual', '下沉地市属地缴纳并承担'),
+        ('down_secondment', 'maternity', 'normal_default', None, 'related_branch', None,
+         'province_public', 'annual_reimbursement', 'annual', 'system_calculated',
+         '随派出单位普通员工同批缴纳，年末与下沉地市结算'),
+        ('down_secondment', 'fund', 'normal_default', None, 'related_branch', None,
+         'province_public', 'annual_reimbursement', 'annual', 'system_calculated',
+         '随派出单位普通员工同批缴纳，年末与下沉地市结算'),
         ('down_secondment', 'annuity', 'fixed', 'province_company', 'related_branch', None,
-         'province_company', 'mixed_by_item', 'annual', '省公司集中缴纳，成本由下沉地市承担'),
+         'province_company', 'record_only', 'annual', 'external_actual',
+         '省公司直接缴纳，成本由下沉地市承担；不进入本单位付款清单'),
         # 地市正式转入：五险转入省公众，两金暂由原单位办理，成本仍归本单位。
         ('city_transfer', 'pension', 'fixed', 'province_public', 'fixed', 'province_public',
-         'province_public', 'none', 'none', '五险由省公众办理'),
-        ('city_transfer', 'medical', 'fixed', 'province_public', 'fixed', 'province_public',
-         'province_public', 'none', 'none', '五险由省公众办理'),
+         'province_public', 'none', 'none', 'system_calculated', '五险由省公众办理'),
+        ('city_transfer', 'medical', 'normal_default', None, 'fixed', 'province_public',
+         'province_public', 'central_chargeback', 'monthly', 'system_calculated',
+         '随本单位普通员工同批办理'),
         ('city_transfer', 'unemp', 'fixed', 'province_public', 'fixed', 'province_public',
-         'province_public', 'none', 'none', '五险由省公众办理'),
+         'province_public', 'none', 'none', 'system_calculated', '五险由省公众办理'),
         ('city_transfer', 'injury', 'fixed', 'province_public', 'fixed', 'province_public',
-         'province_public', 'none', 'none', '五险由省公众办理'),
-        ('city_transfer', 'maternity', 'fixed', 'province_public', 'fixed', 'province_public',
-         'province_public', 'none', 'none', '五险由省公众办理'),
+         'province_public', 'none', 'none', 'system_calculated', '五险由省公众办理'),
+        ('city_transfer', 'maternity', 'normal_default', None, 'fixed', 'province_public',
+         'province_public', 'central_chargeback', 'monthly', 'system_calculated',
+         '随本单位普通员工同批办理'),
         ('city_transfer', 'fund', 'related_branch', None, 'fixed', 'province_public',
-         'province_public', 'annual_labor_cost_reallocation', 'annual', '原单位办理，成本划转至本单位'),
+         'province_public', 'annual_labor_cost_reallocation', 'annual', 'system_calculated',
+         '原单位办理，成本划转至本单位'),
         ('city_transfer', 'annuity', 'related_branch', None, 'fixed', 'province_public',
-         'province_public', 'annual_labor_cost_reallocation', 'annual', '原单位办理，成本划转至本单位'),
+         'province_public', 'annual_labor_cost_reallocation', 'annual', 'system_calculated',
+         '原单位办理，成本划转至本单位'),
     ]
     for (
         arrangement_type, insurance_item, payer_rule, payer_code,
         cost_rule, cost_code, calculation_entity, settlement_mode,
-        settlement_cycle, remarks,
+        settlement_cycle, amount_source, remarks,
     ) in default_special_routes:
         arrangement_name = {
             'down_secondment': '下沉人员', 'city_transfer': '地市正式转入'
@@ -786,8 +809,7 @@ def ensure_work_arrangement_schema(cursor):
                 settlement_mode, settlement_cycle, amount_source,
                 priority, active, remarks
             )
-            SELECT ?, ?, ?, '1900-01', 1, ?, ?, ?, ?, ?, ?, ?,
-                   'system_calculated', 100, 1, ?
+            SELECT ?, ?, ?, '1900-01', 1, ?, ?, ?, ?, ?, ?, ?, ?, 100, 1, ?
             WHERE NOT EXISTS (
                 SELECT 1 FROM social_route_policies
                 WHERE arrangement_type = ? AND insurance_item = ?
@@ -796,9 +818,120 @@ def ensure_work_arrangement_schema(cursor):
             f"系统初始：{arrangement_name}{insurance_name}",
             arrangement_type, insurance_item, calculation_entity,
             payer_rule, payer_code, cost_rule, cost_code,
-            settlement_mode, settlement_cycle, remarks,
+            settlement_mode, settlement_cycle, amount_source, remarks,
             arrangement_type, insurance_item,
         ))
+
+    # 纠正早期系统默认口径。只更新“系统初始”规则，不覆盖用户后来按
+    # 生效月份维护的自定义版本。办理通道与成本承担必须分开：医疗、
+    # 生育、公积金跟随普通员工的当月办理通道，费用仍由下沉地市承担。
+    cursor.execute('''
+        UPDATE social_route_policies
+        SET payer_entity_rule = 'normal_default', payer_entity_code = NULL,
+            cost_bearer_rule = 'related_branch', cost_bearer_code = NULL,
+            calculation_policy_entity = 'province_public',
+            settlement_mode = 'annual_reimbursement', settlement_cycle = 'annual',
+            amount_source = 'system_calculated',
+            remarks = '随派出单位普通员工同批缴纳，年末与下沉地市结算',
+            updated_at = CURRENT_TIMESTAMP
+        WHERE policy_name IN (
+              '系统初始：下沉人员基本医疗', '系统初始：下沉人员生育',
+              '系统初始：下沉人员住房公积金'
+          )
+          AND arrangement_type = 'down_secondment'
+          AND insurance_item IN ('medical', 'maternity', 'fund')
+          AND effective_from_month = '1900-01'
+          AND (
+              payer_entity_rule != 'normal_default'
+              OR payer_entity_code IS NOT NULL
+              OR cost_bearer_rule != 'related_branch'
+              OR cost_bearer_code IS NOT NULL
+              OR settlement_mode != 'annual_reimbursement'
+              OR settlement_cycle != 'annual'
+              OR amount_source != 'system_calculated'
+              OR COALESCE(remarks, '') != '随派出单位普通员工同批缴纳，年末与下沉地市结算'
+          )
+    ''')
+    # 下沉人员企业年金由省公司直接缴纳，不属于本单位当月打款及核对清单。
+    # 系统只保存办理方和成本归属，金额由外部实际数据掌握，不能再按本单位
+    # 年金基数重复计算。
+    cursor.execute('''
+        UPDATE social_route_policies
+        SET payer_entity_rule = 'fixed', payer_entity_code = 'province_company',
+            cost_bearer_rule = 'related_branch', cost_bearer_code = NULL,
+            calculation_policy_entity = 'province_company',
+            settlement_mode = 'record_only', settlement_cycle = 'annual',
+            amount_source = 'external_actual',
+            remarks = '省公司直接缴纳，成本由下沉地市承担；不进入本单位付款清单',
+            updated_at = CURRENT_TIMESTAMP
+        WHERE policy_name = '系统初始：下沉人员企业年金'
+          AND arrangement_type = 'down_secondment'
+          AND insurance_item = 'annuity'
+          AND effective_from_month = '1900-01'
+          AND (
+              payer_entity_rule != 'fixed'
+              OR COALESCE(payer_entity_code, '') != 'province_company'
+              OR cost_bearer_rule != 'related_branch'
+              OR cost_bearer_code IS NOT NULL
+              OR calculation_policy_entity != 'province_company'
+              OR settlement_mode != 'record_only'
+              OR settlement_cycle != 'annual'
+              OR amount_source != 'external_actual'
+              OR COALESCE(remarks, '') != '省公司直接缴纳，成本由下沉地市承担；不进入本单位付款清单'
+          )
+    ''')
+    cursor.execute('''
+        UPDATE social_route_policies
+        SET amount_source = 'external_actual', updated_at = CURRENT_TIMESTAMP
+        WHERE policy_name IN ('系统初始：下沉人员失业', '系统初始：下沉人员工伤')
+          AND arrangement_type = 'down_secondment'
+          AND insurance_item IN ('unemp', 'injury')
+          AND payer_entity_rule = 'related_branch'
+          AND cost_bearer_rule = 'related_branch'
+          AND effective_from_month = '1900-01'
+          AND amount_source != 'external_actual'
+    ''')
+
+    cursor.execute('''
+        UPDATE social_route_policies
+        SET payer_entity_rule = 'normal_default', payer_entity_code = NULL,
+            cost_bearer_rule = 'fixed', cost_bearer_code = 'province_public',
+            calculation_policy_entity = 'province_public',
+            settlement_mode = 'central_chargeback', settlement_cycle = 'monthly',
+            amount_source = 'system_calculated', remarks = '随本单位普通员工同批办理',
+            updated_at = CURRENT_TIMESTAMP
+        WHERE policy_name IN (
+              '系统初始：地市正式转入基本医疗', '系统初始：地市正式转入生育'
+          )
+          AND arrangement_type = 'city_transfer'
+          AND insurance_item IN ('medical', 'maternity')
+          AND effective_from_month = '1900-01'
+          AND (
+              payer_entity_rule != 'normal_default' OR payer_entity_code IS NOT NULL
+              OR cost_bearer_rule != 'fixed'
+              OR COALESCE(cost_bearer_code, '') != 'province_public'
+              OR settlement_mode != 'central_chargeback'
+              OR settlement_cycle != 'monthly'
+              OR amount_source != 'system_calculated'
+              OR COALESCE(remarks, '') != '随本单位普通员工同批办理'
+          )
+    ''')
+
+    # 魏巍属于已经转入本单位核算的个例：年金由省公司统一代办，费用由
+    # 省公众承担。早期页面把“费用归本单位”误存成“省公众直接办理”。
+    cursor.execute('''
+        UPDATE employee_social_overrides
+        SET calculation_policy_entity = 'province_company',
+            payer_entity_code = 'province_company',
+            cost_bearer_code = 'province_public',
+            settlement_counterparty_code = 'province_company',
+            settlement_mode = 'central_chargeback', settlement_cycle = 'monthly',
+            amount_source = 'system_calculated', payment_channel_code = NULL,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE emp_id = (SELECT emp_id FROM employees WHERE name = '魏巍' LIMIT 1)
+          AND insurance_item = 'annuity' AND active = 1
+          AND payer_entity_code = 'province_public'
+    ''')
 
     # 以下字段都是加法迁移。已有数据保持原值，新数据开始写入快照。
     cursor.execute("PRAGMA table_info(employee_arrangements)")
@@ -1700,7 +1833,9 @@ def init_database(db_path=None):
             fund_comp_rate REAL,                -- 公司交公积金的百分比 (通常0.12)
             fund_pers_rate REAL,                -- 员工交公积金的百分比 (通常0.12)
             
-            annuity_comp_rate REAL,             -- 公司交企业年金的百分比
+            annuity_comp_rate REAL,             -- 公司交企业年金的合计百分比
+            annuity_personal_account_comp_rate REAL DEFAULT 0.06, -- 单位划入员工个人账户
+            annuity_public_account_comp_rate REAL DEFAULT 0.02,   -- 单位划入公共账户
             annuity_pers_rate REAL,             -- 员工交企业年金的百分比
             
             rounding_mode TEXT DEFAULT 'round_to_yuan',    -- 【核心开关】社保算出小数怎么办？

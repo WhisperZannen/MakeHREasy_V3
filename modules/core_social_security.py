@@ -28,6 +28,58 @@ def safe_float(val, default=0.0):
     except Exception:
         return default
 
+
+def normalize_internal_cost_center(value):
+    """统一本单位历史称谓，避免跨期汇总时把同一人拆成多行。"""
+    text = str(value or '').strip()
+    if text in {'本级', '本单位'}:
+        return '省公众'
+    return text or '省公众'
+
+
+def prepare_internal_approval_person_summary(df, money_cols):
+    """
+    生成对内审批提款单的人员级汇总。
+
+    人员身份只按系统内部 emp_id 识别；工号、姓名和财务归属取所选期间
+    最后一个月的有效显示值。这样既能汇总跨月金额，也不会因为“本级”
+    改称“省公众”或后续工号变更而把同一人拆成两行。
+    """
+    if df is None or df.empty:
+        return pd.DataFrame(columns=['employee_no', '姓名', 'cost_center', *money_cols])
+
+    work = df.copy()
+    if 'emp_id' not in work.columns:
+        raise ValueError('对内审批提款单缺少内部人员ID，无法可靠进行跨期汇总')
+
+    active_money_cols = [col for col in money_cols if col in work.columns]
+    work['cost_center'] = work.get(
+        'cost_center', pd.Series(index=work.index, dtype='object')
+    ).map(normalize_internal_cost_center)
+    work['__person_key__'] = work['emp_id'].astype(str)
+    work['__month_sort__'] = work.get(
+        'cost_month', pd.Series('', index=work.index)
+    ).fillna('').astype(str)
+
+    latest_meta = (
+        work.sort_values(['__person_key__', '__month_sort__'])
+        .drop_duplicates('__person_key__', keep='last')
+        [['__person_key__', 'employee_no', '姓名', 'cost_center']]
+    )
+    amount_summary = (
+        work.groupby('__person_key__', as_index=False, dropna=False)[active_money_cols]
+        .sum()
+    )
+    result = latest_meta.merge(amount_summary, on='__person_key__', how='inner')
+    result['employee_no'] = result['employee_no'].fillna('').astype(str)
+    result['姓名'] = result['姓名'].fillna('').astype(str)
+    result = result.sort_values(
+        ['cost_center', '姓名', 'employee_no', '__person_key__'],
+        kind='stable',
+    )
+    return result[['employee_no', '姓名', 'cost_center', *active_money_cols]].reset_index(drop=True)
+
+
 # ------------------------------------------------------------------------------
 # 数据库连接池初始化
 # ------------------------------------------------------------------------------
@@ -63,7 +115,10 @@ def _ensure_multi_entity_schema():
                 injury_upper REAL, injury_lower REAL, injury_comp_rate REAL,
                 maternity_upper REAL, maternity_lower REAL, maternity_comp_rate REAL,
                 fund_upper REAL, fund_lower REAL, fund_comp_rate REAL, fund_pers_rate REAL,
-                annuity_comp_rate REAL, annuity_pers_rate REAL,
+                annuity_comp_rate REAL,
+                annuity_personal_account_comp_rate REAL DEFAULT 0.06,
+                annuity_public_account_comp_rate REAL DEFAULT 0.02,
+                annuity_pers_rate REAL,
                 rounding_mode TEXT DEFAULT 'round_to_yuan',
                 fund_calc_method TEXT DEFAULT 'reverse_from_ss',
                 fund_soe_upper REAL DEFAULT 0.0,
@@ -91,6 +146,16 @@ def _ensure_multi_entity_schema():
                 cursor.execute("ALTER TABLE ss_policy_rules ADD COLUMN fund_soe_upper REAL DEFAULT 0.0")
             if 'fund_soe_lower' not in columns:
                 cursor.execute("ALTER TABLE ss_policy_rules ADD COLUMN fund_soe_lower REAL DEFAULT 0.0")
+            if 'annuity_personal_account_comp_rate' not in columns:
+                cursor.execute(
+                    "ALTER TABLE ss_policy_rules ADD COLUMN "
+                    "annuity_personal_account_comp_rate REAL DEFAULT 0.06"
+                )
+            if 'annuity_public_account_comp_rate' not in columns:
+                cursor.execute(
+                    "ALTER TABLE ss_policy_rules ADD COLUMN "
+                    "annuity_public_account_comp_rate REAL DEFAULT 0.02"
+                )
         conn.commit()
     except Exception as e:
         print(f"底层表升级异常: {e}")
@@ -156,10 +221,12 @@ def upsert_policy_rules(params_tuple: tuple, is_all_entities: bool = False) -> t
                 injury_upper, injury_lower, injury_comp_rate,
                 maternity_upper, maternity_lower, maternity_comp_rate,
                 fund_upper, fund_lower, fund_comp_rate, fund_pers_rate,
-                annuity_comp_rate, annuity_pers_rate, fund_soe_upper, fund_soe_lower,
+                annuity_comp_rate, annuity_personal_account_comp_rate,
+                annuity_public_account_comp_rate, annuity_pers_rate,
+                fund_soe_upper, fund_soe_lower,
                 new_hire_fund_delay_months, annuity_requires_regularization,
                 base_generation_rounding_mode
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(effective_from_month, manage_entity) DO UPDATE SET
                 rounding_mode=excluded.rounding_mode, fund_calc_method=excluded.fund_calc_method, medical_serious_fix=excluded.medical_serious_fix,
                 pension_upper=excluded.pension_upper, pension_lower=excluded.pension_lower, pension_comp_rate=excluded.pension_comp_rate, pension_pers_rate=excluded.pension_pers_rate,
@@ -168,7 +235,10 @@ def upsert_policy_rules(params_tuple: tuple, is_all_entities: bool = False) -> t
                 injury_upper=excluded.injury_upper, injury_lower=excluded.injury_lower, injury_comp_rate=excluded.injury_comp_rate,
                 maternity_upper=excluded.maternity_upper, maternity_lower=excluded.maternity_lower, maternity_comp_rate=excluded.maternity_comp_rate,
                 fund_upper=excluded.fund_upper, fund_lower=excluded.fund_lower, fund_comp_rate=excluded.fund_comp_rate, fund_pers_rate=excluded.fund_pers_rate,
-                annuity_comp_rate=excluded.annuity_comp_rate, annuity_pers_rate=excluded.annuity_pers_rate,
+                annuity_comp_rate=excluded.annuity_comp_rate,
+                annuity_personal_account_comp_rate=excluded.annuity_personal_account_comp_rate,
+                annuity_public_account_comp_rate=excluded.annuity_public_account_comp_rate,
+                annuity_pers_rate=excluded.annuity_pers_rate,
                 fund_soe_upper=excluded.fund_soe_upper, fund_soe_lower=excluded.fund_soe_lower,
                 new_hire_fund_delay_months=excluded.new_hire_fund_delay_months,
                 annuity_requires_regularization=excluded.annuity_requires_regularization,
@@ -456,6 +526,7 @@ def calculate_complete_bill(emp_row: dict, target_year: str, target_month: str =
     total_comp, total_pers = 0.0, 0.0
     social_actual_base = 0.0
     fund_actual_base = 0.0
+    annuity_actual_base = 0.0
     participation_notes = []
 
     # [核心防护] 提前初始化大病医疗字段，防止后端报 KeyError
@@ -499,6 +570,9 @@ def calculate_complete_bill(emp_row: dict, target_year: str, target_month: str =
         # 如果个人未开启参保，或尚未到自动启用月份，强制全部归零。
         if int(context.get('enabled', 0)) == 0 or not lifecycle_enabled:
             res[f'{item}_企'] = res[f'{item}_个'] = 0.0
+            if item == 'annuity':
+                res['annuity_personal_account_企'] = 0.0
+                res['annuity_public_account_企'] = 0.0
             res[f'{item}_route'] = '不参保'
             res[f'__{item}_base_amount'] = 0.0
             if lifecycle_reason:
@@ -509,11 +583,17 @@ def calculate_complete_bill(emp_row: dict, target_year: str, target_month: str =
         # 地市属地直缴等项目需要回传实缴金额，不允许套省内规则伪算。
         if context.get('amount_source') != 'system_calculated':
             res[f'{item}_企'] = res[f'{item}_个'] = 0.0
+            if item == 'annuity':
+                res['annuity_personal_account_企'] = 0.0
+                res['annuity_public_account_企'] = 0.0
             res[f'__{item}_base_amount'] = 0.0
             continue
 
         if not rules:
             res[f'{item}_企'] = res[f'{item}_个'] = 0.0
+            if item == 'annuity':
+                res['annuity_personal_account_企'] = 0.0
+                res['annuity_public_account_企'] = 0.0
             res[f'__{item}_base_amount'] = 0.0
             res[f'__{item}_calculation_error'] = f'{target_year}-{policy_entity}未配置计算规则'
             continue
@@ -545,6 +625,8 @@ def calculate_complete_bill(emp_row: dict, target_year: str, target_month: str =
         res[f'__{item}_base_amount'] = actual_base
         if item == 'fund':
             fund_actual_base = actual_base
+        elif item == 'annuity':
+            annuity_actual_base = actual_base
         elif item in {'pension', 'medical', 'unemp', 'injury', 'maternity'} and social_actual_base == 0:
             social_actual_base = actual_base
 
@@ -563,6 +645,31 @@ def calculate_complete_bill(emp_row: dict, target_year: str, target_month: str =
                 res[f'__medical_serious_{key}'] = context.get(key)
             res['__medical_serious_base_amount'] = actual_base
 
+        if item == 'annuity':
+            personal_account_rate = rules.get('annuity_personal_account_comp_rate', 0.06)
+            public_account_rate = rules.get('annuity_public_account_comp_rate', 0.02)
+            if pd.isna(personal_account_rate):
+                personal_account_rate = 0.06
+            if pd.isna(public_account_rate):
+                public_account_rate = max(
+                    safe_float(rules.get('annuity_comp_rate', 0.08))
+                    - safe_float(personal_account_rate),
+                    0.0,
+                )
+            res['annuity_personal_account_企'] = _round_half_up(
+                actual_base * safe_float(personal_account_rate), '0.01'
+            )
+            res['annuity_public_account_企'] = _round_half_up(
+                actual_base * safe_float(public_account_rate), '0.01'
+            )
+            # 年金实际由两个账户分别计缴，合计应以两项实缴额之和为准，
+            # 避免分别四舍五入时与“基数×8%”出现一分钱尾差。
+            c_amt = _round_half_up(
+                res['annuity_personal_account_企']
+                + res['annuity_public_account_企'],
+                '0.01',
+            )
+
         res[f'{item}_企'] = c_amt
         res[f'{item}_个'] = p_amt
         total_comp += c_amt
@@ -572,6 +679,7 @@ def calculate_complete_bill(emp_row: dict, target_year: str, target_month: str =
     res['合计个人扣款'] = total_pers
     res['社保执行基数'] = social_actual_base
     res['公积金执行基数'] = fund_actual_base
+    res['年金执行基数'] = annuity_actual_base
     res['待遇生效说明'] = '；'.join(dict.fromkeys(participation_notes))
     return res
 
