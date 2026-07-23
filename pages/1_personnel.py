@@ -852,7 +852,7 @@ elif current_page == "🧭 特殊人员与待遇":
     person_settings_tab, default_rules_tab, payroll_identity_tab = st.tabs([
         "人员情形与个人待遇例外",
         "下沉/地市转入默认规则",
-        "薪酬身份与聘期",
+        "专家、优才聘任与解聘",
     ])
     with person_settings_tab:
         st.subheader("🧭 特殊人员与待遇设置")
@@ -1278,11 +1278,11 @@ elif current_page == "🧭 特殊人员与待遇":
                     st.error(msg)
 
     with payroll_identity_tab:
-        st.subheader("优才、技术精英与专家身份")
+        st.subheader("专家、优才聘任与解聘")
         st.info(
-            "这里只给人员登记身份和有效期，不在人员档案里增加永久标签。"
-            "工资生成时会按发薪月份自动判断是否有效；多重优才身份只采用绩效倍数最高的一项，"
-            "不会叠加发放。"
+            "身份按聘期留痕，不做永久标签。工资按发薪月份判断：解聘日期所在月份"
+            "仍发最后一个月绩效及专家补贴，从次月起停止。一个人同时有普通岗位、"
+            "优才和专家身份时只采用待遇最高的一项，不叠加发放。"
         )
 
         identity_options = {
@@ -1290,8 +1290,8 @@ elif current_page == "🧭 特殊人员与待遇":
             "省级优才": ("talent", "province"),
             "技术精英": ("technical_elite", "elite"),
             "首席技术精英": ("technical_elite", "chief"),
-            "一级专家（历史调整口径）": ("province_expert", "level_1"),
-            "二级专家（历史调整口径）": ("province_expert", "level_2"),
+            "一级专家": ("province_expert", "level_1"),
+            "二级专家": ("province_expert", "level_2"),
         }
         identity_labels = {value: label for label, value in identity_options.items()}
 
@@ -1320,7 +1320,7 @@ elif current_page == "🧭 特殊人员与待遇":
                 with idc1:
                     identity_start = st.date_input("开始日期*", value=date.today())
                 with idc2:
-                    identity_has_end = st.checkbox("已明确结束日期")
+                    identity_has_end = st.checkbox("已明确聘期结束/解聘日期")
                     identity_end = st.date_input(
                         "结束日期", value=date.today(), disabled=not identity_has_end,
                     )
@@ -1330,7 +1330,7 @@ elif current_page == "🧭 特殊人员与待遇":
                 identity_remarks = st.text_input(
                     "说明（可选）", placeholder="仅记录这次聘任需要记住的特殊情况"
                 )
-                if st.form_submit_button("保存身份与聘期", type="primary"):
+                if st.form_submit_button("保存聘任与聘期", type="primary"):
                     identity_type, identity_level = identity_options[identity_name]
                     ok, msg = save_payroll_identity(
                         identity_person, identity_type, identity_level,
@@ -1355,7 +1355,7 @@ elif current_page == "🧭 特殊人员与待遇":
                 ), axis=1,
             )
             identity_df["状态"] = identity_df["status"].map({
-                "active": "有效/待生效", "ended": "已结束",
+                "active": "在聘/待生效", "ended": "已解聘/已结束",
             }).fillna(identity_df["status"])
             st.write("### 已登记身份")
             st.dataframe(
@@ -1370,15 +1370,18 @@ elif current_page == "🧭 特殊人员与待遇":
                 use_container_width=True, hide_index=True,
             )
 
-            active_identity_df = identity_df[identity_df["status"] == "active"]
-            if not active_identity_df.empty:
-                with st.expander("提前结束一项身份", expanded=False):
-                    active_ids = active_identity_df["identity_id"].astype(int).tolist()
+            endable_identity_df = identity_df[
+                identity_df["status"].isin(["active", "ended"])
+            ]
+            if not endable_identity_df.empty:
+                with st.expander("办理或修正解聘/结束日期", expanded=False):
+                    active_ids = endable_identity_df["identity_id"].astype(int).tolist()
                     active_labels = {
                         int(row["identity_id"]): (
                             f"{row['employee_name']}｜{row['身份']}｜{row['start_date']}起"
+                            f"｜当前结束：{row['end_date'] or '未结束'}"
                         )
-                        for _, row in active_identity_df.iterrows()
+                        for _, row in endable_identity_df.iterrows()
                     }
                     with st.form("end_payroll_identity_form"):
                         ending_identity = st.selectbox(
@@ -1386,7 +1389,8 @@ elif current_page == "🧭 特殊人员与待遇":
                             format_func=lambda value: active_labels[value],
                         )
                         ending_date = st.date_input("实际结束日期", value=date.today())
-                        if st.form_submit_button("保存结束日期"):
+                        st.caption("结束日期所在月份仍计发，次月起自动停止。")
+                        if st.form_submit_button("确认解聘/结束"):
                             ok, msg = end_payroll_identity(
                                 ending_identity, ending_date.isoformat()
                             )

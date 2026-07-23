@@ -2458,6 +2458,7 @@ with tab5:
         else:
             display_identity_rules = identity_rule_df[[
                 '规则ID', '身份规则', '绩效倍数', '年度津贴',
+                '专家原绩效标准', '专家激励包标准', '专家固定津贴',
                 '月度发放比例', '年度考评比例', '启用', '说明',
             ]].copy()
             edited_identity_rules = st.data_editor(
@@ -2469,6 +2470,9 @@ with tab5:
                     '规则ID': None,
                     '绩效倍数': st.column_config.NumberColumn(format="%.2f"),
                     '年度津贴': st.column_config.NumberColumn(format="%.2f"),
+                    '专家原绩效标准': st.column_config.NumberColumn(format="%.2f"),
+                    '专家激励包标准': st.column_config.NumberColumn(format="%.2f"),
+                    '专家固定津贴': st.column_config.NumberColumn(format="%.2f"),
                     '月度发放比例': st.column_config.NumberColumn(format="%.2f"),
                     '年度考评比例': st.column_config.NumberColumn(format="%.2f"),
                     '启用': st.column_config.CheckboxColumn(),
@@ -2481,7 +2485,8 @@ with tab5:
                 )
                 st.success(msg) if ok else st.error(msg)
         st.info(
-            "多重身份不会叠加：普通身份、集团优才和省级优才分别形成绩效候选值，"
-            "系统取其中最高值。技术精英3万/首席技术精英6万元的50%按月发放；"
-            "省公司一级、二级专家需维护聘任前基线后才启用历史差额自动计算。"
+            "多重身份不会叠加：普通身份、集团优才、省级优才、技术精英和专家"
+            "分别形成待遇候选值，系统只采用最高的一项。一级/二级专家按“专家原绩效、"
+            "专家激励包、固定津贴”与普通待遇比较，差额的月度发放比例自动进入"
+            "“专家/特殊津贴”，剩余部分留待年度考评结算。"
         )

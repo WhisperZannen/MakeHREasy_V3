@@ -362,15 +362,24 @@ def _performance_components(conn, version, snapshot):
     return result
 
 
-def _identity_effects(conn, version_id, emp_id, target_month):
+def _identity_effects(conn, version_id, emp_id, target_month, components=None):
+    """
+    计算当月有效薪酬身份。
+
+    普通身份、优才、专家/技术精英分别形成待遇候选值，只采用最高的一项，
+    不叠加。身份结束所在月份仍算有效，从次月起停止。
+    """
     last_day = calendar.monthrange(
         int(target_month[:4]), int(target_month[5:7])
     )[1]
-    target_date = f"{target_month}-{last_day:02d}"
+    month_start = f"{target_month}-01"
+    month_end = f"{target_month}-{last_day:02d}"
     rows = conn.execute(
         """
         SELECT i.*, r.calculation_mode, r.performance_multiplier,
                r.annual_allowance, r.monthly_share, r.annual_share,
+               r.expert_original_performance, r.expert_incentive_pack,
+               r.expert_fixed_allowance,
                r.parameters_json, r.remarks AS rule_remarks
         FROM employee_payroll_identities i
         LEFT JOIN payroll_identity_rules r
@@ -381,36 +390,115 @@ def _identity_effects(conn, version_id, emp_id, target_month):
           AND (i.end_date IS NULL OR i.end_date >= ?)
         ORDER BY i.identity_id
         """,
-        (version_id, emp_id, target_date, target_date),
+        (version_id, emp_id, month_end, month_start),
     ).fetchall()
-    performance_multiplier = 1.0
-    monthly_allowance = 0.0
+    normal_original = float((components or {}).get("original_performance") or 0)
+    normal_incentive = float((components or {}).get("incentive_pack") or 0)
+    normal_total = normal_original + normal_incentive
+    candidates = [{
+        "identity": "normal",
+        "label": "普通身份",
+        "comparison_amount": normal_total,
+        "performance_multiplier": 1.0,
+        "monthly_allowance": 0.0,
+        "calculation": {
+            "normal_original_performance": normal_original,
+            "normal_incentive_pack": normal_incentive,
+        },
+    }]
     labels = []
     warnings = []
     for row in rows:
-        labels.append(f"{row['identity_type']}:{row['identity_level']}")
+        identity_code = f"{row['identity_type']}:{row['identity_level']}"
+        labels.append(identity_code)
         if row["calculation_mode"] is None:
             warnings.append("存在有效薪酬身份，但总阀门没有对应待遇规则")
             continue
         if row["calculation_mode"] == "performance_multiplier":
-            performance_multiplier = max(
-                performance_multiplier, float(row["performance_multiplier"] or 1)
-            )
+            multiplier = float(row["performance_multiplier"] or 1)
+            candidates.append({
+                "identity": identity_code,
+                "label": identity_code,
+                "comparison_amount": normal_total * multiplier,
+                "performance_multiplier": multiplier,
+                "monthly_allowance": 0.0,
+                "calculation": {
+                    "normal_performance_base": normal_total,
+                    "performance_multiplier": multiplier,
+                },
+            })
         elif row["calculation_mode"] == "annual_allowance":
-            monthly_allowance += round(
-                float(row["annual_allowance"] or 0)
-                * float(row["monthly_share"] or 0) / 12, 2
+            annual_allowance = float(row["annual_allowance"] or 0)
+            monthly_share = float(row["monthly_share"] or 0)
+            candidates.append({
+                "identity": identity_code,
+                "label": identity_code,
+                # 用全年待遇折算的月均值与优才/普通身份比较；真正随月发放的
+                # 仍然只取规则中的月度份额。
+                "comparison_amount": normal_total + annual_allowance / 12,
+                "performance_multiplier": 1.0,
+                "monthly_allowance": round(
+                    annual_allowance * monthly_share / 12, 2
+                ),
+                "calculation": {
+                    "annual_allowance": annual_allowance,
+                    "monthly_share": monthly_share,
+                },
+            })
+        elif row["calculation_mode"] == "expert_highest_performance":
+            try:
+                baseline = json.loads(row["baseline_snapshot"] or "{}")
+            except (TypeError, ValueError):
+                baseline = {}
+                warnings.append(f"{identity_code}聘任基线格式异常，已按当前普通待遇计算")
+            baseline_original = float(
+                baseline.get("normal_original_performance", normal_original) or 0
             )
+            baseline_incentive = float(
+                baseline.get("normal_incentive_pack", normal_incentive) or 0
+            )
+            target_original = float(row["expert_original_performance"] or 0)
+            target_incentive = float(row["expert_incentive_pack"] or 0)
+            fixed_allowance = float(row["expert_fixed_allowance"] or 0)
+            original_gap = max(target_original - baseline_original, 0.0)
+            incentive_gap = max(target_incentive - baseline_incentive, 0.0)
+
+            # 两个绩效组成项均不高于普通/管理身份时，专家身份不产生待遇，
+            # 固定津贴也不单独叠加。周浩等多重身份按此自然取较高身份。
+            if original_gap <= 0 and incentive_gap <= 0:
+                continue
+            full_monthly_gap = original_gap + incentive_gap + fixed_allowance
+            monthly_share = float(row["monthly_share"] or 0.5)
+            candidates.append({
+                "identity": identity_code,
+                "label": identity_code,
+                "comparison_amount": (
+                    baseline_original + baseline_incentive + full_monthly_gap
+                ),
+                "performance_multiplier": 1.0,
+                "monthly_allowance": round(full_monthly_gap * monthly_share, 2),
+                "calculation": {
+                    "normal_original_performance": baseline_original,
+                    "normal_incentive_pack": baseline_incentive,
+                    "expert_original_performance": target_original,
+                    "expert_incentive_pack": target_incentive,
+                    "original_performance_gap": original_gap,
+                    "incentive_pack_gap": incentive_gap,
+                    "expert_fixed_allowance": fixed_allowance,
+                    "monthly_share": monthly_share,
+                },
+            })
         elif row["calculation_mode"] == "historical_adjustment":
-            baseline = json.loads(row["baseline_snapshot"] or "{}")
-            if not baseline:
-                warnings.append("专家身份缺少聘任前待遇基线，暂不自动计算专家调整")
-            else:
-                warnings.append("专家历史差额规则已留底，需复核基线后再启用自动金额")
+            warnings.append("专家规则仍是旧版历史差额占位，请在薪酬总阀门升级")
+
+    selected = max(candidates, key=lambda item: item["comparison_amount"])
     return {
-        "performance_multiplier": performance_multiplier,
-        "monthly_allowance": monthly_allowance,
+        "performance_multiplier": selected["performance_multiplier"],
+        "monthly_allowance": selected["monthly_allowance"],
         "identities": labels,
+        "selected_identity": selected["identity"],
+        "identity_candidates": candidates,
+        "selected_calculation": selected["calculation"],
         "warnings": warnings,
     }
 
@@ -603,7 +691,7 @@ def generate_payroll_draft(pay_month, performance_month=None):
                     components = _performance_components(conn, version, perf_person)
             warnings.extend(components["warnings"])
             identity = _identity_effects(
-                conn, version_id, emp_id, performance_month
+                conn, version_id, emp_id, pay_month, components
             )
             warnings.extend(identity["warnings"])
 
@@ -659,6 +747,9 @@ def generate_payroll_draft(pay_month, performance_month=None):
                 "incentive_coefficient": components["incentive_coefficient"],
                 "score_source": score_source,
                 "identities": identity["identities"],
+                "selected_identity": identity["selected_identity"],
+                "identity_candidates": identity["identity_candidates"],
+                "selected_identity_calculation": identity["selected_calculation"],
             }
             record_id = f"{pay_month}_{emp_id}"
             conn.execute(
@@ -911,7 +1002,8 @@ def get_payroll_identities(emp_id=None):
 
 
 def save_payroll_identity(emp_id, identity_type, identity_level, start_date,
-                          end_date=None, source_document="", remarks=""):
+                          end_date=None, source_document="", remarks="",
+                          baseline_snapshot=None):
     """新增一段有时效的薪酬身份；不覆盖同一人员的其他身份。"""
     start = datetime.strptime(str(start_date), "%Y-%m-%d").strftime("%Y-%m-%d")
     end = None
@@ -919,23 +1011,33 @@ def save_payroll_identity(emp_id, identity_type, identity_level, start_date,
         end = datetime.strptime(str(end_date), "%Y-%m-%d").strftime("%Y-%m-%d")
         if end < start:
             return False, "结束日期不能早于开始日期"
+    if isinstance(baseline_snapshot, str):
+        try:
+            baseline_payload = json.loads(baseline_snapshot or "{}")
+        except ValueError:
+            return False, "聘任待遇基线格式不正确"
+    else:
+        baseline_payload = baseline_snapshot or {}
+    baseline_json = json.dumps(baseline_payload, ensure_ascii=False)
     conn = _get_db_connection()
     try:
         conn.execute(
             """
             INSERT INTO employee_payroll_identities(
                 emp_id, identity_type, identity_level, start_date, end_date,
-                source_document, status, remarks
-            ) VALUES (?, ?, ?, ?, ?, ?, 'active', ?)
+                source_document, baseline_snapshot, status, remarks
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?)
             ON CONFLICT(emp_id, identity_type, identity_level, start_date)
             DO UPDATE SET end_date=excluded.end_date,
                           source_document=excluded.source_document,
+                          baseline_snapshot=excluded.baseline_snapshot,
                           status='active', remarks=excluded.remarks,
                           updated_at=CURRENT_TIMESTAMP
             """,
             (
                 str(emp_id), str(identity_type), str(identity_level), start, end,
-                str(source_document or "").strip(), str(remarks or "").strip(),
+                str(source_document or "").strip(), baseline_json,
+                str(remarks or "").strip(),
             ),
         )
         conn.commit()
@@ -968,7 +1070,7 @@ def end_payroll_identity(identity_id, end_date):
             (end, int(identity_id)),
         )
         conn.commit()
-        return True, "薪酬身份已结束，历史月份不会被改写"
+        return True, "身份已解聘/结束；结束日期所在月份仍计发，次月起停止"
     except Exception as exc:
         conn.rollback()
         return False, str(exc)

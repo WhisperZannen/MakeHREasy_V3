@@ -94,6 +94,9 @@ def get_identity_rules(version_id):
                    annual_allowance AS 年度津贴,
                    monthly_share AS 月度发放比例,
                    annual_share AS 年度考评比例,
+                   expert_original_performance AS 专家原绩效标准,
+                   expert_incentive_pack AS 专家激励包标准,
+                   expert_fixed_allowance AS 专家固定津贴,
                    enabled AS 启用,
                    COALESCE(remarks, '') AS 说明
             FROM payroll_identity_rules
@@ -121,7 +124,11 @@ def save_identity_rules(version_id, dataframe):
                 '''
                 UPDATE payroll_identity_rules
                 SET performance_multiplier=?, annual_allowance=?,
-                    monthly_share=?, annual_share=?, enabled=?, remarks=?
+                    monthly_share=?, annual_share=?,
+                    expert_original_performance=?,
+                    expert_incentive_pack=?,
+                    expert_fixed_allowance=?,
+                    enabled=?, remarks=?
                 WHERE identity_rule_id=? AND rule_version_id=?
                 ''',
                 (
@@ -129,6 +136,9 @@ def save_identity_rules(version_id, dataframe):
                     _number(row.get('年度津贴'), allow_none=True),
                     _number(row.get('月度发放比例'), allow_none=True),
                     _number(row.get('年度考评比例'), allow_none=True),
+                    _number(row.get('专家原绩效标准'), allow_none=True),
+                    _number(row.get('专家激励包标准'), allow_none=True),
+                    _number(row.get('专家固定津贴'), allow_none=True),
                     1 if bool(row.get('启用', True)) else 0,
                     str(row.get('说明') or '').strip(),
                     int(row['规则ID']), int(version_id),
@@ -271,10 +281,14 @@ def copy_rule_version(source_version_id, rule_name, effective_from_month):
             'payroll_identity_rules': (
                 'identity_type, identity_level, calculation_mode, '
                 'performance_multiplier, annual_allowance, monthly_share, '
-                'annual_share, parameters_json, enabled, remarks',
+                'annual_share, expert_original_performance, '
+                'expert_incentive_pack, expert_fixed_allowance, '
+                'parameters_json, enabled, remarks',
                 'identity_type, identity_level, calculation_mode, '
                 'performance_multiplier, annual_allowance, monthly_share, '
-                'annual_share, parameters_json, enabled, remarks',
+                'annual_share, expert_original_performance, '
+                'expert_incentive_pack, expert_fixed_allowance, '
+                'parameters_json, enabled, remarks',
             ),
         }
         for table, (target_columns, source_columns) in copy_specs.items():

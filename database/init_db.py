@@ -1431,6 +1431,9 @@ def ensure_payroll_workflow_schema(cursor):
             annual_allowance REAL,
             monthly_share REAL,
             annual_share REAL,
+            expert_original_performance REAL,
+            expert_incentive_pack REAL,
+            expert_fixed_allowance REAL,
             parameters_json TEXT DEFAULT '{}',
             enabled INTEGER NOT NULL DEFAULT 1,
             remarks TEXT,
@@ -1438,6 +1441,18 @@ def ensure_payroll_workflow_schema(cursor):
             FOREIGN KEY(rule_version_id) REFERENCES payroll_rule_versions(rule_version_id)
         )
     ''')
+    cursor.execute("PRAGMA table_info(payroll_identity_rules)")
+    identity_rule_columns = {row[1] for row in cursor.fetchall()}
+    for column_name in (
+        'expert_original_performance',
+        'expert_incentive_pack',
+        'expert_fixed_allowance',
+    ):
+        if column_name not in identity_rule_columns:
+            cursor.execute(
+                f"ALTER TABLE payroll_identity_rules "
+                f"ADD COLUMN {column_name} REAL"
+            )
     cursor.execute('''
         CREATE INDEX IF NOT EXISTS idx_payroll_identity_effective
         ON employee_payroll_identities(emp_id, start_date, end_date, status)
@@ -1454,28 +1469,59 @@ def ensure_payroll_workflow_schema(cursor):
     ]
     identity_rules = [
         ('talent', 'group', 'performance_multiplier', 2.0, None, None, None,
+         None, None, None,
          '集团优才：形成绩效候选值，和其他身份比较后取最高值'),
         ('talent', 'province', 'performance_multiplier', 1.5, None, None, None,
+         None, None, None,
          '省级优才：形成绩效候选值，和其他身份比较后取最高值'),
         ('technical_elite', 'elite', 'annual_allowance', None, 30000, 0.5, 0.5,
+         None, None, None,
          '技术精英：年度津贴3万元，50%按月发放，50%按年度考评发放'),
         ('technical_elite', 'chief', 'annual_allowance', None, 60000, 0.5, 0.5,
+         None, None, None,
          '首席技术精英：年度津贴6万元，50%按月发放，50%按年度考评发放'),
-        ('province_expert', 'level_1', 'historical_adjustment', None, None, None, None,
-         '一级专家按聘任前后待遇差额计算，启用自动计算前须维护聘任基线'),
-        ('province_expert', 'level_2', 'historical_adjustment', None, None, None, None,
-         '二级专家按聘任前后待遇差额计算，启用自动计算前须维护聘任基线'),
+        ('province_expert', 'level_1', 'expert_highest_performance',
+         None, None, 0.5, 0.5, 3900, 6000, 500,
+         '一级专家：原绩效3900、激励包6000、专家津贴500；差额的50%随月发放'),
+        ('province_expert', 'level_2', 'expert_highest_performance',
+         None, None, 0.5, 0.5, 3450, 5400, 350,
+         '二级专家：原绩效3450、激励包5400、专家津贴350；差额的50%随月发放'),
     ]
     for version_id in version_ids:
         cursor.executemany('''
             INSERT OR IGNORE INTO payroll_identity_rules(
                 rule_version_id, identity_type, identity_level,
                 calculation_mode, performance_multiplier, annual_allowance,
-                monthly_share, annual_share, remarks
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                monthly_share, annual_share,
+                expert_original_performance, expert_incentive_pack,
+                expert_fixed_allowance, remarks
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', [
             (version_id,) + row for row in identity_rules
         ])
+        # 早期版本只给专家留了“历史差额”占位，尚未真正计算。仅升级这种
+        # 系统占位规则，不覆盖用户以后另建的专家政策版本。
+        cursor.execute('''
+            UPDATE payroll_identity_rules
+            SET calculation_mode='expert_highest_performance',
+                monthly_share=0.5, annual_share=0.5,
+                expert_original_performance=CASE identity_level
+                    WHEN 'level_1' THEN 3900 ELSE 3450 END,
+                expert_incentive_pack=CASE identity_level
+                    WHEN 'level_1' THEN 6000 ELSE 5400 END,
+                expert_fixed_allowance=CASE identity_level
+                    WHEN 'level_1' THEN 500 ELSE 350 END,
+                remarks=CASE identity_level
+                    WHEN 'level_1'
+                    THEN '一级专家：原绩效3900、激励包6000、专家津贴500；差额的50%随月发放'
+                    ELSE '二级专家：原绩效3450、激励包5400、专家津贴350；差额的50%随月发放'
+                END
+            WHERE rule_version_id=?
+              AND identity_type='province_expert'
+              AND identity_level IN ('level_1', 'level_2')
+              AND calculation_mode='historical_adjustment'
+              AND COALESCE(parameters_json, '{}')='{}'
+        ''', (version_id,))
 
 
 def _apply_confirmed_payroll_rule_upgrades(cursor):

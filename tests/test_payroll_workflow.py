@@ -185,6 +185,71 @@ class PayrollWorkflowTest(unittest.TestCase):
         finally:
             conn.close()
 
+    def test_expert_uses_component_gaps_and_dismissal_month_is_final_month(self):
+        from modules.core_payroll import _identity_effects, save_payroll_identity
+
+        ok, message = save_payroll_identity(
+            "E1", "province_expert", "level_1", "2026-01-01",
+            end_date="2026-07-10",
+            baseline_snapshot={
+                "normal_original_performance": 3150,
+                "normal_incentive_pack": 4500,
+            },
+        )
+        self.assertTrue(ok, message)
+
+        conn = self._connect()
+        try:
+            version_id = conn.execute(
+                "SELECT rule_version_id FROM payroll_rule_versions LIMIT 1"
+            ).fetchone()[0]
+            components = {
+                "original_performance": 3150,
+                "incentive_pack": 4500,
+            }
+            july = _identity_effects(
+                conn, version_id, "E1", "2026-07", components
+            )
+            august = _identity_effects(
+                conn, version_id, "E1", "2026-08", components
+            )
+        finally:
+            conn.close()
+
+        self.assertEqual(july["selected_identity"], "province_expert:level_1")
+        self.assertEqual(july["monthly_allowance"], 1375.0)
+        self.assertEqual(august["selected_identity"], "normal")
+        self.assertEqual(august["monthly_allowance"], 0.0)
+
+    def test_province_talent_beats_technical_elite_without_stacking(self):
+        from modules.core_payroll import _identity_effects, save_payroll_identity
+
+        ok, message = save_payroll_identity(
+            "E1", "technical_elite", "elite", "2024-01-01",
+            end_date="2026-07-31",
+        )
+        self.assertTrue(ok, message)
+        ok, message = save_payroll_identity(
+            "E1", "talent", "province", "2023-01-01"
+        )
+        self.assertTrue(ok, message)
+
+        conn = self._connect()
+        try:
+            version_id = conn.execute(
+                "SELECT rule_version_id FROM payroll_rule_versions LIMIT 1"
+            ).fetchone()[0]
+            result = _identity_effects(
+                conn, version_id, "E1", "2026-07",
+                {"original_performance": 4050, "incentive_pack": 5850},
+            )
+        finally:
+            conn.close()
+
+        self.assertEqual(result["selected_identity"], "talent:province")
+        self.assertEqual(result["performance_multiplier"], 1.5)
+        self.assertEqual(result["monthly_allowance"], 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()
