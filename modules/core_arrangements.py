@@ -67,6 +67,45 @@ AMOUNT_SOURCE_LABELS = {
     "manual_confirmed": "人工确认金额",
 }
 
+SOCIAL_EXPORT_SCOPE_FIELDS = {
+    "payment": "payment_export_included",
+    "oa": "oa_export_included",
+}
+
+SOCIAL_PAYMENT_CHANNEL_DEFINITIONS = {
+    "province_public:fund": {
+        "name": "省公众(公积金)", "items": ["fund"], "sort_order": 10,
+    },
+    "province_public:social_group": {
+        "name": "省公众(养老、失业、工伤)",
+        "items": ["pension", "unemp", "injury"], "sort_order": 20,
+    },
+    "province_company:annuity": {
+        "name": "省公司代缴(年金)", "items": ["annuity"], "sort_order": 30,
+    },
+    "province_company:medical_group": {
+        "name": "省公司代缴(医疗、大病、生育、工伤)",
+        "items": ["medical", "medical_serious", "maternity", "injury"],
+        "sort_order": 40,
+    },
+    "ct_digital:all_social": {
+        "name": "中电数智(五险两金)",
+        "items": [
+            "pension", "medical", "medical_serious", "unemp",
+            "injury", "maternity", "fund", "annuity",
+        ],
+        "sort_order": 50,
+    },
+    "province_public:medical_group": {
+        "name": "省公众(医疗、大病、生育、工伤)",
+        "items": ["medical", "medical_serious", "maternity", "injury"],
+        "sort_order": 60,
+    },
+    "province_company:pension": {
+        "name": "省公司代缴(养老)", "items": ["pension"], "sort_order": 70,
+    },
+}
+
 ACTIVE_LABELS = {1: "启用", 0: "停用"}
 ENABLED_LABELS = {1: "参保", 0: "不参保", None: "沿用上级配置"}
 
@@ -322,11 +361,11 @@ def _default_payment_channel(payer_name: str, insurance_item: str) -> str:
     if payer_name == "中电数智":
         return "ct_digital:all_social"
     if payer_name == "省公司":
-        return (
-            "province_company:annuity"
-            if insurance_item == "annuity"
-            else "province_company:medical_group"
-        )
+        if insurance_item == "annuity":
+            return "province_company:annuity"
+        if insurance_item == "pension":
+            return "province_company:pension"
+        return "province_company:medical_group"
     if payer_name == "省公众":
         if insurance_item == "fund":
             return "province_public:fund"
@@ -389,9 +428,10 @@ def resolve_social_route(
             ),
         ).fetchone()
 
+        arrangement_type = arrangement.get("arrangement_type", "normal")
         context: Dict[str, Any] = {
             "arrangement_id": arrangement.get("arrangement_id"),
-            "arrangement_type": arrangement.get("arrangement_type", "normal"),
+            "arrangement_type": arrangement_type,
             "enabled": int(legacy_enabled or 0),
             "calculation_policy_entity": legacy_payer_name,
             "payer_entity_code": legacy_payer_code,
@@ -403,6 +443,12 @@ def resolve_social_route(
             "settlement_cycle": arrangement.get("settlement_cycle") or "none",
             "amount_source": "system_calculated",
             "payment_channel_code": None,
+            "payment_export_included": (
+                0 if arrangement_type == "down_secondment" else 1
+            ),
+            "oa_export_included": (
+                0 if arrangement_type in {"proxy_social", "down_secondment"} else 1
+            ),
             "route_policy_id": None,
             "override_id": None,
         }
@@ -437,6 +483,8 @@ def resolve_social_route(
                 "settlement_cycle",
                 "amount_source",
                 "payment_channel_code",
+                "payment_export_included",
+                "oa_export_included",
             ]:
                 if p.get(field) not in {None, ""}:
                     context[field] = p[field]
@@ -455,6 +503,8 @@ def resolve_social_route(
                 "settlement_cycle",
                 "amount_source",
                 "payment_channel_code",
+                "payment_export_included",
+                "oa_export_included",
             ]:
                 if o.get(field) not in {None, ""}:
                     context[field] = o[field]
@@ -487,6 +537,37 @@ def resolve_social_route(
     finally:
         if own_conn:
             conn.close()
+
+
+def social_export_included(record: Dict[str, Any], scope: str) -> bool:
+    """
+    统一判断一条险种明细是否进入指定导出。
+
+    新明细必须读取固化字段；兼容旧明细时才按人员情形和金额来源回退。
+    所有付款、审批和OA导出都必须调用这里，禁止各自猜测。
+    """
+    field = SOCIAL_EXPORT_SCOPE_FIELDS.get(scope)
+    if not field:
+        raise ValueError(f"未知社保导出口径：{scope}")
+    value = record.get(field)
+    if value is not None and str(value).strip() not in {"", "nan", "None"}:
+        return bool(int(value))
+
+    arrangement_type = str(record.get("business_type_snapshot")
+                           or record.get("arrangement_type") or "normal")
+    if scope == "oa":
+        return arrangement_type not in {"proxy_social", "down_secondment"}
+    if arrangement_type == "down_secondment":
+        return (
+            str(record.get("insurance_item") or "") == "fund"
+            and str(record.get("amount_source") or "system_calculated")
+            == "system_calculated"
+        )
+    return not (
+        str(record.get("amount_source") or "") == "external_actual"
+        and str(record.get("settlement_mode") or "")
+        in {"none", "record_only", "local_direct"}
+    )
 
 
 def is_payroll_included(emp_id: str, target_month: str, conn=None) -> bool:
@@ -832,7 +913,9 @@ def create_route_policy(data: Dict[str, Any]) -> Tuple[bool, str]:
             "enabled_default", "calculation_policy_entity", "payer_entity_rule",
             "payer_entity_code", "cost_bearer_rule", "cost_bearer_code",
             "settlement_counterparty_code", "settlement_mode", "settlement_cycle",
-            "amount_source", "payment_channel_code", "priority", "active", "remarks",
+            "amount_source", "payment_channel_code",
+            "payment_export_included", "oa_export_included",
+            "priority", "active", "remarks",
         ]
         conn.execute(
             f"INSERT INTO social_route_policies ({','.join(columns)}) "
@@ -964,10 +1047,11 @@ def save_normal_route_default(
                 calculation_policy_entity, payer_entity_rule, payer_entity_code,
                 cost_bearer_rule, cost_bearer_code, settlement_counterparty_code,
                 settlement_mode, settlement_cycle, amount_source,
+                payment_export_included, oa_export_included,
                 priority, active, remarks
             ) VALUES (?, 'normal', ?, ?, NULL, ?, 'fixed', ?,
                       'fixed', 'province_public', ?, ?, ?,
-                      'system_calculated', 100, 1, ?)
+                      'system_calculated', 1, 1, 100, 1, ?)
             """,
             (
                 f"普通人员{INSURANCE_LABELS[insurance_item]}办理方式",
@@ -1067,6 +1151,21 @@ def get_arrangement_route_defaults(
                 "办理单位": payer,
                 "成本归属": cost,
                 "系统处理": result,
+                "本系统金额": (
+                    "自动计算"
+                    if data.get("amount_source") == "system_calculated"
+                    else "不计算，只记录归属"
+                ),
+                "付款清单": (
+                    "进入"
+                    if int(data.get("payment_export_included") or 0)
+                    else "不进入"
+                ),
+                "OA接口": (
+                    "进入"
+                    if int(data.get("oa_export_included") or 0)
+                    else "不进入"
+                ),
                 "生效月份": data.get("effective_from_month"),
                 "说明": data.get("remarks") or "",
                 "insurance_item": item,
@@ -1107,7 +1206,15 @@ def save_arrangement_route_default(
     calculation_entity = (
         "province_company" if payer_choice == "province_company" else "province_public"
     )
-    if payer_rule == cost_rule == "related_branch":
+    if (
+        arrangement_type == "down_secondment"
+        and payer_choice in {"province_company", "related_branch"}
+    ):
+        # 下沉人员由省公司或地市直接办理的项目不经过省公众付款，
+        # 这里只保留业务归属记录；是否进入付款清单不能再由导出页面猜测。
+        settlement_mode, settlement_cycle = "record_only", "none"
+        amount_source = "external_actual"
+    elif payer_rule == cost_rule == "related_branch":
         settlement_mode, settlement_cycle = "none", "none"
         amount_source = "external_actual"
     elif include_company_cost and payer_rule == "related_branch":
@@ -1125,6 +1232,11 @@ def save_arrangement_route_default(
     else:
         settlement_mode, settlement_cycle = "none", "none"
         amount_source = "system_calculated"
+    payment_export_included = int(
+        amount_source == "system_calculated"
+        and settlement_mode not in {"record_only", "local_direct"}
+    )
+    oa_export_included = 0 if arrangement_type == "down_secondment" else 1
 
     conn = _get_db_connection()
     try:
@@ -1170,15 +1282,17 @@ def save_arrangement_route_default(
                 calculation_policy_entity, payer_entity_rule, payer_entity_code,
                 cost_bearer_rule, cost_bearer_code,
                 settlement_mode, settlement_cycle, amount_source,
+                payment_export_included, oa_export_included,
                 priority, active, remarks
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                      ?, 200, 1, ?)
+                      ?, ?, ?, 200, 1, ?)
             """,
             (
                 f"{SPECIAL_DEFAULT_ARRANGEMENT_TYPES[arrangement_type]}{INSURANCE_LABELS[insurance_item]}默认规则",
                 arrangement_type, insurance_item, effective_from_month, effective_to,
                 1 if enabled else 0, calculation_entity, payer_rule, payer_code,
                 cost_rule, cost_code, settlement_mode, settlement_cycle, amount_source,
+                payment_export_included, oa_export_included,
                 str(remarks or "").strip(),
             ),
         )
@@ -1238,6 +1352,7 @@ def create_social_override(data: Dict[str, Any]) -> Tuple[bool, str]:
             "enabled", "calculation_policy_entity", "payer_entity_code",
             "cost_bearer_code", "settlement_counterparty_code", "settlement_mode",
             "settlement_cycle", "amount_source", "payment_channel_code",
+            "payment_export_included", "oa_export_included",
             "special_reason", "source_document_no", "active",
         ]
         conn.execute(
@@ -1324,6 +1439,7 @@ def save_person_social_override(
             "enabled", "calculation_policy_entity", "payer_entity_code",
             "cost_bearer_code", "settlement_counterparty_code", "settlement_mode",
             "settlement_cycle", "amount_source", "payment_channel_code",
+            "payment_export_included", "oa_export_included",
             "special_reason", "source_document_no", "active",
         ]
         values = {
@@ -1345,10 +1461,18 @@ def save_person_social_override(
                 else "system_calculated"
             ),
             "payment_channel_code": None,
+            "payment_export_included": None,
+            "oa_export_included": (
+                0 if arrangement_type in {"proxy_social", "down_secondment"} else 1
+            ),
             "special_reason": str(special_reason).strip(),
             "source_document_no": str(source_document_no or "").strip(),
             "active": 1,
         }
+        values["payment_export_included"] = int(
+            values["amount_source"] == "system_calculated"
+            and values["settlement_mode"] not in {"record_only", "local_direct"}
+        )
         conn.execute(
             f"INSERT INTO employee_social_overrides ({','.join(columns)}) "
             f"VALUES ({','.join(['?'] * len(columns))})",
@@ -1416,7 +1540,8 @@ def create_arrangement(data: Dict[str, Any]) -> Tuple[bool, str]:
             "payroll_entity_code", "home_dept_id", "actual_work_unit_code",
             "related_branch_code", "accounting_entity_code",
             "ultimate_cost_bearer_code", "start_date", "planned_end_date",
-            "actual_end_date", "payroll_included", "labor_cost_included", "settlement_mode",
+            "actual_end_date", "payroll_included", "labor_cost_included",
+            "final_performance_pay_month", "settlement_mode",
             "settlement_cycle", "status", "source_document_no", "remarks",
         ]
         conn.execute(
@@ -1518,6 +1643,9 @@ def save_simple_arrangement(data: Dict[str, Any]) -> Tuple[bool, str]:
             "actual_end_date": None,
             "payroll_included": payroll_included,
             "labor_cost_included": labor_included,
+            "final_performance_pay_month": data.get(
+                "final_performance_pay_month"
+            ),
             "settlement_mode": settlement_mode,
             "settlement_cycle": settlement_cycle,
             "status": "active",
@@ -1530,7 +1658,8 @@ def save_simple_arrangement(data: Dict[str, Any]) -> Tuple[bool, str]:
             "home_dept_id", "actual_work_unit_code", "related_branch_code",
             "accounting_entity_code", "ultimate_cost_bearer_code", "start_date",
             "planned_end_date", "actual_end_date", "payroll_included",
-            "labor_cost_included", "settlement_mode", "settlement_cycle", "status",
+            "labor_cost_included", "final_performance_pay_month",
+            "settlement_mode", "settlement_cycle", "status",
             "source_document_no", "remarks",
         ]
         if current and str(current["start_date"]) == start_date:
@@ -1715,9 +1844,11 @@ def backfill_relationship_snapshots() -> Dict[str, int]:
                         base_amount, company_amount, personal_amount,
                         calculation_policy_entity, payer_entity_code, cost_bearer_code,
                         settlement_counterparty_code, settlement_mode, settlement_cycle,
-                        amount_source, payment_channel_code, route_policy_id, override_id,
+                        amount_source, payment_channel_code,
+                        payment_export_included, oa_export_included,
+                        route_policy_id, override_id,
                         close_status
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(cost_month, emp_id, insurance_item) DO UPDATE SET
                         monthly_record_id=excluded.monthly_record_id,
                         arrangement_id=excluded.arrangement_id,
@@ -1733,6 +1864,8 @@ def backfill_relationship_snapshots() -> Dict[str, int]:
                         settlement_cycle=excluded.settlement_cycle,
                         amount_source=excluded.amount_source,
                         payment_channel_code=excluded.payment_channel_code,
+                        payment_export_included=excluded.payment_export_included,
+                        oa_export_included=excluded.oa_export_included,
                         route_policy_id=excluded.route_policy_id,
                         override_id=excluded.override_id
                     """,
@@ -1744,6 +1877,8 @@ def backfill_relationship_snapshots() -> Dict[str, int]:
                         context.get("cost_bearer_code"), context.get("settlement_counterparty_code"),
                         context.get("settlement_mode") or "none", context.get("settlement_cycle") or "none",
                         "historical_snapshot", context.get("payment_channel_code"),
+                        int(context.get("payment_export_included", 1) or 0),
+                        int(context.get("oa_export_included", 1) or 0),
                         context.get("route_policy_id"), context.get("override_id"),
                         row.get("close_status") or "draft",
                     ),

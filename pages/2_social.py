@@ -42,8 +42,12 @@ from modules.core_social_security import (
     _get_db_connection,
     batch_update_emp_matrix,
     batch_update_social_bases,
+    INTERNAL_APPROVAL_TYPE_LABELS,
+    load_internal_approval_base_snapshots,
+    load_payment_export_rows,
     normalize_internal_cost_center,
     prepare_internal_approval_person_summary,
+    write_internal_approval_sheet,
 )
 from modules.core_arrangements import (
     ACTIVE_LABELS,
@@ -56,6 +60,7 @@ from modules.core_arrangements import (
     SETTLEMENT_BATCH_STATUS_LABELS,
     SETTLEMENT_CYCLE_LABELS,
     SETTLEMENT_MODE_LABELS,
+    SOCIAL_PAYMENT_CHANNEL_DEFINITIONS,
     backfill_relationship_snapshots,
     create_route_policy,
     create_social_override,
@@ -68,9 +73,17 @@ from modules.core_arrangements import (
     register_social_settlement_batch,
     resolve_social_route,
     save_normal_route_default,
+    social_export_included,
     update_settlement_batch_status,
 )
 from modules.core_identity import resolve_employee_reference, resolve_internal_emp_id
+from modules.core_social_oa import (
+    OAExportValidationError,
+    build_oa_export_package,
+    get_oa_export_settings,
+    get_oa_export_summary,
+    update_oa_export_filenames,
+)
 
 st.set_page_config(page_title="社保与福利结算", layout="wide")
 
@@ -110,104 +123,6 @@ def format_excel_sheet(worksheet, df_columns):
                     cell.alignment = Alignment(horizontal='right', vertical='center')
                 else:
                     cell.alignment = Alignment(horizontal='center', vertical='center')
-
-
-def write_internal_approval_sheet(writer, df, sheet_name, title, period_text):
-    """输出可直接用于审批的财务表样式，并在末行补充合计。"""
-    workbook = writer.book
-    worksheet = workbook.add_worksheet(sheet_name)
-    writer.sheets[sheet_name] = worksheet
-
-    display_df = df.copy()
-    money_cols = [
-        col for col in display_df.columns
-        if pd.api.types.is_numeric_dtype(display_df[col])
-    ]
-    text_cols = set(display_df.columns) - set(money_cols)
-    if money_cols:
-        total_row = {col: '' for col in display_df.columns}
-        total_row['姓名'] = '合计'
-        for col in money_cols:
-            total_row[col] = pd.to_numeric(display_df[col], errors='coerce').fillna(0).sum()
-        display_df = pd.concat([display_df, pd.DataFrame([total_row])], ignore_index=True)
-
-    title_format = workbook.add_format({
-        'bold': True, 'font_size': 16, 'font_color': '#FFFFFF',
-        'bg_color': '#17365D', 'align': 'center', 'valign': 'vcenter',
-    })
-    subtitle_format = workbook.add_format({
-        'font_size': 10, 'font_color': '#404040', 'bg_color': '#D9EAF7',
-        'align': 'left', 'valign': 'vcenter',
-    })
-    header_format = workbook.add_format({
-        'bold': True, 'font_color': '#FFFFFF', 'bg_color': '#4472C4',
-        'border': 1, 'align': 'center', 'valign': 'vcenter',
-    })
-    text_format = workbook.add_format({
-        'border': 1, 'align': 'center', 'valign': 'vcenter',
-    })
-    money_format = workbook.add_format({
-        'border': 1, 'align': 'right', 'valign': 'vcenter',
-        'num_format': '#,##0.00;[Red]-#,##0.00',
-    })
-    alternate_format = workbook.add_format({'bg_color': '#F3F6FA'})
-    total_text_format = workbook.add_format({
-        'bold': True, 'bg_color': '#D9EAD3', 'border': 1,
-        'align': 'center', 'valign': 'vcenter',
-    })
-    total_money_format = workbook.add_format({
-        'bold': True, 'bg_color': '#D9EAD3', 'border': 1,
-        'align': 'right', 'valign': 'vcenter',
-        'num_format': '#,##0.00;[Red]-#,##0.00',
-    })
-
-    last_col = max(len(display_df.columns) - 1, 0)
-    worksheet.merge_range(0, 0, 0, last_col, title, title_format)
-    worksheet.merge_range(
-        1, 0, 1, last_col,
-        f"核算期间：{period_text}　｜　单位：元　｜　同一人员跨期按系统内部人员ID合并",
-        subtitle_format,
-    )
-    display_df.to_excel(writer, index=False, sheet_name=sheet_name, startrow=2)
-
-    for col_idx, col_name in enumerate(display_df.columns):
-        worksheet.write(2, col_idx, col_name, header_format)
-        values = [str(col_name), *display_df[col_name].fillna('').astype(str).tolist()]
-        width = min(max(max(map(len, values)) + 2, 10), 24)
-        if col_name == '财务归属':
-            width = max(width, 14)
-        worksheet.set_column(
-            col_idx, col_idx, width,
-            text_format if col_name in text_cols else money_format,
-        )
-
-    first_data_row = 3
-    last_data_row = first_data_row + len(display_df) - 1
-    if len(display_df) > 1:
-        worksheet.conditional_format(
-            first_data_row, 0, last_data_row - 1, last_col,
-            {'type': 'formula', 'criteria': '=MOD(ROW(),2)=0', 'format': alternate_format},
-        )
-    if not display_df.empty:
-        total_excel_row = last_data_row
-        for col_idx, col_name in enumerate(display_df.columns):
-            worksheet.write(
-                total_excel_row, col_idx, display_df.iloc[-1, col_idx],
-                total_text_format if col_name in text_cols else total_money_format,
-            )
-
-    worksheet.freeze_panes(3, min(3, len(display_df.columns)))
-    if not display_df.empty:
-        filter_last_row = last_data_row - 1 if money_cols else last_data_row
-        worksheet.autofilter(2, 0, filter_last_row, last_col)
-    worksheet.set_row(0, 28)
-    worksheet.set_row(1, 20)
-    worksheet.set_row(2, 24)
-    worksheet.set_landscape()
-    worksheet.fit_to_pages(1, 0)
-    worksheet.repeat_rows(0, 2)
-    worksheet.set_margins(left=0.25, right=0.25, top=0.5, bottom=0.5)
-    worksheet.set_footer('&L省公众人力资源部&C&P / &N&R生成日期：&D')
 
 
 # ==============================================================================
@@ -410,7 +325,7 @@ with tab1:
             st.session_state['temp_bills_signature'] = calculation_signature
 
     if 'temp_bills' in st.session_state:
-        raw_df_preview = st.session_state['temp_bills']
+        raw_df_preview = st.session_state['temp_bills'].reset_index(drop=True)
         export_df = raw_df_preview.copy()
 
         calculation_error_cols = [
@@ -474,49 +389,73 @@ with tab1:
         c_audit, c_save = st.columns(2)
 
         with c_audit:
-            # [极致修复 2] 彻底消灭群魔乱舞！在预览下载中，直接为你拆分出 5 张独立主体 Sheet！
+            # 按统一付款通道动态拆分，不在页面硬编码报表数量或人员类型。
             buffer_audit = io.BytesIO()
             with pd.ExcelWriter(buffer_audit, engine='openpyxl') as writer:
                 # 1. 写入全量总表
                 export_df.to_excel(writer, index=False, sheet_name='0.全量合并底稿')
                 format_excel_sheet(writer.sheets['0.全量合并底稿'], export_df.columns)
 
-                # 核算底稿是实际缴费/打款对账工具，只输出固定的五张付款清单。
-                # “财务归属”只决定费用记到哪里，不参与拆表；因此下沉人员会
-                # 和省公众普通员工出现在同一付款清单中，但仍显示各自地市归属。
-                split_configs = [
-                    {
-                        'name': '1.省公众(公积金)', 'route': '省公众',
-                        'items': ['公积金'],
-                    },
-                    {
-                        'name': '2.省公众(养老_失业_工伤)', 'route': '省公众',
-                        'items': ['养老', '失业', '工伤'],
-                    },
-                    {
-                        'name': '3.省公司代缴(年金)', 'route': '省公司',
-                        'items': ['年金'],
-                    },
-                    {
-                        'name': '4.省公司代缴(医疗_大病_生育_工伤)', 'route': '省公司',
-                        'items': ['医疗', '大病', '生育', '工伤'],
-                    },
-                    {
-                        'name': '5.中电数智(五险两金)', 'route': '中电数智',
-                        'items': ['养老', '医疗', '大病', '失业', '工伤', '生育', '公积金', '年金'],
-                    },
+                # 所有付款明细只认险种快照里的“付款导出=是”和付款通道。
+                # 下个月普通员工医保改为省公众后会自动形成省公众医疗通道，
+                # 不需要再修改这里或额外复制一套判断。
+                payment_items = [
+                    'pension', 'medical', 'medical_serious', 'unemp',
+                    'injury', 'maternity', 'fund', 'annuity',
                 ]
+                channel_items = {}
+                for item in payment_items:
+                    channel_col = f'__{item}_payment_channel_code'
+                    scope_col = f'__{item}_payment_export_included'
+                    if (
+                        channel_col not in raw_df_preview.columns
+                        or scope_col not in raw_df_preview.columns
+                    ):
+                        continue
+                    included = pd.to_numeric(
+                        raw_df_preview[scope_col], errors='coerce'
+                    ).fillna(0).astype(int) == 1
+                    for channel_code in (
+                        raw_df_preview.loc[included, channel_col]
+                        .dropna().astype(str).unique()
+                    ):
+                        if channel_code and channel_code != 'None':
+                            channel_items.setdefault(channel_code, set()).add(item)
+
+                split_configs = []
+                for channel_code, items in channel_items.items():
+                    definition = SOCIAL_PAYMENT_CHANNEL_DEFINITIONS.get(
+                        channel_code, {}
+                    )
+                    split_configs.append({
+                        'channel_code': channel_code,
+                        'name': definition.get('name', channel_code),
+                        'items': [
+                            item for item in payment_items if item in items
+                        ],
+                        'sort_order': definition.get('sort_order', 999),
+                    })
+                split_configs.sort(
+                    key=lambda config: (
+                        config['sort_order'], config['name']
+                    )
+                )
+                for index, config in enumerate(split_configs, start=1):
+                    config['sheet_name'] = f"{index}.{config['name']}"
 
                 # 2. 依次生成分表
                 for cfg in split_configs:
                     df_sub = export_df.copy()
                     # 动态筛选出该主体关注的列名
                     base_cols = []
-                    if any(item in cfg['items'] for item in ['养老', '医疗', '大病', '失业', '工伤', '生育']):
+                    if any(item in cfg['items'] for item in [
+                        'pension', 'medical', 'medical_serious',
+                        'unemp', 'injury', 'maternity',
+                    ]):
                         base_cols.append('社保执行基数')
-                    if '公积金' in cfg['items']:
+                    if 'fund' in cfg['items']:
                         base_cols.append('公积金执行基数')
-                    if '年金' in cfg['items']:
+                    if 'annuity' in cfg['items']:
                         base_cols.append('年金执行基数')
                     cols_to_keep = [
                         '工号', '姓名',
@@ -527,16 +466,28 @@ with tab1:
                     # 过滤逻辑：只有那些主体名字符合的，才保留金额；否则设为 0
                     has_money = pd.Series([False] * len(df_sub), index=df_sub.index)
                     for item in cfg['items']:
-                        if item == '大病':
-                            mask = df_sub['医疗缴纳主体'] == cfg['route']
+                        channel_col = f'__{item}_payment_channel_code'
+                        scope_col = f'__{item}_payment_export_included'
+                        mask = (
+                            raw_df_preview[channel_col].astype(str)
+                            == cfg['channel_code']
+                        ) & (
+                            pd.to_numeric(
+                                raw_df_preview[scope_col], errors='coerce'
+                            ).fillna(0).astype(int) == 1
+                        )
+                        if item == 'medical_serious':
                             df_sub.loc[~mask, '大病(个人)'] = 0.0
                             if '大病(个人)' in df_sub.columns: cols_to_keep.append('大病(个人)')
                             has_money = has_money | (df_sub['大病(个人)'] > 0)
                         else:
-                            route_col = f"{item}缴纳主体"
-                            mask = df_sub[route_col] == cfg['route']
-
-                            if item == '年金':
+                            chinese_item = {
+                                'pension': '养老', 'medical': '医疗',
+                                'unemp': '失业', 'injury': '工伤',
+                                'maternity': '生育', 'fund': '公积金',
+                                'annuity': '年金',
+                            }[item]
+                            if item == 'annuity':
                                 annuity_cols = [
                                     '年金(单位划入个人账户)', '年金(单位公共账户)',
                                     '年金(单位合计)', '年金(个人)',
@@ -554,8 +505,8 @@ with tab1:
                                         df_sub[amount_cols].fillna(0).abs().sum(axis=1) > 0
                                     )
                             else:
-                                c_col = f"{item}(企业)"
-                                p_col = f"{item}(个人)"
+                                c_col = f"{chinese_item}(企业)"
+                                p_col = f"{chinese_item}(个人)"
                                 if c_col in df_sub.columns:
                                     df_sub.loc[~mask, c_col] = 0.0
                                     cols_to_keep.append(c_col)
@@ -567,11 +518,17 @@ with tab1:
 
                     df_sub_clean = df_sub[has_money][cols_to_keep]
                     if not df_sub_clean.empty:
-                        df_sub_clean.to_excel(writer, index=False, sheet_name=cfg['name'])
-                        format_excel_sheet(writer.sheets[cfg['name']], df_sub_clean.columns)
+                        df_sub_clean.to_excel(
+                            writer, index=False,
+                            sheet_name=cfg['sheet_name'][:31],
+                        )
+                        format_excel_sheet(
+                            writer.sheets[cfg['sheet_name'][:31]],
+                            df_sub_clean.columns,
+                        )
 
             st.download_button(
-                label="📥 1. 下载当月核算底稿 (全自动排版，包含 5 大拆分 Sheet)",
+                label="📥 1. 下载当月核算底稿（按实际付款通道自动拆分）",
                 data=buffer_audit.getvalue(),
                 file_name=f"当期核算智能底稿_{calc_month}.xlsx",
                 type="secondary"
@@ -1049,8 +1006,125 @@ with tab5:
 # Tab 2: 财务输出中心 (对内账单与公对公 Word 结算函)
 # ------------------------------------------------------------------------------
 with tab2:
+    st.subheader("📤 OA 数据接口导出")
+    st.caption(
+        "读取已经固化的当月社保明细，生成与上月 OA 模板一致的 7 个文件。"
+        "挂靠代缴和下沉人员不进入 OA 接口；新人社保账号默认为0，但必须先补齐工号。"
+    )
+
+    oa_conn = _get_db_connection()
+    try:
+        oa_months = [
+            row[0] for row in oa_conn.execute(
+                "SELECT DISTINCT cost_month FROM social_monthly_items ORDER BY cost_month DESC"
+            ).fetchall()
+        ]
+    finally:
+        oa_conn.close()
+
+    if not oa_months:
+        st.info("尚无已固化的月度社保明细，完成“当月社保办理”后即可导出。")
+    else:
+        oa_month = st.selectbox(
+            "OA接口月份",
+            options=oa_months,
+            key="oa_social_export_month",
+        )
+        try:
+            oa_summary = get_oa_export_summary(oa_month)
+            oa_summary_df = pd.DataFrame(oa_summary['items']).rename(columns={
+                'display_name': '险种',
+                'row_count': '导出人数',
+                'company_total': '单位合计',
+                'personal_total': '个人合计',
+                'zero_account_count': '账号为0人数',
+            })
+            st.dataframe(
+                oa_summary_df[[
+                    '险种', '导出人数', '单位合计', '个人合计', '账号为0人数'
+                ]],
+                hide_index=True,
+                use_container_width=True,
+                column_config={
+                    '单位合计': st.column_config.NumberColumn(format="%.2f"),
+                    '个人合计': st.column_config.NumberColumn(format="%.2f"),
+                },
+            )
+            st.caption(
+                "已按统一口径排除"
+                f" {oa_summary['excluded_proxy_people']} 名挂靠代缴人员、"
+                f"{oa_summary.get('excluded_down_people', 0)} 名下沉人员。"
+                "无当月缴费、无补缴的险种不会为该人员生成空行。"
+            )
+            if oa_summary['missing_employee_numbers']:
+                st.error(
+                    "以下人员尚无工号，OA 无法匹配："
+                    + "、".join(oa_summary['missing_employee_numbers'])
+                    + "。请先到“人员档案”补齐工号；社保账号可以继续保留0。"
+                )
+
+            package_key = f"oa_social_export_package_{oa_month}"
+            if st.button(
+                "生成7个OA接口文件",
+                type="primary",
+                disabled=bool(oa_summary['missing_employee_numbers']),
+            ):
+                st.session_state[package_key] = build_oa_export_package(oa_month)
+
+            package = st.session_state.get(package_key)
+            if package:
+                st.download_button(
+                    "📦 一次下载全部7个文件",
+                    data=package['zip_content'],
+                    file_name=package['zip_file_name'],
+                    mime="application/zip",
+                    type="primary",
+                )
+                with st.expander("也可以逐个下载", expanded=False):
+                    download_columns = st.columns(2)
+                    for index, file_info in enumerate(package['files']):
+                        with download_columns[index % 2]:
+                            st.download_button(
+                                f"下载{file_info['display_name']}（{file_info['row_count']}人）",
+                                data=file_info['content'],
+                                file_name=file_info['file_name'],
+                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                key=f"oa_file_{oa_month}_{file_info['insurance_item']}",
+                                use_container_width=True,
+                            )
+        except OAExportValidationError as exc:
+            st.error(str(exc))
+
+        with st.expander("修改 OA 接口文件名", expanded=False):
+            st.caption("默认名称完全沿用你提供的上月文件；只有 OA 模板名称发生变化时才需要修改。")
+            oa_settings = get_oa_export_settings()
+            with st.form("oa_export_filename_form"):
+                edited_names = {}
+                for setting in oa_settings:
+                    edited_names[setting['insurance_item']] = st.text_input(
+                        setting['display_name'],
+                        value=setting['file_name'],
+                        key=f"oa_filename_{setting['insurance_item']}",
+                    )
+                if st.form_submit_button("保存7个文件名"):
+                    try:
+                        ok, message = update_oa_export_filenames(edited_names)
+                        if ok:
+                            for key in list(st.session_state):
+                                if key.startswith("oa_social_export_package_"):
+                                    st.session_state.pop(key, None)
+                            st.success(message)
+                            st.rerun()
+                    except OAExportValidationError as exc:
+                        st.error(str(exc))
+
+    st.divider()
     st.subheader("📤 第一部分：对内审批提款单 (跨期多表智能打包)")
-    st.info("💡 财务走账专用。严格按【缴费主体+险种】物理隔离出 5 个独立的 Excel。多月提取时自动生成【总览】与月度明细 Sheet。")
+    st.info(
+        "💡 财务走账专用。严格读取已经固化的“付款导出范围+付款通道”，"
+        "自动生成当前实际需要的 Excel；以后办理单位变化时无需改导出代码。"
+        "多月提取时自动生成【总览】与月度明细 Sheet。"
+    )
 
     conn = _get_db_connection()
     try:
@@ -1074,15 +1148,24 @@ with tab2:
 
         conn = _get_db_connection()
 
-        query = """
-            SELECT r.*, e.employee_no, e.name AS '姓名'
-            FROM ss_monthly_records r 
-            LEFT JOIN employees e ON r.emp_id = e.emp_id 
-            WHERE r.cost_month >= ? AND r.cost_month <= ?
-        """
-        raw_df = pd.read_sql_query(query, conn, params=[s_m, e_m])
+        raw_df = load_payment_export_rows(conn, s_m, e_m)
         if not raw_df.empty:
             raw_df['cost_center'] = raw_df['cost_center'].map(normalize_internal_cost_center)
+            approval_base_df = load_internal_approval_base_snapshots(
+                conn, s_m, e_m
+            )
+            if not approval_base_df.empty:
+                raw_df = raw_df.merge(
+                    approval_base_df,
+                    on=['cost_month', 'emp_id'],
+                    how='left',
+                )
+            for base_col in ['social_base', 'fund_base', 'annuity_base']:
+                if base_col not in raw_df.columns:
+                    raw_df[base_col] = 0.0
+                raw_df[base_col] = pd.to_numeric(
+                    raw_df[base_col], errors='coerce'
+                ).fillna(0.0)
 
         retro_query = """
             SELECT r.*, e.employee_no, e.name AS '姓名',
@@ -1098,6 +1181,28 @@ with tab2:
         retro_df = pd.read_sql_query(retro_query, conn, params=[s_m, e_m])
         if not retro_df.empty:
             retro_df['cost_center'] = retro_df['cost_center'].map(normalize_internal_cost_center)
+            retro_item_map = {
+                '养老保险': 'pension', '基本养老保险': 'pension',
+                '医疗保险': 'medical', '基本医疗保险': 'medical',
+                '大病医疗': 'medical', '失业保险': 'unemp',
+                '工伤保险': 'injury', '生育保险': 'maternity',
+                '住房公积金': 'fund', '企业年金': 'annuity',
+            }
+            keep_rows = []
+            for _, retro_row in retro_df.iterrows():
+                item_code = retro_item_map.get(
+                    str(retro_row.get('retro_type') or '').strip()
+                )
+                if not item_code:
+                    # 未识别的人工异常款保留在专项审批中，避免静默漏款。
+                    keep_rows.append(True)
+                    continue
+                route = resolve_social_route(
+                    str(retro_row['emp_id']), item_code,
+                    str(retro_row['process_month']), conn=conn,
+                )
+                keep_rows.append(social_export_included(route, 'payment'))
+            retro_df = retro_df[pd.Series(keep_rows, index=retro_df.index)]
         conn.close()
 
         if not raw_df.empty or not retro_df.empty:
@@ -1106,110 +1211,181 @@ with tab2:
 
                 rename_map = {
                     'employee_no': '工号', 'cost_center': '财务归属',
-                    'pension_comp': '养老(企业)', 'pension_pers': '养老(个人)',
-                    'medical_comp': '医疗(企业)', 'medical_pers': '医疗(个人)', 'medical_serious_pers': '大病(个人)',
-                    'unemp_comp': '失业(企业)', 'unemp_pers': '失业(个人)',
-                    'injury_comp': '工伤(企业)', 'maternity_comp': '生育(企业)',
-                    'fund_comp': '公积金(企业)', 'fund_pers': '公积金(个人)',
-                    'annuity_comp': '年金(单位合计)', 'annuity_pers': '年金(个人)'
+                    'business_type_snapshot': '人员类别',
+                    'social_base': '社保基数',
+                    'fund_base': '公积金基数',
+                    'annuity_base': '年金基数',
+                    'pension_comp': '养老企业', 'pension_pers': '养老个人',
+                    'medical_comp': '医疗企业', 'medical_pers': '医疗个人',
+                    'medical_serious_pers': '大病个人',
+                    'unemp_comp': '失业企业', 'unemp_pers': '失业个人',
+                    'injury_comp': '工伤', 'maternity_comp': '生育',
+                    'fund_comp': '公积金企业', 'fund_pers': '公积金个人',
+                    'annuity_comp': '年金企业', 'annuity_pers': '年金个人'
                 }
-
-                channel_configs = [
-                    {'name': '1.中电数智(五险两金综合)', 'route': '中电数智', 'items': ['pension', 'medical', 'unemp', 'injury', 'maternity', 'fund', 'annuity']},
-                    {'name': '2.省公司(年金)', 'route': '省公司', 'items': ['annuity']},
-                    {'name': '3.省公司(医疗_生育_工伤)', 'route': '省公司', 'items': ['medical', 'maternity', 'injury']},
-                    {'name': '4.省公众(公积金)', 'route': '省公众', 'items': ['fund']},
-                    {'name': '5.省公众(养老_失业_工伤)', 'route': '省公众', 'items': ['pension', 'unemp', 'injury']}
+                money_column_order = [
+                    'pension_comp', 'pension_pers',
+                    'medical_comp', 'medical_pers', 'medical_serious_pers',
+                    'unemp_comp', 'unemp_pers',
+                    'injury_comp', 'maternity_comp',
+                    'fund_comp', 'fund_pers',
+                    'annuity_comp', 'annuity_pers',
                 ]
-
-                all_insurance_items = ['pension', 'medical', 'unemp', 'injury', 'maternity', 'fund', 'annuity']
-
-                # 保留现有5个财务通道，同时自动发现主体切换后新增的“主体+险种”组合。
-                # 例如医疗、生育转到省公众后，会形成新增通道文件，不会被旧硬编码漏掉。
-                covered_pairs = {
-                    (cfg['route'], item)
-                    for cfg in channel_configs
-                    for item in cfg['items']
+                item_money_columns = {
+                    'pension': ['pension_comp', 'pension_pers'],
+                    'medical': [
+                        'medical_comp', 'medical_pers',
+                        'medical_serious_pers',
+                    ],
+                    'unemp': ['unemp_comp', 'unemp_pers'],
+                    'injury': ['injury_comp'],
+                    'maternity': ['maternity_comp'],
+                    'fund': ['fund_comp', 'fund_pers'],
+                    'annuity': ['annuity_comp', 'annuity_pers'],
                 }
-                extra_pairs = {}
-                if not raw_df.empty:
-                    for item in all_insurance_items:
-                        route_col = f'{item}_route'
-                        money_cols_for_item = [
-                            col for col in [f'{item}_comp', f'{item}_pers']
-                            if col in raw_df.columns
-                        ]
-                        if route_col not in raw_df.columns or not money_cols_for_item:
-                            continue
-                        positive_rows = raw_df[raw_df[money_cols_for_item].fillna(0).abs().sum(axis=1) > 0]
-                        for route_name in positive_rows[route_col].dropna().astype(str).unique():
-                            if route_name not in {'', '不参保', 'None'} and (route_name, item) not in covered_pairs:
-                                extra_pairs.setdefault(route_name, set()).add(item)
+                social_items = {
+                    'pension', 'medical', 'unemp', 'injury', 'maternity'
+                }
 
-                for route_name, items in sorted(extra_pairs.items()):
-                    channel_configs.append({
-                        'name': f"{len(channel_configs) + 1}.{route_name}(新增缴费通道)",
-                        'route': route_name,
-                        'items': sorted(items, key=all_insurance_items.index)
-                    })
+                def approval_money_columns(items, source_df):
+                    configured = {
+                        col
+                        for item in items
+                        for col in item_money_columns.get(item, [])
+                    }
+                    return [
+                        col for col in money_column_order
+                        if col in configured and col in source_df.columns
+                    ]
+
+                def approval_base_columns(items):
+                    item_set = set(items)
+                    base_cols = []
+                    if item_set & social_items:
+                        base_cols.append('social_base')
+                    if 'fund' in item_set:
+                        base_cols.append('fund_base')
+                    if 'annuity' in item_set and not base_cols:
+                        base_cols.append('annuity_base')
+                    return base_cols
+
+                def prepare_approval_export(source_df, active_money_cols, base_cols):
+                    summary = prepare_internal_approval_person_summary(
+                        source_df, active_money_cols, base_cols=base_cols
+                    ).rename(columns=rename_map)
+                    summary['人员类别'] = (
+                        summary['人员类别']
+                        .map(INTERNAL_APPROVAL_TYPE_LABELS)
+                        .fillna('特殊人员')
+                    )
+                    display_base_cols = [rename_map[col] for col in base_cols]
+                    display_money_cols = [
+                        rename_map[col] for col in active_money_cols
+                    ]
+                    display_columns = [
+                        '工号', '姓名', '人员类别', '财务归属',
+                        *display_base_cols, *display_money_cols,
+                    ]
+                    return (
+                        summary[display_columns],
+                        display_base_cols,
+                        display_money_cols,
+                    )
+
+                channel_configs = []
+                if not raw_df.empty:
+                    for channel_code in (
+                        raw_df['payment_channel_code']
+                        .dropna().astype(str).unique()
+                    ):
+                        definition = SOCIAL_PAYMENT_CHANNEL_DEFINITIONS.get(
+                            channel_code, {}
+                        )
+                        channel_df = raw_df[
+                            raw_df['payment_channel_code'] == channel_code
+                        ]
+                        items = []
+                        for item, columns in item_money_columns.items():
+                            if any(
+                                column in channel_df.columns
+                                and channel_df[column].fillna(0).abs().sum() > 0
+                                for column in columns
+                            ):
+                                items.append(item)
+                        channel_configs.append({
+                            'channel_code': channel_code,
+                            'name': definition.get('name', channel_code),
+                            'items': items,
+                            'sort_order': definition.get('sort_order', 999),
+                        })
+                channel_configs.sort(
+                    key=lambda config: (
+                        config['sort_order'], config['name']
+                    )
+                )
+                for index, config in enumerate(channel_configs, start=1):
+                    config['file_name'] = f"{index}.{config['name']}"
 
                 if not raw_df.empty:
                     for config in channel_configs:
-                        df_channel = raw_df.copy()
+                        df_channel = raw_df[
+                            raw_df['payment_channel_code']
+                            == config['channel_code']
+                        ].copy()
+                        display_channel_name = config['file_name']
 
-                        for it in all_insurance_items:
-                            if it not in config['items']:
-                                if f'{it}_comp' in df_channel.columns: df_channel[f'{it}_comp'] = 0.0
-                                if f'{it}_pers' in df_channel.columns: df_channel[f'{it}_pers'] = 0.0
-                                if it == 'medical' and 'medical_serious_pers' in df_channel.columns: df_channel['medical_serious_pers'] = 0.0
-                            else:
-                                mask = df_channel[f'{it}_route'] == config['route']
-                                if f'{it}_comp' in df_channel.columns: df_channel.loc[~mask, f'{it}_comp'] = 0.0
-                                if f'{it}_pers' in df_channel.columns: df_channel.loc[~mask, f'{it}_pers'] = 0.0
-                                if it == 'medical' and 'medical_serious_pers' in df_channel.columns: df_channel.loc[~mask, 'medical_serious_pers'] = 0.0
-
-                        money_cols = [c for c in df_channel.columns if c.endswith('_comp') or c.endswith('_pers')]
+                        money_cols = approval_money_columns(
+                            config['items'], df_channel
+                        )
                         df_channel['__row_sum__'] = df_channel[money_cols].sum(axis=1)
                         df_channel = df_channel[df_channel['__row_sum__'] > 0].drop(columns=['__row_sum__'])
 
                         if not df_channel.empty:
                             excel_io = io.BytesIO()
                             with pd.ExcelWriter(excel_io, engine='xlsxwriter') as writer:
-                                active_sum_cols = [
-                                    c for c in money_cols
-                                    if df_channel[c].fillna(0).abs().sum() > 0
-                                ]
+                                base_cols = approval_base_columns(config['items'])
+                                active_sum_cols = money_cols
 
                                 if active_sum_cols:
-                                    df_sum = prepare_internal_approval_person_summary(
-                                        df_channel, active_sum_cols
+                                    (
+                                        df_export,
+                                        display_base_cols,
+                                        display_money_cols,
+                                    ) = prepare_approval_export(
+                                        df_channel, active_sum_cols, base_cols
                                     )
-                                    df_export = df_sum.rename(columns=rename_map)
                                     write_internal_approval_sheet(
                                         writer, df_export, "总览",
-                                        f"{config['name']} 对内审批提款汇总",
+                                        f"{display_channel_name} 对内审批提款汇总",
                                         f"{s_m} 至 {e_m}",
+                                        money_columns=display_money_cols,
+                                        base_columns=display_base_cols,
                                     )
 
                                 for month in selected_months:
                                     df_month = df_channel[df_channel['cost_month'] == month]
                                     if not df_month.empty:
-                                        m_active_cols = [
-                                            c for c in money_cols
-                                            if df_month[c].fillna(0).abs().sum() > 0
-                                        ]
+                                        m_active_cols = money_cols
                                         if m_active_cols:
-                                            df_month_sum = prepare_internal_approval_person_summary(
-                                                df_month, m_active_cols
+                                            (
+                                                df_export,
+                                                display_base_cols,
+                                                display_money_cols,
+                                            ) = prepare_approval_export(
+                                                df_month, m_active_cols, base_cols
                                             )
-                                            df_export = df_month_sum.rename(columns=rename_map)
                                             write_internal_approval_sheet(
                                                 writer, df_export, month,
-                                                f"{config['name']} {month}明细",
+                                                f"{display_channel_name} {month}明细",
                                                 month,
+                                                money_columns=display_money_cols,
+                                                base_columns=display_base_cols,
                                             )
 
-                            zf.writestr(f"{config['name']}_{s_m}至{e_m}.xlsx", excel_io.getvalue())
+                            zf.writestr(
+                                f"{config['file_name']}_{s_m}至{e_m}.xlsx",
+                                excel_io.getvalue(),
+                            )
 
                 if not retro_df.empty:
                     retro_map = {
@@ -1226,9 +1402,17 @@ with tab2:
                         write_internal_approval_sheet(
                             writer, df_retro_export, "异常款项专项审批",
                             "异常款项专项审批明细", f"{s_m} 至 {e_m}",
+                            money_columns=[
+                                '企业本金', '个人本金', '滞纳金(异常支出)'
+                            ],
+                            base_columns=[],
                         )
 
-                    zf.writestr(f"6.异常款项专项审批_{s_m}至{e_m}.xlsx", excel_io.getvalue())
+                    retro_index = len(channel_configs) + 1
+                    zf.writestr(
+                        f"{retro_index}.异常款项专项审批_{s_m}至{e_m}.xlsx",
+                        excel_io.getvalue(),
+                    )
 
             # 将 ZIP 存入缓存记忆
             st.session_state['ss_zip_data'] = zip_buffer.getvalue()

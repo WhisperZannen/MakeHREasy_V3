@@ -39,6 +39,15 @@ def _normalize_rank_value(value):
         return text
 
 
+def _normalize_oa_account(value, fallback='0'):
+    """OA 接口账号按文本保存；空值统一为 0，避免 Excel 科学计数法。"""
+    text = _normalize_text(value)
+    if text:
+        return text
+    fallback_text = _normalize_text(fallback)
+    return fallback_text or '0'
+
+
 def _validate_payroll_start_month(profile_data, join_date=None):
     """校验首次发薪月份；空值兼容旧档案，有值必须为YYYY-MM且不得早于入职月。"""
     value = _normalize_text(profile_data.get('payroll_start_month'))
@@ -273,6 +282,13 @@ def add_employee(emp_data, profile_data, reason="新员工入职", change_date=N
         profile_data = _prepare_lifecycle(
             profile_data, emp_data.get('join_company_date'), change_date
         )
+        profile_data['oa_social_account_no'] = _normalize_oa_account(
+            profile_data.get('oa_social_account_no')
+        )
+        profile_data['oa_annuity_account_no'] = _normalize_oa_account(
+            profile_data.get('oa_annuity_account_no'),
+            profile_data['oa_social_account_no'],
+        )
         _validate_payroll_start_month(profile_data, emp_data.get('join_company_date'))
         cursor.execute("""
                        INSERT INTO employees (emp_id, person_id, employee_no, name, id_card, dept_id, post_rank, post_grade, status,
@@ -286,8 +302,9 @@ def add_employee(emp_data, profile_data, reason="新员工入职", change_date=N
                                                       school_name, major, graduation_date, first_job_date,
                                                       employment_stage, first_employment,
                                                       expected_regularization_date, actual_regularization_date,
-                                                      payroll_start_month)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                                      payroll_start_month, oa_social_account_no,
+                                                      oa_annuity_account_no)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                        """, (internal_emp_id, profile_data.get('pos_id'), profile_data.get('tech_grade'),
                              profile_data.get('title_order', 999), profile_data.get('education_level'),
                              profile_data.get('degree'), profile_data.get('school_name'), profile_data.get('major'),
@@ -296,7 +313,9 @@ def add_employee(emp_data, profile_data, reason="新员工入职", change_date=N
                              int(profile_data.get('first_employment', 0) or 0),
                              profile_data.get('expected_regularization_date'),
                              profile_data.get('actual_regularization_date'),
-                             profile_data.get('payroll_start_month')))
+                             profile_data.get('payroll_start_month'),
+                             profile_data.get('oa_social_account_no'),
+                             profile_data.get('oa_annuity_account_no')))
         cursor.execute("""
             INSERT OR IGNORE INTO ss_emp_matrix (
                 emp_id, cost_center,
@@ -340,7 +359,8 @@ def update_employee(emp_id, emp_data, profile_data, reason="档案更新", chang
                    e.join_company_date,
                    p.pos_id, p.tech_grade, p.employment_stage, p.first_employment,
                    p.expected_regularization_date, p.actual_regularization_date,
-                   p.payroll_start_month, pos.pos_name as old_pos_name,
+                   p.payroll_start_month, p.oa_social_account_no,
+                   p.oa_annuity_account_no, pos.pos_name as old_pos_name,
                    COALESCE(d.is_pending_pool, 0) AS old_is_pending_pool
             FROM employees e
             LEFT JOIN employee_profiles p ON e.emp_id = p.emp_id
@@ -355,7 +375,8 @@ def update_employee(emp_id, emp_data, profile_data, reason="档案更新", chang
             for field in (
                 'employment_stage', 'first_employment',
                 'expected_regularization_date', 'actual_regularization_date',
-                'payroll_start_month',
+                'payroll_start_month', 'oa_social_account_no',
+                'oa_annuity_account_no',
             ):
                 if field not in profile_data:
                     profile_data[field] = old_snapshot.get(field)
@@ -363,6 +384,13 @@ def update_employee(emp_id, emp_data, profile_data, reason="档案更新", chang
             profile_data = _prepare_lifecycle(
                 profile_data, emp_data.get('join_company_date'), actual_date,
                 was_intern=was_intern,
+            )
+            profile_data['oa_social_account_no'] = _normalize_oa_account(
+                profile_data.get('oa_social_account_no')
+            )
+            profile_data['oa_annuity_account_no'] = _normalize_oa_account(
+                profile_data.get('oa_annuity_account_no'),
+                profile_data['oa_social_account_no'],
             )
             _validate_payroll_start_month(profile_data, emp_data.get('join_company_date'))
             change_tags = build_personnel_change_tags(old_snapshot, emp_data, profile_data)
@@ -424,7 +452,8 @@ def update_employee(emp_id, emp_data, profile_data, reason="档案更新", chang
             SET pos_id=?, tech_grade=?, title_order=?, education_level=?, degree=?,
                 school_name=?, major=?, graduation_date=?, first_job_date=?,
                 employment_stage=?, first_employment=?, expected_regularization_date=?,
-                actual_regularization_date=?, payroll_start_month=?
+                actual_regularization_date=?, payroll_start_month=?,
+                oa_social_account_no=?, oa_annuity_account_no=?
             WHERE emp_id=?
         """, (
             profile_data.get('pos_id'), profile_data.get('tech_grade'),
@@ -435,7 +464,9 @@ def update_employee(emp_id, emp_data, profile_data, reason="档案更新", chang
             int(profile_data.get('first_employment', 0) or 0),
             profile_data.get('expected_regularization_date'),
             profile_data.get('actual_regularization_date'),
-            profile_data.get('payroll_start_month'), emp_id,
+            profile_data.get('payroll_start_month'),
+            profile_data.get('oa_social_account_no'),
+            profile_data.get('oa_annuity_account_no'), emp_id,
         ))
 
         saved_row = cursor.execute(
@@ -461,7 +492,8 @@ def get_all_employees(dept_id=None, include_resigned=False):
                 a.*, b.pos_id, b.tech_grade, b.education_level,
                 b.employment_stage, b.first_employment,
                 b.expected_regularization_date, b.actual_regularization_date,
-                b.payroll_start_month, c.dept_name, c.is_pending_pool, p.pos_name,
+                b.payroll_start_month, b.oa_social_account_no,
+                b.oa_annuity_account_no, c.dept_name, c.is_pending_pool, p.pos_name,
                 (SELECT h.change_date FROM personnel_changes h 
                  LEFT JOIN positions hp ON h.new_pos_id = hp.pos_id
                  WHERE h.emp_id = a.emp_id AND hp.pos_name = '实习岗'

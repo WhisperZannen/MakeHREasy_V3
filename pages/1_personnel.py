@@ -509,10 +509,16 @@ elif current_page == "👥 人员档案":
                 'employee_no': '工号/编号', 'name': '姓名', 'id_card': '身份证号', 'dept_name': '部门', 'pos_name': '岗位',
                 'post_rank': '岗级', 'post_grade': '档次', 'tech_grade': 'T级', 'join_company_date': '入职日期',
                 'status': '状态', 'education_level': '学历', 'degree': '学位', 'school_name': '毕业院校',
-                'major': '专业', 'graduation_date': '毕业日期', 'first_job_date': '参加工作日期'
+                'major': '专业', 'graduation_date': '毕业日期', 'first_job_date': '参加工作日期',
+                'oa_social_account_no': 'OA五险社保账号',
+                'oa_annuity_account_no': 'OA年金账号',
             })
 
-            eo = ['工号/编号', '姓名', '部门', '岗位', '岗级', '档次', 'T级', '状态', '入职日期', '参加工作日期', '身份证号', '学历', '学位', '毕业院校', '专业', '毕业日期']
+            eo = [
+                '工号/编号', '姓名', '部门', '岗位', '岗级', '档次', 'T级', '状态',
+                '入职日期', '参加工作日期', '身份证号', '学历', '学位', '毕业院校',
+                '专业', '毕业日期', 'OA五险社保账号', 'OA年金账号',
+            ]
             out_df = out_df[[c for c in eo if c in out_df.columns]]
 
             ob = io.BytesIO()
@@ -567,7 +573,12 @@ elif current_page == "👥 人员档案":
         st.info("💡 若状态填为【离职/退休】，部门岗位可留空，系统将自动编入【离退休公共池】；若状态为【挂靠人员】，工号可填入社保编号。")
         t1, t2 = st.columns(2)
         with t1:
-            icols = ['工号', '姓名', '状态', '所属部门', '岗位', '技术等级(T级)', '身份证号', '岗级', '档次', '入职日期', '首次发薪月份', '参加工作日期', '首次就业(是/否)', '学历', '学位', '毕业院校', '专业', '毕业日期']
+            icols = [
+                '工号', '姓名', '状态', '所属部门', '岗位', '技术等级(T级)',
+                '身份证号', '岗级', '档次', '入职日期', '首次发薪月份',
+                '参加工作日期', '首次就业(是/否)', '学历', '学位', '毕业院校',
+                '专业', '毕业日期', 'OA五险社保账号', 'OA年金账号',
+            ]
             tmp = pd.DataFrame(columns=icols); tout = io.BytesIO()
             with pd.ExcelWriter(tout) as w: tmp.to_excel(w, index=False)
             st.download_button("下载人员模板", data=tout.getvalue(), file_name="人员导入模板.xlsx")
@@ -636,6 +647,12 @@ elif current_page == "👥 人员档案":
                             else clean_date(row.get('入职日期'))[:7] if clean_date(row.get('入职日期')) else None
                         ),
                     }
+                    social_account = clean_str(row.get('OA五险社保账号'))
+                    annuity_account = clean_str(row.get('OA年金账号'))
+                    if social_account:
+                        pd_info['oa_social_account_no'] = social_account
+                    if annuity_account:
+                        pd_info['oa_annuity_account_no'] = annuity_account
 
                     if internal_id:
                         ok, msg = update_employee(internal_id, ed, pd_info, reason="Excel批量覆盖更新")
@@ -800,6 +817,39 @@ elif current_page == "👥 人员档案":
                         "到期只提醒，不会自动转正；将岗位改为正式岗位并保存后，才记录实际转正。"
                     )
 
+            st.write("**--- OA 社保数据接口账号 ---**")
+            oa1, oa2 = st.columns(2)
+            current_oa_social = (
+                clean_str(t_emp_sel.get('oa_social_account_no'))
+                if t_emp_sel is not None else '0'
+            ) or '0'
+            current_oa_annuity = (
+                clean_str(t_emp_sel.get('oa_annuity_account_no'))
+                if t_emp_sel is not None else current_oa_social
+            ) or current_oa_social
+            with oa1:
+                f_oa_social_account = st.text_input(
+                    "OA五险社保账号",
+                    value=current_oa_social,
+                    help="养老、医疗、失业、工伤、生育接口共用；新员工没有历史账号时填0。",
+                )
+            with oa2:
+                same_oa_account = st.checkbox(
+                    "年金账号与五险相同",
+                    value=current_oa_annuity == current_oa_social,
+                    help="绝大多数人员相同；确有不同的人员取消勾选后单独填写。",
+                )
+                f_oa_annuity_account = st.text_input(
+                    "OA年金账号",
+                    value=(
+                        f_oa_social_account
+                        if same_oa_account else current_oa_annuity
+                    ),
+                    disabled=same_oa_account,
+                )
+                if same_oa_account:
+                    f_oa_annuity_account = f_oa_social_account
+
             st.write("**--- 状态与快照控制 ---**")
             cs1, cs2, cs3 = st.columns(3)
             with cs1:
@@ -838,6 +888,8 @@ elif current_page == "👥 人员档案":
                             if t_emp_sel is not None else None
                         ),
                         'payroll_start_month': f_payroll_start_month.strip(),
+                        'oa_social_account_no': f_oa_social_account.strip() or '0',
+                        'oa_annuity_account_no': f_oa_annuity_account.strip() or '0',
                     }
                     ad_str = fcd.strftime('%Y-%m-%d %H:%M:%S')
                     if t_emp_sel is not None: ok, msg = update_employee(str(t_emp_sel['emp_id']), ed, pd_i, reason=frsn, change_date=ad_str)
@@ -1193,8 +1245,9 @@ elif current_page == "🧭 特殊人员与待遇":
         )
         if rule_type == 'down_secondment':
             st.caption(
-                "省公司文件默认：养老、年金由省公司集中办理；失业、工伤由下沉地市办理；"
-                "医疗、生育、公积金由省公众办理。全部费用由下沉地市承担。"
+                "当前下沉口径：仅住房公积金由省公众缴纳并在年底与地市结算；"
+                "养老、医疗、大病、生育、工伤、年金由省公司办理，失业由地市办理，"
+                "均不进入省公众付款清单；下沉人员全部退出社保 OA 数据接口。"
             )
         else:
             st.caption(
@@ -1209,6 +1262,7 @@ elif current_page == "🧭 特殊人员与待遇":
             st.dataframe(
                 default_rule_df[[
                     '项目', '默认办理', '办理单位', '成本归属',
+                    '本系统金额', '付款清单', 'OA接口',
                     '系统处理', '生效月份', '说明',
                 ]],
                 use_container_width=True,

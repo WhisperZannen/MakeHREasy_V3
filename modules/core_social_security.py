@@ -14,7 +14,10 @@ import re
 from datetime import date
 from decimal import Decimal, ROUND_HALF_UP
 
-from modules.core_arrangements import resolve_social_route
+from modules.core_arrangements import (
+    resolve_social_route,
+    social_export_included,
+)
 from modules.core_identity import resolve_employee_reference, resolve_internal_emp_id
 
 # ------------------------------------------------------------------------------
@@ -37,34 +40,69 @@ def normalize_internal_cost_center(value):
     return text or '省公众'
 
 
-def prepare_internal_approval_person_summary(df, money_cols):
+INTERNAL_APPROVAL_TYPE_LABELS = {
+    'normal': '本单位员工',
+    'city_transfer': '地市转入',
+    'down_secondment': '下沉人员',
+    'proxy_social': '挂靠代缴',
+}
+
+INTERNAL_APPROVAL_TYPE_ORDER = {
+    'normal': 0,
+    'city_transfer': 1,
+    'down_secondment': 2,
+    'proxy_social': 3,
+}
+
+
+def prepare_internal_approval_person_summary(df, money_cols, base_cols=None):
     """
     生成对内审批提款单的人员级汇总。
 
     人员身份只按系统内部 emp_id 识别；工号、姓名和财务归属取所选期间
-    最后一个月的有效显示值。这样既能汇总跨月金额，也不会因为“本级”
-    改称“省公众”或后续工号变更而把同一人拆成两行。
+    最后一个月的有效显示值。缴费基数同样取所选期间最后一个月，而不是
+    跨月相加。这样既能汇总跨月金额，也不会因为“本级”改称“省公众”
+    或后续工号变更而把同一人拆成两行。
+
+    排序固定为：本单位员工 -> 地市转入 -> 下沉人员 -> 挂靠代缴。
     """
+    base_cols = [
+        col for col in (base_cols or [])
+        if isinstance(col, str) and col
+    ]
     if df is None or df.empty:
-        return pd.DataFrame(columns=['employee_no', '姓名', 'cost_center', *money_cols])
+        return pd.DataFrame(columns=[
+            'employee_no', '姓名', 'cost_center', 'business_type_snapshot',
+            *base_cols, *money_cols,
+        ])
 
     work = df.copy()
     if 'emp_id' not in work.columns:
         raise ValueError('对内审批提款单缺少内部人员ID，无法可靠进行跨期汇总')
 
     active_money_cols = [col for col in money_cols if col in work.columns]
+    active_base_cols = [col for col in base_cols if col in work.columns]
     work['cost_center'] = work.get(
         'cost_center', pd.Series(index=work.index, dtype='object')
     ).map(normalize_internal_cost_center)
+    work['business_type_snapshot'] = work.get(
+        'business_type_snapshot', pd.Series('normal', index=work.index)
+    ).fillna('normal').astype(str)
+    for col in active_base_cols:
+        work[col] = pd.to_numeric(work[col], errors='coerce').fillna(0.0)
     work['__person_key__'] = work['emp_id'].astype(str)
     work['__month_sort__'] = work.get(
         'cost_month', pd.Series('', index=work.index)
     ).fillna('').astype(str)
 
+    latest_columns = [
+        '__person_key__', 'employee_no', '姓名', 'cost_center',
+        'business_type_snapshot', *active_base_cols,
+    ]
     latest_meta = (
         work.sort_values(['__person_key__', '__month_sort__'])
         .drop_duplicates('__person_key__', keep='last')
-        [['__person_key__', 'employee_no', '姓名', 'cost_center']]
+        [latest_columns]
     )
     amount_summary = (
         work.groupby('__person_key__', as_index=False, dropna=False)[active_money_cols]
@@ -73,11 +111,449 @@ def prepare_internal_approval_person_summary(df, money_cols):
     result = latest_meta.merge(amount_summary, on='__person_key__', how='inner')
     result['employee_no'] = result['employee_no'].fillna('').astype(str)
     result['姓名'] = result['姓名'].fillna('').astype(str)
+    result['__type_order__'] = (
+        result['business_type_snapshot']
+        .map(INTERNAL_APPROVAL_TYPE_ORDER)
+        .fillna(2)
+    )
     result = result.sort_values(
-        ['cost_center', '姓名', 'employee_no', '__person_key__'],
+        ['__type_order__', '姓名', 'employee_no', '__person_key__'],
         kind='stable',
     )
-    return result[['employee_no', '姓名', 'cost_center', *active_money_cols]].reset_index(drop=True)
+    return result[[
+        'employee_no', '姓名', 'cost_center', 'business_type_snapshot',
+        *active_base_cols, *active_money_cols,
+    ]].reset_index(drop=True)
+
+
+def load_internal_approval_base_snapshots(conn, start_month, end_month):
+    """
+    读取审批表所需的月度执行基数。
+
+    旧月份的 social_monthly_items.base_amount 可能保存的是封顶前原始基数，
+    所以优先使用实际缴费额 / 当月生效比例反推执行基数；无金额时才回退
+    到原字段。每人每月每类基数只保留一列。
+    """
+    return pd.read_sql_query("""
+        WITH item_base AS (
+            SELECT i.cost_month, i.emp_id, i.insurance_item,
+                   CASE i.insurance_item
+                       WHEN 'pension' THEN COALESCE(
+                           NULLIF(i.company_amount, 0) /
+                               NULLIF(p.pension_comp_rate, 0),
+                           NULLIF(i.personal_amount, 0) /
+                               NULLIF(p.pension_pers_rate, 0),
+                           i.base_amount, 0
+                       )
+                       WHEN 'medical' THEN COALESCE(
+                           NULLIF(i.company_amount, 0) /
+                               NULLIF(p.medical_comp_rate, 0),
+                           NULLIF(i.personal_amount, 0) /
+                               NULLIF(p.medical_pers_rate, 0),
+                           i.base_amount, 0
+                       )
+                       WHEN 'unemp' THEN COALESCE(
+                           NULLIF(i.company_amount, 0) /
+                               NULLIF(p.unemp_comp_rate, 0),
+                           NULLIF(i.personal_amount, 0) /
+                               NULLIF(p.unemp_pers_rate, 0),
+                           i.base_amount, 0
+                       )
+                       WHEN 'injury' THEN COALESCE(
+                           NULLIF(i.company_amount, 0) /
+                               NULLIF(p.injury_comp_rate, 0),
+                           i.base_amount, 0
+                       )
+                       WHEN 'maternity' THEN COALESCE(
+                           NULLIF(i.company_amount, 0) /
+                               NULLIF(p.maternity_comp_rate, 0),
+                           i.base_amount, 0
+                       )
+                       WHEN 'fund' THEN COALESCE(
+                           NULLIF(i.company_amount, 0) /
+                               NULLIF(p.fund_comp_rate, 0),
+                           NULLIF(i.personal_amount, 0) /
+                               NULLIF(p.fund_pers_rate, 0),
+                           i.base_amount, 0
+                       )
+                       WHEN 'annuity' THEN COALESCE(
+                           NULLIF(i.company_amount, 0) /
+                               NULLIF(p.annuity_comp_rate, 0),
+                           NULLIF(i.personal_amount, 0) /
+                               NULLIF(p.annuity_pers_rate, 0),
+                           i.base_amount, 0
+                       )
+                       ELSE COALESCE(i.base_amount, 0)
+                   END AS execution_base
+            FROM social_monthly_items i
+            LEFT JOIN ss_policy_versions p
+              ON p.manage_entity=COALESCE(i.calculation_policy_entity, '省公众')
+             AND p.effective_from_month=(
+                 SELECT MAX(p2.effective_from_month)
+                 FROM ss_policy_versions p2
+                 WHERE p2.manage_entity=COALESCE(
+                           i.calculation_policy_entity, '省公众'
+                       )
+                   AND p2.effective_from_month<=i.cost_month
+             )
+            WHERE i.cost_month >= ? AND i.cost_month <= ?
+        )
+        SELECT cost_month, emp_id,
+               COALESCE(
+                   MAX(CASE WHEN insurance_item='pension'
+                            AND execution_base > 0 THEN execution_base END),
+                   MAX(CASE WHEN insurance_item='medical'
+                            AND execution_base > 0 THEN execution_base END),
+                   MAX(CASE WHEN insurance_item='unemp'
+                            AND execution_base > 0 THEN execution_base END),
+                   MAX(CASE WHEN insurance_item='injury'
+                            AND execution_base > 0 THEN execution_base END),
+                   MAX(CASE WHEN insurance_item='maternity'
+                            AND execution_base > 0 THEN execution_base END),
+                   0
+               ) AS social_base,
+               COALESCE(
+                   MAX(CASE WHEN insurance_item='fund'
+                            AND execution_base > 0 THEN execution_base END),
+                   0
+               ) AS fund_base,
+               COALESCE(
+                   MAX(CASE WHEN insurance_item='annuity'
+                            AND execution_base > 0 THEN execution_base END),
+                   0
+               ) AS annuity_base
+        FROM item_base
+        GROUP BY cost_month, emp_id
+    """, conn, params=[start_month, end_month])
+
+
+PAYMENT_EXPORT_MONEY_COLUMNS = [
+    'pension_comp', 'pension_pers',
+    'medical_comp', 'medical_pers', 'medical_serious_pers',
+    'unemp_comp', 'unemp_pers', 'injury_comp', 'maternity_comp',
+    'fund_comp', 'fund_pers', 'annuity_comp', 'annuity_pers',
+]
+
+
+def load_payment_export_rows(conn, start_month, end_month):
+    """
+    读取统一的本单位付款导出数据源。
+
+    月度底稿、对内审批及以后新增的付款类报表必须使用险种快照中的
+    payment_export_included 和 payment_channel_code，不能再自行根据
+    人员类型、办理单位或金额猜测。
+    """
+    item_rows = pd.read_sql_query("""
+        SELECT i.cost_month, i.emp_id, e.employee_no, e.name AS 姓名,
+               COALESCE(cost_entity.entity_name, r.cost_center, '省公众')
+                   AS cost_center,
+               i.business_type_snapshot, i.insurance_item,
+               i.company_amount, i.personal_amount,
+               i.amount_source, i.settlement_mode,
+               i.payment_export_included, i.oa_export_included,
+               i.payment_channel_code
+        FROM social_monthly_items i
+        JOIN employees e ON e.emp_id = i.emp_id
+        LEFT JOIN ss_monthly_records r
+          ON r.record_id = i.monthly_record_id
+        LEFT JOIN business_entities cost_entity
+          ON cost_entity.entity_code = i.cost_bearer_code
+        WHERE i.cost_month >= ? AND i.cost_month <= ?
+        ORDER BY i.cost_month, i.emp_id, i.insurance_item
+    """, conn, params=[start_month, end_month])
+    if item_rows.empty:
+        return pd.DataFrame(columns=[
+            'cost_month', 'emp_id', 'employee_no', '姓名', 'cost_center',
+            'business_type_snapshot', 'payment_channel_code',
+            *PAYMENT_EXPORT_MONEY_COLUMNS,
+        ])
+
+    item_rows = item_rows[
+        item_rows.apply(
+            lambda row: social_export_included(row.to_dict(), 'payment'),
+            axis=1,
+        )
+    ].copy()
+    item_rows = item_rows[
+        item_rows[['company_amount', 'personal_amount']]
+        .fillna(0).abs().sum(axis=1) > 0
+    ]
+    if item_rows.empty:
+        return pd.DataFrame(columns=[
+            'cost_month', 'emp_id', 'employee_no', '姓名', 'cost_center',
+            'business_type_snapshot', 'payment_channel_code',
+            *PAYMENT_EXPORT_MONEY_COLUMNS,
+        ])
+
+    records = {}
+    for row in item_rows.to_dict('records'):
+        channel = str(row.get('payment_channel_code') or '').strip()
+        if not channel:
+            continue
+        key = (row['cost_month'], str(row['emp_id']), channel)
+        target = records.setdefault(key, {
+            'cost_month': row['cost_month'],
+            'emp_id': str(row['emp_id']),
+            'employee_no': row.get('employee_no'),
+            '姓名': row.get('姓名'),
+            'cost_center': normalize_internal_cost_center(
+                row.get('cost_center')
+            ),
+            'business_type_snapshot': (
+                row.get('business_type_snapshot') or 'normal'
+            ),
+            'payment_channel_code': channel,
+            **{column: 0.0 for column in PAYMENT_EXPORT_MONEY_COLUMNS},
+        })
+        item = str(row.get('insurance_item') or '')
+        if item == 'medical_serious':
+            target['medical_serious_pers'] += safe_float(
+                row.get('personal_amount')
+            )
+            continue
+        company_col = f'{item}_comp'
+        personal_col = f'{item}_pers'
+        if company_col in target:
+            target[company_col] += safe_float(row.get('company_amount'))
+        if personal_col in target:
+            target[personal_col] += safe_float(row.get('personal_amount'))
+
+    if not records:
+        return pd.DataFrame(columns=[
+            'cost_month', 'emp_id', 'employee_no', '姓名', 'cost_center',
+            'business_type_snapshot', 'payment_channel_code',
+            *PAYMENT_EXPORT_MONEY_COLUMNS,
+        ])
+    return pd.DataFrame(records.values()).sort_values(
+        ['cost_month', 'payment_channel_code', 'emp_id'],
+        kind='stable',
+    ).reset_index(drop=True)
+
+
+def _excel_column_name(index):
+    """0-based Excel列号转字母，避免页面层依赖额外工具函数。"""
+    result = ''
+    value = int(index) + 1
+    while value:
+        value, remainder = divmod(value - 1, 26)
+        result = chr(65 + remainder) + result
+    return result
+
+
+def write_internal_approval_sheet(
+    writer, df, sheet_name, title, period_text, money_columns, base_columns=None
+):
+    """输出正式展示版对内审批表：分组排序、小计、合计和清晰表头。"""
+    base_columns = [col for col in (base_columns or []) if col in df.columns]
+    money_columns = [col for col in money_columns if col in df.columns]
+    workbook = writer.book
+    worksheet = workbook.add_worksheet(sheet_name)
+    writer.sheets[sheet_name] = worksheet
+
+    details = df.copy()
+    if '人员类别' not in details.columns:
+        details['人员类别'] = '本单位员工'
+    details.insert(0, '序号', range(1, len(details) + 1))
+
+    group_specs = [
+        ('本单位及特殊人员小计', details['人员类别'] != '挂靠代缴', 'unit_subtotal'),
+        ('挂靠代缴小计', details['人员类别'] == '挂靠代缴', 'proxy_subtotal'),
+    ]
+    output_rows = []
+    row_kinds = []
+    subtotal_meta = []
+    for label, mask, subtotal_kind in group_specs:
+        group = details.loc[mask]
+        if group.empty:
+            continue
+        group_start = len(output_rows)
+        for _, row in group.iterrows():
+            output_rows.append(row.to_dict())
+            row_kinds.append('detail')
+        group_end = len(output_rows) - 1
+        subtotal = {col: '' for col in details.columns}
+        subtotal['姓名'] = label
+        for col in money_columns:
+            subtotal[col] = pd.to_numeric(group[col], errors='coerce').fillna(0).sum()
+        subtotal_index = len(output_rows)
+        output_rows.append(subtotal)
+        row_kinds.append(subtotal_kind)
+        subtotal_meta.append((subtotal_index, group_start, group_end))
+
+    grand_total = {col: '' for col in details.columns}
+    grand_total['姓名'] = '合计'
+    for col in money_columns:
+        grand_total[col] = pd.to_numeric(details[col], errors='coerce').fillna(0).sum()
+    grand_total_index = len(output_rows)
+    output_rows.append(grand_total)
+    row_kinds.append('grand_total')
+    display_df = pd.DataFrame(output_rows, columns=details.columns)
+
+    title_format = workbook.add_format({
+        'bold': True, 'font_size': 16, 'font_color': '#FFFFFF',
+        'bg_color': '#17365D', 'align': 'center', 'valign': 'vcenter',
+    })
+    subtitle_format = workbook.add_format({
+        'font_size': 10, 'font_color': '#404040', 'bg_color': '#D9EAF7',
+        'align': 'left', 'valign': 'vcenter',
+    })
+    header_format = workbook.add_format({
+        'bold': True, 'font_color': '#FFFFFF', 'bg_color': '#4472C4',
+        'border': 1, 'align': 'center', 'valign': 'vcenter',
+        'text_wrap': True,
+    })
+    text_format = workbook.add_format({
+        'border': 1, 'align': 'center', 'valign': 'vcenter',
+    })
+    number_format = workbook.add_format({
+        'border': 1, 'align': 'right', 'valign': 'vcenter',
+        'num_format': '#,##0.00;[Red]-#,##0.00',
+    })
+    sequence_format = workbook.add_format({
+        'border': 1, 'align': 'center', 'valign': 'vcenter',
+        'num_format': '0',
+    })
+    alternate_format = workbook.add_format({'bg_color': '#F3F6FA'})
+    unit_text_format = workbook.add_format({
+        'bold': True, 'bg_color': '#D9EAF7', 'border': 1,
+        'align': 'center', 'valign': 'vcenter',
+    })
+    unit_money_format = workbook.add_format({
+        'bold': True, 'bg_color': '#D9EAF7', 'border': 1,
+        'align': 'right', 'valign': 'vcenter',
+        'num_format': '#,##0.00;[Red]-#,##0.00',
+    })
+    proxy_text_format = workbook.add_format({
+        'bold': True, 'bg_color': '#FCE4D6', 'border': 1,
+        'align': 'center', 'valign': 'vcenter',
+    })
+    proxy_money_format = workbook.add_format({
+        'bold': True, 'bg_color': '#FCE4D6', 'border': 1,
+        'align': 'right', 'valign': 'vcenter',
+        'num_format': '#,##0.00;[Red]-#,##0.00',
+    })
+    total_text_format = workbook.add_format({
+        'bold': True, 'font_color': '#FFFFFF', 'bg_color': '#548235',
+        'border': 1, 'align': 'center', 'valign': 'vcenter',
+    })
+    total_money_format = workbook.add_format({
+        'bold': True, 'font_color': '#FFFFFF', 'bg_color': '#548235',
+        'border': 1, 'align': 'right', 'valign': 'vcenter',
+        'num_format': '#,##0.00;[Red]-#,##0.00',
+    })
+
+    last_col = max(len(display_df.columns) - 1, 0)
+    worksheet.merge_range(0, 0, 0, last_col, title, title_format)
+    amount_scope_text = (
+        '金额跨期累计，基数取所选期间最后一个月'
+        if '至' in str(period_text)
+        else '金额与基数均为本月口径'
+    )
+    worksheet.merge_range(
+        1, 0, 1, last_col,
+        f"核算期间：{period_text}　｜　单位：元　｜　{amount_scope_text}",
+        subtitle_format,
+    )
+    display_df.to_excel(writer, index=False, sheet_name=sheet_name, startrow=2)
+
+    text_columns = {
+        '工号', '姓名', '人员类别', '财务归属',
+    }
+    for col_idx, col_name in enumerate(display_df.columns):
+        worksheet.write(2, col_idx, col_name, header_format)
+        if col_name == '序号':
+            width = 7
+            default_format = sequence_format
+        elif col_name == '姓名':
+            width = 12
+            default_format = text_format
+        elif col_name == '工号':
+            width = 14
+            default_format = text_format
+        elif col_name in {'人员类别', '财务归属'}:
+            width = 16
+            default_format = text_format
+        elif col_name in base_columns:
+            width = 14
+            default_format = number_format
+        elif col_name in money_columns:
+            width = 13
+            default_format = number_format
+        else:
+            values = [str(col_name), *display_df[col_name].fillna('').astype(str).tolist()]
+            width = min(max(max(map(len, values)) + 2, 10), 22)
+            default_format = text_format if col_name in text_columns else number_format
+        worksheet.set_column(col_idx, col_idx, width, default_format)
+
+    first_data_row = 3
+    last_data_row = first_data_row + len(display_df) - 1
+    detail_rows = [
+        first_data_row + index
+        for index, kind in enumerate(row_kinds)
+        if kind == 'detail'
+    ]
+    for row in detail_rows:
+        worksheet.conditional_format(
+            row, 0, row, last_col,
+            {'type': 'formula', 'criteria': '=MOD(ROW(),2)=0', 'format': alternate_format},
+        )
+
+    summary_formats = {
+        'unit_subtotal': (unit_text_format, unit_money_format),
+        'proxy_subtotal': (proxy_text_format, proxy_money_format),
+        'grand_total': (total_text_format, total_money_format),
+    }
+    for index, kind in enumerate(row_kinds):
+        if kind == 'detail':
+            continue
+        excel_row = first_data_row + index
+        text_cell_format, money_cell_format = summary_formats[kind]
+        for col_idx, col_name in enumerate(display_df.columns):
+            cell_format = money_cell_format if col_name in money_columns else text_cell_format
+            worksheet.write(excel_row, col_idx, display_df.iloc[index, col_idx], cell_format)
+
+    for subtotal_index, group_start, group_end in subtotal_meta:
+        excel_row = first_data_row + subtotal_index
+        first_excel_detail = first_data_row + group_start + 1
+        last_excel_detail = first_data_row + group_end + 1
+        for col_name in money_columns:
+            col_idx = display_df.columns.get_loc(col_name)
+            letter = _excel_column_name(col_idx)
+            cached_value = float(display_df.iloc[subtotal_index][col_name] or 0)
+            worksheet.write_formula(
+                excel_row, col_idx,
+                f'=SUM({letter}{first_excel_detail}:{letter}{last_excel_detail})',
+                unit_money_format if row_kinds[subtotal_index] == 'unit_subtotal'
+                else proxy_money_format,
+                cached_value,
+            )
+
+    grand_excel_row = first_data_row + grand_total_index
+    subtotal_excel_rows = [
+        first_data_row + subtotal_index + 1
+        for subtotal_index, _, _ in subtotal_meta
+    ]
+    for col_name in money_columns:
+        col_idx = display_df.columns.get_loc(col_name)
+        letter = _excel_column_name(col_idx)
+        cached_value = float(display_df.iloc[grand_total_index][col_name] or 0)
+        formula = '=' + '+'.join(f'{letter}{row}' for row in subtotal_excel_rows)
+        worksheet.write_formula(
+            grand_excel_row, col_idx, formula, total_money_format, cached_value
+        )
+
+    worksheet.freeze_panes(3, min(5, len(display_df.columns)))
+    worksheet.autofilter(2, 0, last_data_row, last_col)
+    worksheet.hide_gridlines(2)
+    worksheet.set_zoom(90)
+    worksheet.set_row(0, 30)
+    worksheet.set_row(1, 21)
+    worksheet.set_row(2, 30)
+    worksheet.set_landscape()
+    worksheet.fit_to_pages(1, 0)
+    worksheet.repeat_rows(0, 2)
+    worksheet.set_margins(left=0.25, right=0.25, top=0.5, bottom=0.5)
+    worksheet.set_footer('&L省公众人力资源部&C&P / &N&R生成日期：&D')
 
 
 # ------------------------------------------------------------------------------
@@ -548,6 +1024,7 @@ def calculate_complete_bill(emp_row: dict, target_year: str, target_month: str =
             'payer_entity_code', 'cost_bearer_code',
             'settlement_counterparty_code', 'settlement_mode',
             'settlement_cycle', 'amount_source', 'payment_channel_code',
+            'payment_export_included', 'oa_export_included',
             'route_policy_id', 'override_id'
         ]:
             res[f'__{item}_{key}'] = context.get(key)
@@ -640,6 +1117,7 @@ def calculate_complete_bill(emp_row: dict, target_year: str, target_month: str =
                 'payer_entity_code', 'cost_bearer_code',
                 'settlement_counterparty_code', 'settlement_mode',
                 'settlement_cycle', 'amount_source', 'payment_channel_code',
+                'payment_export_included', 'oa_export_included',
                 'route_policy_id', 'override_id'
             ]:
                 res[f'__medical_serious_{key}'] = context.get(key)
@@ -767,6 +1245,8 @@ def save_monthly_ss_records(df: pd.DataFrame, month: str) -> tuple:
                     row.get(f'__{source_item}_settlement_cycle', 'none') or 'none',
                     row.get(f'__{source_item}_amount_source', 'system_calculated') or 'system_calculated',
                     row.get(f'__{source_item}_payment_channel_code'),
+                    int(row.get(f'__{source_item}_payment_export_included', 1) or 0),
+                    int(row.get(f'__{source_item}_oa_export_included', 1) or 0),
                     row.get(f'__{source_item}_route_policy_id'),
                     row.get(f'__{source_item}_override_id'),
                     'draft'
@@ -780,9 +1260,11 @@ def save_monthly_ss_records(df: pd.DataFrame, month: str) -> tuple:
                 base_amount, company_amount, personal_amount,
                 calculation_policy_entity, payer_entity_code, cost_bearer_code,
                 settlement_counterparty_code, settlement_mode, settlement_cycle,
-                amount_source, payment_channel_code, route_policy_id, override_id,
+                amount_source, payment_channel_code,
+                payment_export_included, oa_export_included,
+                route_policy_id, override_id,
                 close_status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, item_insert_data)
         cursor.executemany(
             """

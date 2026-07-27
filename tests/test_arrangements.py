@@ -274,21 +274,30 @@ class ArrangementRoutingTest(unittest.TestCase):
         self.assertEqual(down_routes.loc["养老", "办理单位"], "省公司")
         self.assertEqual(down_routes.loc["基本医疗", "办理单位"], "省公司")
         self.assertEqual(down_routes.loc["失业", "办理单位"], "测试分公司")
-        self.assertEqual(down_routes.loc["工伤", "办理单位"], "测试分公司")
+        self.assertEqual(down_routes.loc["工伤", "办理单位"], "省公司")
         self.assertEqual(down_routes.loc["住房公积金", "办理单位"], "省公众")
         self.assertEqual(down_routes.loc["企业年金", "办理单位"], "省公司")
         self.assertTrue(
             (down_routes["成本归属"] == "测试分公司").all()
         )
-        for item in ["失业", "工伤"]:
+        for item in ["养老", "基本医疗", "失业", "工伤", "生育", "企业年金"]:
             route = self.arrangements.resolve_social_route(
                 "E001",
-                {"失业": "unemp", "工伤": "injury", "企业年金": "annuity"}[item],
+                {
+                    "养老": "pension", "基本医疗": "medical",
+                    "失业": "unemp", "工伤": "injury",
+                    "生育": "maternity", "企业年金": "annuity",
+                }[item],
                 "2026-07", legacy_enabled=1,
                 legacy_payer_name="省公众", legacy_cost_center="本级",
             )
-            self.assertEqual(route["payer_entity_name"], "测试分公司")
+            expected_payer = (
+                "测试分公司" if item == "失业" else "省公司"
+            )
+            self.assertEqual(route["payer_entity_name"], expected_payer)
             self.assertEqual(route["amount_source"], "external_actual")
+            self.assertEqual(route["payment_export_included"], 0)
+            self.assertEqual(route["oa_export_included"], 0)
 
         annuity_route = self.arrangements.resolve_social_route(
             "E001", "annuity", "2026-07", legacy_enabled=1,
@@ -298,6 +307,25 @@ class ArrangementRoutingTest(unittest.TestCase):
         self.assertEqual(annuity_route["cost_bearer_name"], "测试分公司")
         self.assertEqual(annuity_route["amount_source"], "external_actual")
         self.assertEqual(annuity_route["settlement_mode"], "record_only")
+
+        fund_route = self.arrangements.resolve_social_route(
+            "E001", "fund", "2026-07", legacy_enabled=1,
+            legacy_payer_name="省公众", legacy_cost_center="本级",
+        )
+        self.assertEqual(fund_route["payer_entity_name"], "省公众")
+        self.assertEqual(fund_route["amount_source"], "system_calculated")
+        self.assertEqual(fund_route["payment_export_included"], 1)
+        self.assertEqual(fund_route["oa_export_included"], 0)
+        down_defaults = self.arrangements.get_arrangement_route_defaults(
+            "down_secondment", "2026-07"
+        ).set_index("项目")
+        self.assertEqual(down_defaults.loc["住房公积金", "付款清单"], "进入")
+        self.assertEqual(down_defaults.loc["住房公积金", "OA接口"], "不进入")
+        self.assertEqual(down_defaults.loc["基本医疗", "付款清单"], "不进入")
+        self.assertEqual(
+            down_defaults.loc["基本医疗", "本系统金额"],
+            "不计算，只记录归属",
+        )
 
         ok, message = self.arrangements.save_normal_route_default(
             "medical", "province_public", "2026-08", "普通员工医保转回省公众",
@@ -312,8 +340,23 @@ class ArrangementRoutingTest(unittest.TestCase):
             legacy_payer_name="省公众", legacy_cost_center="本级",
         )
         self.assertEqual(july["payer_entity_name"], "省公司")
-        self.assertEqual(august["payer_entity_name"], "省公众")
+        self.assertEqual(august["payer_entity_name"], "省公司")
         self.assertEqual(august["cost_bearer_name"], "测试分公司")
+        self.assertEqual(august["amount_source"], "external_actual")
+
+        ok, message = self.arrangements.save_arrangement_route_default(
+            "down_secondment", "medical", True, "province_company", False,
+            "2027-01", "省公司直接缴纳",
+        )
+        self.assertTrue(ok, message)
+        future = self.arrangements.resolve_social_route(
+            "E001", "medical", "2027-01", legacy_enabled=1,
+            legacy_payer_name="省公众", legacy_cost_center="本级",
+        )
+        self.assertEqual(future["amount_source"], "external_actual")
+        self.assertEqual(future["settlement_mode"], "record_only")
+        self.assertEqual(future["payment_export_included"], 0)
+        self.assertEqual(future["oa_export_included"], 0)
 
     def test_schema_rerun_does_not_overwrite_people_rules(self):
         conn = sqlite3.connect(self.db_path)

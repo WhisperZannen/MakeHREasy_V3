@@ -104,6 +104,60 @@ class PayrollWorkflowTest(unittest.TestCase):
         snapshot = get_effective_payroll_snapshot("2026-07")["E1"]
         self.assertEqual(snapshot["dept_name"], "原部门")
 
+    def test_down_secondment_transition_month_only_pays_prior_performance(self):
+        from modules.core_payroll import generate_payroll_draft
+
+        conn = self._connect()
+        try:
+            dept_id = conn.execute(
+                "SELECT dept_id FROM departments WHERE dept_name='新部门'"
+            ).fetchone()[0]
+            conn.execute(
+                """
+                INSERT INTO employee_arrangements(
+                    emp_id, arrangement_type, contract_entity_code,
+                    home_dept_id, actual_work_unit_code, related_branch_code,
+                    accounting_entity_code, ultimate_cost_bearer_code,
+                    start_date, planned_end_date, payroll_included,
+                    labor_cost_included, final_performance_pay_month,
+                    settlement_mode, settlement_cycle, status
+                ) VALUES (
+                    'E1', 'down_secondment', 'province_public',
+                    ?, 'province_company', 'province_company',
+                    'province_public', 'province_company',
+                    '2026-07-01', '2028-06-30', 0, 0, '2026-07',
+                    'mixed_by_item', 'mixed', 'active'
+                )
+                """,
+                (dept_id,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        july = generate_payroll_draft("2026-07", "2026-06")
+        self.assertEqual(july["generated"], 1)
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                """
+                SELECT base_salary, seniority_pay, comp_subsidy,
+                       perf_salary_calc, salary_source
+                FROM payroll_monthly_records
+                WHERE cost_month='2026-07' AND emp_id='E1'
+                """
+            ).fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(row["base_salary"], 0.0)
+        self.assertEqual(row["seniority_pay"], 0.0)
+        self.assertEqual(row["comp_subsidy"], 0.0)
+        self.assertGreater(row["perf_salary_calc"], 0.0)
+        self.assertEqual(row["salary_source"], "下沉过渡月：仅发上月绩效")
+
+        august = generate_payroll_draft("2026-08", "2026-07")
+        self.assertEqual(august["generated"], 0)
+
     def test_talent_uses_highest_multiplier_and_totals_separate_female_item(self):
         from modules.core_payroll import (
             generate_payroll_draft,

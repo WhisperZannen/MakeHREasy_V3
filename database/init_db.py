@@ -446,6 +446,52 @@ def ensure_person_lifecycle_schema(cursor):
     """)
 
 
+def ensure_social_oa_export_schema(cursor):
+    """补齐 OA 社保数据接口所需的人员账号和可维护文件名。"""
+    _add_columns_if_missing(cursor, 'employee_profiles', {
+        # 上月接口数据证明：五险使用同一个社保账号，但年金允许存在独立账号。
+        # 新人没有历史账号时按 OA 现有口径填 0，不把空值写入上传文件。
+        'oa_social_account_no': "TEXT DEFAULT '0'",
+        'oa_annuity_account_no': "TEXT DEFAULT '0'",
+    })
+    cursor.execute("""
+        UPDATE employee_profiles
+        SET oa_social_account_no = '0'
+        WHERE oa_social_account_no IS NULL OR TRIM(oa_social_account_no) = ''
+    """)
+    cursor.execute("""
+        UPDATE employee_profiles
+        SET oa_annuity_account_no = COALESCE(
+            NULLIF(TRIM(oa_social_account_no), ''), '0'
+        )
+        WHERE oa_annuity_account_no IS NULL OR TRIM(oa_annuity_account_no) = ''
+    """)
+
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS social_oa_export_settings (
+            insurance_item TEXT PRIMARY KEY,
+            display_name TEXT NOT NULL,
+            file_name TEXT NOT NULL,
+            sort_order INTEGER NOT NULL DEFAULT 999,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    defaults = [
+        ('injury', '工伤保险', '2022-工伤保险.xlsx', 10),
+        ('pension', '基本养老保险', '2022-基本养老保险.xlsx', 20),
+        ('medical', '基本医疗保险', '2022-基本医疗保险.xlsx', 30),
+        ('unemp', '失业保险', '2022-年失业保险.xlsx', 40),
+        ('maternity', '生育保险', '2022-生育保险.xlsx', 50),
+        ('fund', '住房公积金', '2022-住房公积金.xlsx', 60),
+        ('annuity', '企业年金', '2023-年企业年金.xlsx', 70),
+    ]
+    cursor.executemany("""
+        INSERT OR IGNORE INTO social_oa_export_settings(
+            insurance_item, display_name, file_name, sort_order
+        ) VALUES (?, ?, ?, ?)
+    """, defaults)
+
+
 def ensure_social_policy_versions_schema(cursor):
     """建立按生效月份取最新版本的参数表；旧年度规则只做初始化来源。"""
     cursor.execute('''
@@ -564,6 +610,7 @@ def ensure_work_arrangement_schema(cursor):
             status TEXT NOT NULL DEFAULT 'active',
             source_document_no TEXT,
             remarks TEXT,
+            final_performance_pay_month TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (emp_id) REFERENCES employees(emp_id),
@@ -576,6 +623,9 @@ def ensure_work_arrangement_schema(cursor):
             FOREIGN KEY (ultimate_cost_bearer_code) REFERENCES business_entities(entity_code)
         )
     ''')
+    _add_columns_if_missing(cursor, 'employee_arrangements', {
+        'final_performance_pay_month': 'TEXT',
+    })
     cursor.execute('''
         CREATE INDEX IF NOT EXISTS idx_employee_arrangements_effective
         ON employee_arrangements(emp_id, start_date, actual_end_date, status)
@@ -601,6 +651,8 @@ def ensure_work_arrangement_schema(cursor):
             settlement_cycle TEXT NOT NULL DEFAULT 'none',
             amount_source TEXT NOT NULL DEFAULT 'system_calculated',
             payment_channel_code TEXT,
+            payment_export_included INTEGER,
+            oa_export_included INTEGER,
             priority INTEGER NOT NULL DEFAULT 100,
             active INTEGER NOT NULL DEFAULT 1,
             remarks TEXT,
@@ -612,6 +664,10 @@ def ensure_work_arrangement_schema(cursor):
             FOREIGN KEY (settlement_counterparty_code) REFERENCES business_entities(entity_code)
         )
     ''')
+    _add_columns_if_missing(cursor, 'social_route_policies', {
+        'payment_export_included': 'INTEGER',
+        'oa_export_included': 'INTEGER',
+    })
     cursor.execute('''
         CREATE INDEX IF NOT EXISTS idx_social_route_policies_effective
         ON social_route_policies(arrangement_type, insurance_item,
@@ -634,6 +690,8 @@ def ensure_work_arrangement_schema(cursor):
             settlement_cycle TEXT,
             amount_source TEXT,
             payment_channel_code TEXT,
+            payment_export_included INTEGER,
+            oa_export_included INTEGER,
             special_reason TEXT NOT NULL,
             source_document_no TEXT,
             active INTEGER NOT NULL DEFAULT 1,
@@ -645,6 +703,10 @@ def ensure_work_arrangement_schema(cursor):
             FOREIGN KEY (settlement_counterparty_code) REFERENCES business_entities(entity_code)
         )
     ''')
+    _add_columns_if_missing(cursor, 'employee_social_overrides', {
+        'payment_export_included': 'INTEGER',
+        'oa_export_included': 'INTEGER',
+    })
     cursor.execute('''
         CREATE INDEX IF NOT EXISTS idx_employee_social_overrides_effective
         ON employee_social_overrides(emp_id, insurance_item,
@@ -671,6 +733,8 @@ def ensure_work_arrangement_schema(cursor):
             settlement_cycle TEXT NOT NULL DEFAULT 'none',
             amount_source TEXT NOT NULL DEFAULT 'system_calculated',
             payment_channel_code TEXT,
+            payment_export_included INTEGER,
+            oa_export_included INTEGER,
             route_policy_id INTEGER,
             override_id INTEGER,
             close_status TEXT NOT NULL DEFAULT 'draft',
@@ -684,6 +748,10 @@ def ensure_work_arrangement_schema(cursor):
             FOREIGN KEY (override_id) REFERENCES employee_social_overrides(override_id)
         )
     ''')
+    _add_columns_if_missing(cursor, 'social_monthly_items', {
+        'payment_export_included': 'INTEGER',
+        'oa_export_included': 'INTEGER',
+    })
     cursor.execute('''
         CREATE INDEX IF NOT EXISTS idx_social_monthly_items_settlement
         ON social_monthly_items(cost_month, cost_bearer_code,
@@ -892,6 +960,158 @@ def ensure_work_arrangement_schema(cursor):
           AND amount_source != 'external_actual'
     ''')
 
+    # 2026-07起下沉人员统一采用“仅公积金由省公众代缴”的新口径：
+    # 养老、医疗（含大病）、工伤、生育、年金由省公司直接办理并与地市
+    # 结算，失业由地市办理；这些项目不进入省公众付款清单和OA。公积金
+    # 仍由省公众缴纳，金额进入付款清单和年末地市结算，但不进入OA及
+    # 本单位人工成本。
+    cursor.execute('''
+        UPDATE social_route_policies
+        SET effective_to_month = '2026-06', updated_at = CURRENT_TIMESTAMP
+        WHERE arrangement_type = 'down_secondment'
+          AND effective_from_month < '2026-07'
+          AND (effective_to_month IS NULL OR effective_to_month >= '2026-07')
+    ''')
+    down_secondment_202607_routes = [
+        (
+            'pension', 'fixed', 'province_company', 'province_company',
+            'record_only', 'none', 'external_actual', 0,
+            '省公司缴纳并直接与下沉地市结算，省公众只记录办理归属',
+        ),
+        (
+            'medical', 'fixed', 'province_company', 'province_company',
+            'record_only', 'none', 'external_actual', 0,
+            '基本医疗及大病由省公司缴纳并直接与下沉地市结算',
+        ),
+        (
+            'unemp', 'related_branch', None, 'province_public',
+            'record_only', 'none', 'external_actual', 0,
+            '下沉地市属地缴纳，省公众只记录办理归属',
+        ),
+        (
+            'injury', 'fixed', 'province_company', 'province_company',
+            'record_only', 'none', 'external_actual', 0,
+            '工伤由省公司缴纳并直接与下沉地市结算',
+        ),
+        (
+            'maternity', 'fixed', 'province_company', 'province_company',
+            'record_only', 'none', 'external_actual', 0,
+            '生育由省公司缴纳并直接与下沉地市结算',
+        ),
+        (
+            'fund', 'fixed', 'province_public', 'province_public',
+            'annual_reimbursement', 'annual', 'system_calculated', 1,
+            '省公众代缴，个人和单位金额均保留，年底与下沉地市统一结算',
+        ),
+        (
+            'annuity', 'fixed', 'province_company', 'province_company',
+            'record_only', 'none', 'external_actual', 0,
+            '省公司缴纳并直接与下沉地市结算，省公众不生成金额',
+        ),
+    ]
+    for (
+        insurance_item, payer_rule, payer_code, calculation_entity,
+        settlement_mode, settlement_cycle, amount_source,
+        payment_export_included, remarks,
+    ) in down_secondment_202607_routes:
+        cursor.execute('''
+            INSERT INTO social_route_policies(
+                policy_name, arrangement_type, insurance_item,
+                effective_from_month, enabled_default,
+                calculation_policy_entity, payer_entity_rule, payer_entity_code,
+                cost_bearer_rule, cost_bearer_code,
+                settlement_counterparty_code,
+                settlement_mode, settlement_cycle, amount_source,
+                payment_channel_code, payment_export_included,
+                oa_export_included, priority, active, remarks
+            )
+            SELECT ?, 'down_secondment', ?, '2026-07', 1,
+                   ?, ?, ?, 'related_branch', NULL,
+                   NULL,
+                   ?, ?, ?, NULL, ?, 0, 100, 1, ?
+            WHERE NOT EXISTS (
+                SELECT 1 FROM social_route_policies
+                WHERE policy_name = ? AND arrangement_type = 'down_secondment'
+                  AND insurance_item = ? AND effective_from_month = '2026-07'
+            )
+        ''', (
+            f'系统统一：2026-07下沉人员{insurance_item}',
+            insurance_item, calculation_entity, payer_rule, payer_code,
+            settlement_mode, settlement_cycle, amount_source,
+            payment_export_included, remarks,
+            f'系统统一：2026-07下沉人员{insurance_item}', insurance_item,
+        ))
+
+    # 旧政策与个人例外没有显式导出口径时按统一规则补齐；以后所有导出
+    # 只能读取这两个结论，不再自行根据人员类型或金额猜测。
+    cursor.execute('''
+        UPDATE social_route_policies
+        SET payment_export_included = CASE
+                WHEN arrangement_type = 'down_secondment'
+                    THEN CASE WHEN insurance_item = 'fund'
+                              AND amount_source = 'system_calculated' THEN 1 ELSE 0 END
+                WHEN amount_source = 'external_actual'
+                     AND settlement_mode IN ('none', 'record_only', 'local_direct')
+                    THEN 0
+                ELSE 1
+            END
+        WHERE payment_export_included IS NULL
+    ''')
+    cursor.execute('''
+        UPDATE social_route_policies
+        SET oa_export_included = CASE
+                WHEN arrangement_type IN ('proxy_social', 'down_secondment') THEN 0
+                ELSE 1
+            END
+        WHERE oa_export_included IS NULL
+    ''')
+    cursor.execute('''
+        UPDATE employee_social_overrides
+        SET oa_export_included = CASE
+                WHEN EXISTS (
+                    SELECT 1 FROM employee_arrangements a
+                    WHERE a.emp_id = employee_social_overrides.emp_id
+                      AND a.arrangement_type IN ('proxy_social', 'down_secondment')
+                      AND date(a.start_date) <= date(
+                          employee_social_overrides.effective_from_month || '-01',
+                          '+1 month', '-1 day'
+                      )
+                      AND date(COALESCE(a.actual_end_date, a.planned_end_date, '9999-12-31'))
+                          >= date(employee_social_overrides.effective_from_month || '-01')
+                ) THEN 0 ELSE 1 END
+        WHERE oa_export_included IS NULL
+    ''')
+    cursor.execute('''
+        UPDATE employee_social_overrides
+        SET payment_export_included = CASE
+                WHEN amount_source = 'external_actual'
+                     AND settlement_mode IN ('none', 'record_only', 'local_direct')
+                    THEN 0
+                ELSE 1
+            END
+        WHERE payment_export_included IS NULL
+    ''')
+    cursor.execute('''
+        UPDATE social_monthly_items
+        SET oa_export_included = CASE
+                WHEN business_type_snapshot IN ('proxy_social', 'down_secondment')
+                    THEN 0 ELSE 1
+            END
+    ''')
+    cursor.execute('''
+        UPDATE social_monthly_items
+        SET payment_export_included = CASE
+                WHEN business_type_snapshot = 'down_secondment'
+                    THEN CASE WHEN insurance_item = 'fund'
+                                   AND amount_source = 'system_calculated'
+                              THEN 1 ELSE 0 END
+                WHEN amount_source = 'external_actual'
+                     AND settlement_mode IN ('none', 'record_only', 'local_direct')
+                    THEN 0
+                ELSE 1
+            END
+    ''')
+
     cursor.execute('''
         UPDATE social_route_policies
         SET payer_entity_rule = 'normal_default', payer_entity_code = NULL,
@@ -933,6 +1153,94 @@ def ensure_work_arrangement_schema(cursor):
           AND payer_entity_code = 'province_public'
     ''')
 
+    # 已固化的2026-07下沉账同步切换到统一快照。这里只处理下沉人员，
+    # 公积金金额原样保留；其余险种清零并保留外部办理归属。
+    cursor.execute('''
+        UPDATE social_monthly_items
+        SET base_amount = CASE WHEN insurance_item = 'fund' THEN base_amount ELSE 0 END,
+            company_amount = CASE WHEN insurance_item = 'fund' THEN company_amount ELSE 0 END,
+            personal_amount = CASE WHEN insurance_item = 'fund' THEN personal_amount ELSE 0 END,
+            calculation_policy_entity = CASE
+                WHEN insurance_item IN ('pension', 'medical', 'medical_serious',
+                                        'injury', 'maternity', 'annuity')
+                    THEN 'province_company'
+                ELSE 'province_public'
+            END,
+            payer_entity_code = CASE
+                WHEN insurance_item = 'fund' THEN 'province_public'
+                WHEN insurance_item = 'unemp' THEN (
+                    SELECT a.related_branch_code
+                    FROM employee_arrangements a
+                    WHERE a.arrangement_id = social_monthly_items.arrangement_id
+                )
+                ELSE 'province_company'
+            END,
+            cost_bearer_code = (
+                SELECT a.related_branch_code
+                FROM employee_arrangements a
+                WHERE a.arrangement_id = social_monthly_items.arrangement_id
+            ),
+            settlement_counterparty_code = CASE
+                WHEN insurance_item = 'fund' THEN (
+                    SELECT a.related_branch_code
+                    FROM employee_arrangements a
+                    WHERE a.arrangement_id = social_monthly_items.arrangement_id
+                )
+                ELSE NULL
+            END,
+            settlement_mode = CASE
+                WHEN insurance_item = 'fund' THEN 'annual_reimbursement'
+                ELSE 'record_only'
+            END,
+            settlement_cycle = CASE
+                WHEN insurance_item = 'fund' THEN 'annual' ELSE 'none'
+            END,
+            amount_source = CASE
+                WHEN insurance_item = 'fund' THEN 'system_calculated'
+                ELSE 'external_actual'
+            END,
+            payment_channel_code = CASE
+                WHEN insurance_item = 'fund' THEN 'province_public:fund'
+                ELSE 'external:record_only'
+            END,
+            payment_export_included = CASE
+                WHEN insurance_item = 'fund' THEN 1 ELSE 0
+            END,
+            oa_export_included = 0,
+            route_policy_id = (
+                SELECT p.route_policy_id
+                FROM social_route_policies p
+                WHERE p.arrangement_type = 'down_secondment'
+                  AND p.insurance_item = CASE
+                      WHEN social_monthly_items.insurance_item = 'medical_serious'
+                          THEN 'medical'
+                      ELSE social_monthly_items.insurance_item
+                  END
+                  AND p.effective_from_month <= social_monthly_items.cost_month
+                  AND (p.effective_to_month IS NULL
+                       OR p.effective_to_month >= social_monthly_items.cost_month)
+                  AND p.active = 1
+                ORDER BY p.priority DESC, p.effective_from_month DESC,
+                         p.route_policy_id DESC
+                LIMIT 1
+            ),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE cost_month >= '2026-07'
+          AND business_type_snapshot = 'down_secondment'
+    ''')
+    cursor.execute('''
+        UPDATE employee_arrangements
+        SET final_performance_pay_month = '2026-07',
+            updated_at = CURRENT_TIMESTAMP
+        WHERE arrangement_type = 'down_secondment'
+          AND status = 'active'
+          AND final_performance_pay_month IS NULL
+          AND emp_id IN (
+              SELECT emp_id FROM employees
+              WHERE name IN ('李诗影', '林宇琎', '梁作栋')
+          )
+    ''')
+
     # 以下字段都是加法迁移。已有数据保持原值，新数据开始写入快照。
     cursor.execute("PRAGMA table_info(employee_arrangements)")
     arrangement_columns_before_patch = {row[1] for row in cursor.fetchall()}
@@ -958,6 +1266,25 @@ def ensure_work_arrangement_schema(cursor):
         'closed_by': 'TEXT',
         'rebuild_reason': 'TEXT',
     })
+    cursor.execute('''
+        UPDATE ss_monthly_records
+        SET pension_pers = 0, medical_pers = 0, medical_serious_pers = 0,
+            unemp_pers = 0, annuity_pers = 0,
+            pension_comp = 0, medical_comp = 0, unemp_comp = 0,
+            injury_comp = 0, maternity_comp = 0, annuity_comp = 0,
+            pension_route = '省公司', medical_route = '省公司',
+            unemp_route = (
+                SELECT e.entity_name
+                FROM employee_arrangements a
+                JOIN business_entities e ON e.entity_code = a.related_branch_code
+                WHERE a.arrangement_id = ss_monthly_records.arrangement_id
+            ),
+            injury_route = '省公司', maternity_route = '省公司',
+            fund_route = '省公众', annuity_route = '省公司',
+            calculation_status = 'calculated'
+        WHERE cost_month >= '2026-07'
+          AND business_type_snapshot = 'down_secondment'
+    ''')
     _add_columns_if_missing(cursor, 'ss_retroactive_records', {
         'arrangement_id': 'INTEGER',
         'payer_entity_code': 'TEXT',
@@ -2419,6 +2746,7 @@ def init_database(db_path=None):
         # --- 表 15+：多形态用工、社保路由与结算兼容层 ---
         # 只新增表和字段，不删除现有人员、社保、薪酬或人工成本数据。
         ensure_person_lifecycle_schema(cursor)
+        ensure_social_oa_export_schema(cursor)
         ensure_social_policy_versions_schema(cursor)
         ensure_work_arrangement_schema(cursor)
         ensure_finance_labor_schema(cursor)

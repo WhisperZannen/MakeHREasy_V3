@@ -642,7 +642,13 @@ def generate_payroll_draft(pay_month, performance_month=None):
                         })
                 continue
             arrangement = get_effective_arrangement(emp_id, pay_month, conn)
-            if not int(arrangement.get("payroll_included", 1)):
+            payroll_included = int(arrangement.get("payroll_included", 1))
+            performance_only = (
+                not payroll_included
+                and str(arrangement.get("final_performance_pay_month") or "")
+                == pay_month
+            )
+            if not payroll_included and not performance_only:
                 excluded += 1
                 continue
             perf_person = performance_snapshot.get(emp_id)
@@ -694,6 +700,10 @@ def generate_payroll_draft(pay_month, performance_month=None):
                 conn, version_id, emp_id, pay_month, components
             )
             warnings.extend(identity["warnings"])
+            if performance_only:
+                warnings.append(
+                    "下沉过渡月仅发上月绩效；岗位工资和其他固定项目为0"
+                )
 
             existing_score = current.get("perf_kpi_score")
             if emp_id in person_scores:
@@ -734,6 +744,10 @@ def generate_payroll_draft(pay_month, performance_month=None):
             ).fetchone()
             if deferred_row and float(deferred_row["amount"] or 0) != 0:
                 new_hire_backpay = float(deferred_row["amount"] or 0)
+            if performance_only:
+                base_salary = 0.0
+                expert_allowance = 0.0
+                new_hire_backpay = 0.0
             social = social_rows.get(emp_id, {})
             explanation = {
                 "rule_version": version["rule_name"],
@@ -750,7 +764,15 @@ def generate_payroll_draft(pay_month, performance_month=None):
                 "selected_identity": identity["selected_identity"],
                 "identity_candidates": identity["identity_candidates"],
                 "selected_identity_calculation": identity["selected_calculation"],
+                "payroll_scope": (
+                    "performance_only" if performance_only else "full"
+                ),
             }
+            recurring_value = (
+                lambda field: 0.0
+                if performance_only
+                else float(current.get(field) or carry.get(field) or 0)
+            )
             record_id = f"{pay_month}_{emp_id}"
             conn.execute(
                 """
@@ -818,12 +840,12 @@ def generate_payroll_draft(pay_month, performance_month=None):
                     pay_person.get("post_rank"), pay_person.get("post_grade"),
                     pay_person.get("tech_grade"), calculation_mode,
                     base_salary,
-                    float(current.get("seniority_pay") or carry.get("seniority_pay") or 0),
-                    float(current.get("comp_subsidy") or carry.get("comp_subsidy") or 0),
-                    float(current.get("telecom_subsidy") or carry.get("telecom_subsidy") or 0),
-                    float(current.get("perf_float_subsidy") or carry.get("perf_float_subsidy") or 0),
-                    float(current.get("intern_subsidy") or carry.get("intern_subsidy") or 0),
-                    float(current.get("graduate_allowance") or carry.get("graduate_allowance") or 0),
+                    recurring_value("seniority_pay"),
+                    recurring_value("comp_subsidy"),
+                    recurring_value("telecom_subsidy"),
+                    recurring_value("perf_float_subsidy"),
+                    recurring_value("intern_subsidy"),
+                    recurring_value("graduate_allowance"),
                     expert_allowance, new_hire_backpay, components["original_performance"],
                     components["incentive_pack"], score, pack_coef,
                     leader_coef, identity_coef, performance,
@@ -838,7 +860,15 @@ def generate_payroll_draft(pay_month, performance_month=None):
                     arrangement.get("payroll_entity_code"),
                     arrangement.get("actual_work_unit_code"),
                     arrangement.get("ultimate_cost_bearer_code"),
-                    "外部来函核定" if calculation_mode == "external_notice" else "本单位发放",
+                    (
+                        "下沉过渡月：仅发上月绩效"
+                        if performance_only
+                        else (
+                            "外部来函核定"
+                            if calculation_mode == "external_notice"
+                            else "本单位发放"
+                        )
+                    ),
                     json.dumps(explanation, ensure_ascii=False),
                     json.dumps(list(dict.fromkeys(warnings)), ensure_ascii=False),
                 ),
