@@ -95,6 +95,9 @@ def ensure_payroll_schema_patch(cursor):
         "commission_pay": "REAL DEFAULT 0.0",
         "cash_payable_total": "REAL DEFAULT 0.0",
         # 补齐现有签字工资表中的独立项目。女工劳保费单列，不混入人工成本应发。
+
+        "display_order": "INTEGER",
+        # 月度工资表展示顺序。只保存当月快照，不反向改变人员主数据排序。
     }
 
     # 逐个检查必需字段。
@@ -1237,7 +1240,17 @@ def ensure_work_arrangement_schema(cursor):
           AND final_performance_pay_month IS NULL
           AND emp_id IN (
               SELECT emp_id FROM employees
-              WHERE name IN ('李诗影', '林宇琎', '梁作栋')
+              WHERE name IN ('林宇琎', '梁作栋')
+          )
+    ''')
+    cursor.execute('''
+        UPDATE employee_arrangements
+        SET final_performance_pay_month = NULL,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE arrangement_type = 'down_secondment'
+          AND status = 'active'
+          AND emp_id = (
+              SELECT emp_id FROM employees WHERE name = '李诗影' LIMIT 1
           )
     ''')
 
@@ -1730,6 +1743,22 @@ def ensure_payroll_workflow_schema(cursor):
         )
     ''')
     cursor.execute('''
+        CREATE TABLE IF NOT EXISTS payroll_monthly_overrides (
+            override_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            cost_month TEXT NOT NULL,
+            emp_id TEXT NOT NULL,
+            field_name TEXT NOT NULL,
+            override_value REAL NOT NULL,
+            reason TEXT,
+            source_file TEXT,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(cost_month, emp_id, field_name),
+            FOREIGN KEY(emp_id) REFERENCES employees(emp_id)
+        )
+    ''')
+    cursor.execute('''
         CREATE TABLE IF NOT EXISTS employee_payroll_identities (
             identity_id INTEGER PRIMARY KEY AUTOINCREMENT,
             emp_id TEXT NOT NULL,
@@ -1788,6 +1817,33 @@ def ensure_payroll_workflow_schema(cursor):
         CREATE INDEX IF NOT EXISTS idx_payroll_scores_run
         ON payroll_score_inputs(payroll_run_id, score_scope)
     ''')
+    cursor.execute('''
+        CREATE INDEX IF NOT EXISTS idx_payroll_monthly_overrides
+        ON payroll_monthly_overrides(cost_month, emp_id, enabled)
+    ''')
+
+    cursor.execute("PRAGMA table_info(payroll_allowance_rules)")
+    allowance_rule_columns = {row[1] for row in cursor.fetchall()}
+    if "target_field" not in allowance_rule_columns:
+        cursor.execute(
+            "ALTER TABLE payroll_allowance_rules "
+            "ADD COLUMN target_field TEXT DEFAULT 'graduate_allowance'"
+        )
+
+    cursor.execute("PRAGMA table_info(payroll_person_calculation_overrides)")
+    person_override_columns = {row[1] for row in cursor.fetchall()}
+    for column_name, column_sql in {
+        "effective_from_month": "TEXT",
+        "effective_to_month": "TEXT",
+        "base_salary_override": "REAL",
+        "original_performance_override": "REAL",
+        "incentive_pack_override": "REAL",
+    }.items():
+        if column_name not in person_override_columns:
+            cursor.execute(
+                f"ALTER TABLE payroll_person_calculation_overrides "
+                f"ADD COLUMN {column_name} {column_sql}"
+            )
 
     version_ids = [
         row[0] for row in cursor.execute(

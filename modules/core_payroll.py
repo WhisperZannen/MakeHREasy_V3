@@ -13,6 +13,56 @@ from datetime import datetime
 from modules.core_arrangements import get_effective_arrangement
 
 
+MONTHLY_OVERRIDE_FIELDS = {
+    "base_salary",
+    "seniority_pay",
+    "comp_subsidy",
+    "telecom_subsidy",
+    "perf_float_subsidy",
+    "position_adj",
+    "intern_subsidy",
+    "graduate_allowance",
+    "expert_allowance",
+    "perf_standard",
+    "perf_base",
+    "perf_kpi_score",
+    "perf_pack_coef",
+    "perf_leader_coef",
+    "perf_excel_coef",
+    "perf_salary_calc",
+    "perf_adj",
+    "commission_pay",
+    "special_bonus_total",
+    "history_clearance",
+    "promotion_backpay",
+    "new_hire_backpay",
+    "ss_pension_pers",
+    "ss_medical_mix",
+    "ss_unemp_pers",
+    "ss_fund_pers",
+    "ss_annuity_pers",
+}
+
+ALLOWANCE_TARGET_FIELDS = {
+    "seniority_pay",
+    "comp_subsidy",
+    "telecom_subsidy",
+    "perf_float_subsidy",
+    "position_adj",
+    "intern_subsidy",
+    "graduate_allowance",
+}
+
+POST_INSERT_OVERRIDE_FIELDS = {
+    "position_adj",
+    "perf_adj",
+    "commission_pay",
+    "special_bonus_total",
+    "history_clearance",
+    "promotion_backpay",
+}
+
+
 def _get_db_connection():
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     db_path = os.environ.get(
@@ -38,6 +88,126 @@ def previous_month(value):
     year = month.year if month.month > 1 else month.year - 1
     number = month.month - 1 if month.month > 1 else 12
     return f"{year:04d}-{number:02d}"
+
+
+def save_monthly_overrides(
+    cost_month, emp_id, values, reason="", source_file="", conn=None
+):
+    """保存只影响指定人员、指定月份的人工核定值。"""
+    month = _normalize_month(cost_month)
+    invalid_fields = sorted(set(values) - MONTHLY_OVERRIDE_FIELDS)
+    if invalid_fields:
+        raise ValueError("不允许覆盖字段：" + "、".join(invalid_fields))
+    own_conn = conn is None
+    conn = conn or _get_db_connection()
+    try:
+        for field_name, value in values.items():
+            if value is None:
+                conn.execute(
+                    """
+                    DELETE FROM payroll_monthly_overrides
+                    WHERE cost_month=? AND emp_id=? AND field_name=?
+                    """,
+                    (month, str(emp_id), field_name),
+                )
+                continue
+            conn.execute(
+                """
+                INSERT INTO payroll_monthly_overrides(
+                    cost_month, emp_id, field_name, override_value,
+                    reason, source_file, enabled
+                ) VALUES (?, ?, ?, ?, ?, ?, 1)
+                ON CONFLICT(cost_month, emp_id, field_name) DO UPDATE SET
+                    override_value=excluded.override_value,
+                    reason=excluded.reason,
+                    source_file=excluded.source_file,
+                    enabled=1,
+                    updated_at=CURRENT_TIMESTAMP
+                """,
+                (
+                    month,
+                    str(emp_id),
+                    field_name,
+                    float(value),
+                    str(reason or "").strip(),
+                    str(source_file or "").strip(),
+                ),
+            )
+        if own_conn:
+            conn.commit()
+    except Exception:
+        if own_conn:
+            conn.rollback()
+        raise
+    finally:
+        if own_conn:
+            conn.close()
+
+
+def get_monthly_overrides(cost_month, conn=None):
+    """返回指定月份的人工核定值，按人员和字段组织。"""
+    month = _normalize_month(cost_month)
+    own_conn = conn is None
+    conn = conn or _get_db_connection()
+    try:
+        rows = conn.execute(
+            """
+            SELECT o.*, e.name, COALESCE(e.employee_no, '待分配') AS employee_no
+            FROM payroll_monthly_overrides o
+            JOIN employees e ON e.emp_id=o.emp_id
+            WHERE o.cost_month=? AND o.enabled=1
+            ORDER BY e.name, o.field_name
+            """,
+            (month,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        if own_conn:
+            conn.close()
+
+
+def _monthly_override_map(conn, cost_month):
+    result = {}
+    for row in conn.execute(
+        """
+        SELECT emp_id, field_name, override_value, reason, source_file
+        FROM payroll_monthly_overrides
+        WHERE cost_month=? AND enabled=1
+        """,
+        (cost_month,),
+    ).fetchall():
+        emp_id = str(row["emp_id"])
+        result.setdefault(emp_id, {
+            "values": {},
+            "reasons": set(),
+            "source_files": set(),
+        })
+        result[emp_id]["values"][row["field_name"]] = float(row["override_value"])
+        if row["reason"]:
+            result[emp_id]["reasons"].add(str(row["reason"]))
+        if row["source_file"]:
+            result[emp_id]["source_files"].add(str(row["source_file"]))
+    return result
+
+
+def _active_allowance_values(conn, emp_id, cost_month):
+    values = {}
+    rows = conn.execute(
+        """
+        SELECT target_field, SUM(monthly_amount) AS amount
+        FROM payroll_allowance_rules
+        WHERE emp_id=? AND is_active=1
+          AND start_month<=?
+          AND (end_month IS NULL OR end_month='' OR end_month>=?)
+        GROUP BY target_field
+        """,
+        (str(emp_id), cost_month, cost_month),
+    ).fetchall()
+    for row in rows:
+        target = str(row["target_field"] or "graduate_allowance")
+        if target in ALLOWANCE_TARGET_FIELDS:
+            values[target] = float(row["amount"] or 0)
+    return values
 
 
 def save_new_hire_backpay(emp_id, source_month, pay_month, amount, remarks=""):
@@ -110,7 +280,8 @@ def get_effective_payroll_snapshot(target_month, conn=None):
             """
             SELECT e.emp_id, e.name, e.status, e.dept_id, e.post_rank,
                    e.post_grade, e.join_company_date, ep.pos_id, ep.tech_grade,
-                   ep.payroll_start_month
+                   ep.payroll_start_month, ep.employment_stage,
+                   ep.education_level
             FROM employees e
             LEFT JOIN employee_profiles ep ON ep.emp_id = e.emp_id
             WHERE e.join_company_date IS NULL
@@ -612,15 +783,44 @@ def generate_payroll_draft(pay_month, performance_month=None):
                 (pay_month,),
             )
         }
+        def delete_current_draft(emp_id):
+            current_record = current_records.get(emp_id)
+            if not current_record:
+                return
+            if str(current_record.get("audit_status") or "草稿").strip() == "草稿":
+                conn.execute(
+                    """
+                    DELETE FROM payroll_monthly_records
+                    WHERE cost_month=? AND emp_id=?
+                    """,
+                    (pay_month, emp_id),
+                )
+
+        monthly_overrides = _monthly_override_map(conn, pay_month)
         generated = 0
         excluded = 0
         deferred = 0
         warning_people = []
         for emp_id, pay_person in pay_snapshot.items():
-            if pay_person.get("status") != "在职":
+            month_override = monthly_overrides.get(emp_id, {})
+            override_values = month_override.get("values", {})
+            leaver_final_performance = (
+                pay_person.get("status") == "离职"
+                and "perf_salary_calc" in override_values
+            )
+            if (
+                pay_person.get("status") != "在职"
+                and not leaver_final_performance
+                and not override_values
+            ):
+                delete_current_draft(emp_id)
                 continue
             payroll_start_month = str(pay_person.get("payroll_start_month") or "").strip()
-            if payroll_start_month and payroll_start_month > pay_month:
+            if (
+                payroll_start_month
+                and payroll_start_month > pay_month
+                and not override_values
+            ):
                 deferred += 1
                 existing_deferred_record = current_records.get(emp_id)
                 if existing_deferred_record:
@@ -647,23 +847,29 @@ def generate_payroll_draft(pay_month, performance_month=None):
                 not payroll_included
                 and str(arrangement.get("final_performance_pay_month") or "")
                 == pay_month
-            )
-            if not payroll_included and not performance_only:
+            ) or leaver_final_performance
+            if not payroll_included and not performance_only and not override_values:
                 excluded += 1
+                delete_current_draft(emp_id)
                 continue
             perf_person = performance_snapshot.get(emp_id)
             carry = _carry_values(conn, emp_id, pay_month)
             current = current_records.get(emp_id, {})
             warnings = []
+            allowance_values = _active_allowance_values(conn, emp_id, pay_month)
 
             override = conn.execute(
                 """
                 SELECT * FROM payroll_person_calculation_overrides
                 WHERE rule_version_id=? AND emp_id=? AND enabled=1
+                  AND (effective_from_month IS NULL OR effective_from_month<=?)
+                  AND (effective_to_month IS NULL OR effective_to_month>=?)
                 """,
-                (version_id, emp_id),
+                (version_id, emp_id, pay_month, pay_month),
             ).fetchone()
             calculation_mode = override["calculation_mode"] if override else "automatic"
+            if override_values:
+                calculation_mode = "manual"
             if calculation_mode == "external_notice":
                 base_salary = float(current.get("base_salary") or carry.get("base_salary") or 0)
                 components = {
@@ -680,7 +886,7 @@ def generate_payroll_draft(pay_month, performance_month=None):
                 base_salary, salary_warning = _salary_amount(
                     conn, version_id, pay_person
                 )
-                if salary_warning:
+                if salary_warning and "base_salary" not in override_values:
                     warnings.append(salary_warning)
                 if perf_person is None:
                     components = {
@@ -695,18 +901,74 @@ def generate_payroll_draft(pay_month, performance_month=None):
                     }
                 else:
                     components = _performance_components(conn, version, perf_person)
+            if override:
+                if (
+                    override["base_salary_override"] is not None
+                    and "base_salary" not in override_values
+                ):
+                    base_salary = float(override["base_salary_override"])
+                if (
+                    override["original_performance_override"] is not None
+                    and "perf_standard" not in override_values
+                ):
+                    components["original_performance"] = float(
+                        override["original_performance_override"]
+                    )
+                if (
+                    override["incentive_pack_override"] is not None
+                    and "perf_base" not in override_values
+                ):
+                    components["incentive_pack"] = float(
+                        override["incentive_pack_override"]
+                    )
+                if (
+                    override["original_performance_override"] is not None
+                    and override["incentive_pack_override"] is not None
+                ):
+                    components["warnings"] = []
+            if pay_person.get("employment_stage") == "intern":
+                base_salary = 0.0
+                components = {
+                    "category": "intern",
+                    "management_role": None,
+                    "official_position": None,
+                    "original_performance": 0.0,
+                    "incentive_pack": 0.0,
+                    "original_coefficient": None,
+                    "incentive_coefficient": None,
+                    "warnings": [],
+                }
+            base_salary = float(
+                override_values.get("base_salary", base_salary)
+            )
+            components["original_performance"] = float(
+                override_values.get(
+                    "perf_standard", components["original_performance"]
+                )
+            )
+            components["incentive_pack"] = float(
+                override_values.get("perf_base", components["incentive_pack"])
+            )
+            if {"perf_standard", "perf_base"}.issubset(override_values):
+                components["warnings"] = []
             warnings.extend(components["warnings"])
             identity = _identity_effects(
                 conn, version_id, emp_id, pay_month, components
             )
             warnings.extend(identity["warnings"])
-            if performance_only:
+            if performance_only and not override_values:
                 warnings.append(
-                    "下沉过渡月仅发上月绩效；岗位工资和其他固定项目为0"
+                    (
+                        "离职次月仅发离职月绩效；岗位工资、固定项目和个人代扣为0"
+                        if leaver_final_performance
+                        else "下沉过渡月仅发上月绩效；岗位工资、固定项目和个人代扣为0"
+                    )
                 )
-
             existing_score = current.get("perf_kpi_score")
-            if emp_id in person_scores:
+            if "perf_kpi_score" in override_values:
+                score = float(override_values["perf_kpi_score"])
+                score_source = "本月人工核定"
+            elif emp_id in person_scores:
                 score = person_scores[emp_id]
                 score_source = "个人评分导入"
             elif (
@@ -715,25 +977,68 @@ def generate_payroll_draft(pay_month, performance_month=None):
             ):
                 score = department_scores[pay_person["dept_id"]]
                 score_source = "部门分数（主任分数）"
-            elif existing_score not in (None, 0):
+            elif existing_score is not None:
                 score = float(existing_score)
                 score_source = "本月已保存评分"
+                if (
+                    score == 0
+                    and (
+                        float(components["original_performance"])
+                        + float(components["incentive_pack"])
+                    ) != 0
+                ):
+                    warnings.append("尚未导入个人或部门评分，绩效暂按0")
             else:
-                score = 100.0
-                score_source = "暂按100分，待导入"
+                score = 0.0
+                score_source = "未导入"
+                if (
+                    float(components["original_performance"])
+                    + float(components["incentive_pack"])
+                ) != 0:
+                    warnings.append("尚未导入个人或部门评分，绩效暂按0")
 
-            leader_coef = float(current.get("perf_leader_coef") or 1)
-            pack_coef = float(current.get("perf_pack_coef") or 1)
-            identity_coef = float(identity["performance_multiplier"] or 1)
+            leader_coef = float(
+                override_values.get(
+                    "perf_leader_coef",
+                    current.get("perf_leader_coef")
+                    if current.get("perf_leader_coef") is not None else 1,
+                )
+            )
+            pack_coef = float(
+                override_values.get(
+                    "perf_pack_coef",
+                    current.get("perf_pack_coef")
+                    if current.get("perf_pack_coef") is not None else 1,
+                )
+            )
+            identity_coef = float(
+                override_values.get(
+                    "perf_excel_coef",
+                    identity["performance_multiplier"] or 1,
+                )
+            )
+            effective_score = round(score * leader_coef, 2)
             performance = round(
                 (
                     float(components["original_performance"])
                     + float(components["incentive_pack"]) * pack_coef
-                ) * score / 100 * leader_coef * identity_coef,
+                ) * effective_score / 100 * identity_coef,
                 2,
             )
-            expert_allowance = float(identity["monthly_allowance"] or 0)
-            new_hire_backpay = float(current.get("new_hire_backpay") or 0)
+            performance = float(
+                override_values.get("perf_salary_calc", performance)
+            )
+            expert_allowance = float(
+                override_values.get(
+                    "expert_allowance", identity["monthly_allowance"] or 0
+                )
+            )
+            new_hire_backpay = float(
+                override_values.get(
+                    "new_hire_backpay",
+                    current.get("new_hire_backpay") or 0,
+                )
+            )
             deferred_row = conn.execute(
                 """
                 SELECT COALESCE(SUM(amount), 0) AS amount
@@ -767,12 +1072,49 @@ def generate_payroll_draft(pay_month, performance_month=None):
                 "payroll_scope": (
                     "performance_only" if performance_only else "full"
                 ),
+                "monthly_overrides": sorted(override_values),
+                "monthly_override_reasons": sorted(
+                    month_override.get("reasons", set())
+                ),
+                "monthly_override_sources": sorted(
+                    month_override.get("source_files", set())
+                ),
+                "person_rule_override": (
+                    {
+                        "base_salary": override["base_salary_override"],
+                        "original_performance": override[
+                            "original_performance_override"
+                        ],
+                        "incentive_pack": override["incentive_pack_override"],
+                        "effective_from_month": override["effective_from_month"],
+                        "effective_to_month": override["effective_to_month"],
+                    }
+                    if override
+                    else None
+                ),
             }
-            recurring_value = (
-                lambda field: 0.0
-                if performance_only
-                else float(current.get(field) or carry.get(field) or 0)
-            )
+            def recurring_value(field):
+                if performance_only:
+                    return 0.0
+                if field in override_values:
+                    return float(override_values[field])
+                if field in allowance_values:
+                    return float(allowance_values[field])
+                current_value = current.get(field)
+                if current_value is not None:
+                    return float(current_value)
+                return float(carry.get(field) or 0)
+
+            def social_value(field, source_field, *extra_source_fields):
+                if performance_only:
+                    return 0.0
+                if field in override_values:
+                    return float(override_values[field])
+                return sum(
+                    float(social.get(source) or 0)
+                    for source in (source_field, *extra_source_fields)
+                )
+
             record_id = f"{pay_month}_{emp_id}"
             conn.execute(
                 """
@@ -809,6 +1151,12 @@ def generate_payroll_draft(pay_month, performance_month=None):
                     tech_grade_snapshot=excluded.tech_grade_snapshot,
                     calculation_mode=excluded.calculation_mode,
                     base_salary=excluded.base_salary,
+                    seniority_pay=excluded.seniority_pay,
+                    comp_subsidy=excluded.comp_subsidy,
+                    telecom_subsidy=excluded.telecom_subsidy,
+                    perf_float_subsidy=excluded.perf_float_subsidy,
+                    intern_subsidy=excluded.intern_subsidy,
+                    graduate_allowance=excluded.graduate_allowance,
                     expert_allowance=excluded.expert_allowance,
                     new_hire_backpay=excluded.new_hire_backpay,
                     perf_standard=excluded.perf_standard,
@@ -849,30 +1197,57 @@ def generate_payroll_draft(pay_month, performance_month=None):
                     expert_allowance, new_hire_backpay, components["original_performance"],
                     components["incentive_pack"], score, pack_coef,
                     leader_coef, identity_coef, performance,
-                    float(social.get("pension_pers") or 0),
-                    float(social.get("medical_pers") or 0)
-                    + float(social.get("medical_serious_pers") or 0),
-                    float(social.get("unemp_pers") or 0),
-                    float(social.get("fund_pers") or 0),
-                    float(social.get("annuity_pers") or 0),
+                    social_value("ss_pension_pers", "pension_pers"),
+                    social_value(
+                        "ss_medical_mix",
+                        "medical_pers",
+                        "medical_serious_pers",
+                    ),
+                    social_value("ss_unemp_pers", "unemp_pers"),
+                    social_value("ss_fund_pers", "fund_pers"),
+                    social_value("ss_annuity_pers", "annuity_pers"),
                     arrangement.get("arrangement_id"),
                     arrangement.get("arrangement_type", "normal"),
                     arrangement.get("payroll_entity_code"),
                     arrangement.get("actual_work_unit_code"),
                     arrangement.get("ultimate_cost_bearer_code"),
                     (
-                        "下沉过渡月：仅发上月绩效"
+                        (
+                            "离职次月：仅发离职月绩效"
+                            if leaver_final_performance
+                            else "下沉过渡月：仅发上月绩效"
+                        )
                         if performance_only
                         else (
-                            "外部来函核定"
-                            if calculation_mode == "external_notice"
-                            else "本单位发放"
+                            "本月人工核定"
+                            if override_values
+                            else (
+                                "外部来函核定"
+                                if calculation_mode == "external_notice"
+                                else "本单位发放"
+                            )
                         )
                     ),
                     json.dumps(explanation, ensure_ascii=False),
                     json.dumps(list(dict.fromkeys(warnings)), ensure_ascii=False),
                 ),
             )
+            post_insert_values = {
+                field: override_values[field]
+                for field in POST_INSERT_OVERRIDE_FIELDS
+                if field in override_values
+            }
+            if "position_adj" in allowance_values and "position_adj" not in post_insert_values:
+                post_insert_values["position_adj"] = allowance_values["position_adj"]
+            for field_name, field_value in post_insert_values.items():
+                conn.execute(
+                    f"""
+                    UPDATE payroll_monthly_records
+                    SET {field_name}=?, update_time=CURRENT_TIMESTAMP
+                    WHERE cost_month=? AND emp_id=?
+                    """,
+                    (float(field_value), pay_month, emp_id),
+                )
             generated += 1
             if warnings:
                 warning_people.append({
@@ -921,12 +1296,16 @@ def recalculate_payroll_performance(pay_month, score_updates):
     try:
         run_id = f"PAY-{month}"
         for row in score_updates:
-            score = float(row.get("score", 100) or 100)
-            pack_coef = float(row.get("pack_coef", 1) or 1)
-            leader_coef = float(row.get("leader_coef", 1) or 1)
+            score_raw = row.get("score")
+            score = 0.0 if score_raw is None else float(score_raw)
+            pack_raw = row.get("pack_coef")
+            leader_raw = row.get("leader_coef")
+            pack_coef = 1.0 if pack_raw is None else float(pack_raw)
+            leader_coef = 1.0 if leader_raw is None else float(leader_raw)
             record = conn.execute(
                 """
-                SELECT perf_standard, perf_base, perf_excel_coef
+                SELECT perf_standard, perf_base, perf_excel_coef,
+                       perf_kpi_score, perf_pack_coef, perf_leader_coef
                 FROM payroll_monthly_records
                 WHERE cost_month=? AND emp_id=?
                 """,
@@ -934,13 +1313,46 @@ def recalculate_payroll_performance(pay_month, score_updates):
             ).fetchone()
             if not record:
                 continue
-            calculated = round(
-                (float(record["perf_standard"] or 0)
-                 + float(record["perf_base"] or 0) * pack_coef)
-                * score / 100 * leader_coef
-                * float(record["perf_excel_coef"] or 1),
-                2,
+            inputs_changed = any(
+                abs(float(new_value) - float(old_value or 0)) > 0.000001
+                for new_value, old_value in (
+                    (score, record["perf_kpi_score"]),
+                    (pack_coef, record["perf_pack_coef"]),
+                    (leader_coef, record["perf_leader_coef"]),
+                )
             )
+            if inputs_changed:
+                conn.execute(
+                    """
+                    DELETE FROM payroll_monthly_overrides
+                    WHERE cost_month=? AND emp_id=?
+                      AND field_name IN (
+                          'perf_kpi_score', 'perf_pack_coef',
+                          'perf_leader_coef', 'perf_salary_calc'
+                      )
+                    """,
+                    (month, str(row["emp_id"])),
+                )
+            manual_performance = conn.execute(
+                """
+                SELECT override_value
+                FROM payroll_monthly_overrides
+                WHERE cost_month=? AND emp_id=?
+                  AND field_name='perf_salary_calc' AND enabled=1
+                """,
+                (month, str(row["emp_id"])),
+            ).fetchone()
+            if manual_performance:
+                calculated = float(manual_performance["override_value"])
+            else:
+                effective_score = round(score * leader_coef, 2)
+                calculated = round(
+                    (float(record["perf_standard"] or 0)
+                     + float(record["perf_base"] or 0) * pack_coef)
+                    * effective_score / 100
+                    * float(record["perf_excel_coef"] or 1),
+                    2,
+                )
             conn.execute(
                 """
                 UPDATE payroll_monthly_records

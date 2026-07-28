@@ -124,6 +124,40 @@ class EmployeeIdentityTest(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn('已被其他人员使用', message)
 
+    def test_duplicate_name_can_be_resolved_by_department(self):
+        from modules.core_identity import resolve_employee_reference
+        from modules.core_personnel import add_employee
+
+        conn = sqlite3.connect(self.db_path)
+        conn.execute(
+            "INSERT INTO departments(dept_name, dept_category) "
+            "VALUES ('另一个测试部门', '生产')"
+        )
+        other_dept_id = conn.execute(
+            "SELECT dept_id FROM departments WHERE dept_name='另一个测试部门'"
+        ).fetchone()[0]
+        conn.commit()
+        conn.close()
+
+        first = self._employee('同名人员', employee_no='DUP001')
+        second = self._employee('同名人员', employee_no='DUP002')
+        second['dept_id'] = other_dept_id
+        ok, message = add_employee(first, self._profile())
+        self.assertTrue(ok, message)
+        ok, message = add_employee(second, self._profile())
+        self.assertTrue(ok, message)
+
+        self.assertIsNone(resolve_employee_reference(name='同名人员'))
+        resolved = resolve_employee_reference(
+            name='同名人员', department='另一个测试部门'
+        )
+        conn = sqlite3.connect(self.db_path)
+        expected = conn.execute(
+            "SELECT emp_id FROM employees WHERE employee_no='DUP002'"
+        ).fetchone()[0]
+        conn.close()
+        self.assertEqual(resolved, expected)
+
 
 if __name__ == '__main__':
     unittest.main()

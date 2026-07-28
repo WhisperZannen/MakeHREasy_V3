@@ -638,6 +638,11 @@ def get_person_calculation_overrides(version_id):
                      ELSE o.calculation_mode
                    END AS 核定方式,
                    COALESCE(o.counterparty_name, '') AS 来函单位,
+                   o.effective_from_month AS 生效月份,
+                   o.effective_to_month AS 结束月份,
+                   o.base_salary_override AS 岗位工资标准,
+                   o.original_performance_override AS 原绩效标准,
+                   o.incentive_pack_override AS 激励包标准,
                    COALESCE(o.remarks, '') AS 说明,
                    o.enabled AS 启用
             FROM payroll_person_calculation_overrides o

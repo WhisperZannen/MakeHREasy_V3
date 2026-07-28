@@ -16,10 +16,12 @@ from modules.core_arrangements import get_effective_arrangement
 from modules.core_identity import resolve_employee_reference
 from modules.core_payroll import (
     generate_payroll_draft,
+    get_monthly_overrides,
     get_new_hire_backpay_items,
     previous_month,
     recalculate_payroll_performance,
     recalculate_payroll_totals,
+    save_monthly_overrides,
     save_person_scores,
     save_new_hire_backpay,
 )
@@ -986,13 +988,46 @@ with tab2:
             ):
                 st.dataframe(warning_df, use_container_width=True, hide_index=True)
 
+    try:
+        monthly_override_rows = get_monthly_overrides(calc_month)
+    except ValueError:
+        monthly_override_rows = []
+    if monthly_override_rows:
+        override_df = pd.DataFrame(monthly_override_rows)
+        override_people = override_df["emp_id"].nunique()
+        with st.expander(
+            f"本月有 {override_people} 人采用已确认核算基准，点击查看来源",
+            expanded=False,
+        ):
+            override_summary = (
+                override_df.groupby(
+                    ["employee_no", "name", "reason", "source_file"],
+                    dropna=False,
+                    as_index=False,
+                )
+                .size()
+                .rename(columns={"size": "核定项目数"})
+            )
+            st.dataframe(
+                override_summary.rename(
+                    columns={
+                        "employee_no": "工号",
+                        "name": "姓名",
+                        "reason": "核定原因",
+                        "source_file": "来源文件",
+                    }
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+
     st.divider()
     st.write("#### 导入部门提交的人员评分")
     st.caption(
         "表格只需要“姓名+分数”两列，也兼容“员工姓名、KPI评分、得分”等常见列名。"
-        "系统按唯一姓名匹配，重名或未找到的人不会写入。"
+        "出现重名时可增加“部门”或“工号”列，系统会自动进一步识别。"
     )
-    score_template = pd.DataFrame(columns=["姓名", "分数"])
+    score_template = pd.DataFrame(columns=["姓名", "部门（重名时填写）", "工号（可选）", "分数"])
     score_buffer = io.BytesIO()
     with pd.ExcelWriter(score_buffer, engine="openpyxl") as writer:
         score_template.to_excel(writer, index=False, sheet_name="人员评分")
@@ -1021,6 +1056,14 @@ with tab2:
                 (col for col in ["分数", "KPI评分", "得分", "评分"] if col in score_df.columns),
                 None,
             )
+            dept_col = next(
+                (col for col in ["部门", "归属部门", "所在部门", "部门（重名时填写）"] if col in score_df.columns),
+                None,
+            )
+            employee_no_col = next(
+                (col for col in ["工号", "员工工号", "工号（可选）"] if col in score_df.columns),
+                None,
+            )
             if not name_col or not score_col:
                 raise ValueError("没有识别到姓名列和分数列")
             conn_score = _get_db_connection()
@@ -1031,7 +1074,12 @@ with tab2:
                     name = str(row.get(name_col) or "").strip()
                     if not name:
                         continue
-                    emp_id = resolve_employee_reference(name=name, conn=conn_score)
+                    emp_id = resolve_employee_reference(
+                        employee_no=row.get(employee_no_col) if employee_no_col else None,
+                        name=name,
+                        department=row.get(dept_col) if dept_col else None,
+                        conn=conn_score,
+                    )
                     score = pd.to_numeric(row.get(score_col), errors="coerce")
                     if not emp_id or pd.isna(score):
                         unmatched.append(name)
@@ -1075,7 +1123,7 @@ with tab2:
         FROM payroll_monthly_records p
         JOIN employees e ON p.emp_id=e.emp_id
         WHERE p.cost_month=?
-        ORDER BY p.dept_name, e.name
+        ORDER BY COALESCE(p.display_order, 999999), p.dept_name, e.name
         """,
         conn,
         params=[calc_month],
@@ -1235,7 +1283,7 @@ with tab3:
         FROM payroll_monthly_records p
                  JOIN employees e ON p.emp_id = e.emp_id
         WHERE p.cost_month = ?
-        ORDER BY p.dept_name ASC, p.emp_id ASC
+        ORDER BY COALESCE(p.display_order, 999999), p.dept_name ASC, p.emp_id ASC
     """
 
     df_final = pd.read_sql_query(sql_final, conn, params=[final_month])
@@ -1623,8 +1671,40 @@ with tab3:
             cursor = conn.cursor()
 
             update_count = 0
+            editable_override_fields = {
+                "岗位补/扣": "position_adj",
+                "实习补贴": "intern_subsidy",
+                "高校毕业生津贴": "graduate_allowance",
+                "专家/特殊津贴": "expert_allowance",
+                "绩效补/扣": "perf_adj",
+                "晋升补发": "promotion_backpay",
+                "新入职工资补发": "new_hire_backpay",
+                "提成": "commission_pay",
+                "专项奖惩合计": "special_bonus_total",
+                "历史清算": "history_clearance",
+            }
 
             for _, row in edited_final.iterrows():
+                original_row = df_final.loc[
+                    df_final["__内部人员ID"] == row["__内部人员ID"]
+                ].iloc[0]
+                changed_overrides = {
+                    field_name: float(row[column_name] or 0)
+                    for column_name, field_name in editable_override_fields.items()
+                    if abs(
+                        float(row[column_name] or 0)
+                        - float(original_row[column_name] or 0)
+                    ) > 0.000001
+                }
+                if changed_overrides:
+                    save_monthly_overrides(
+                        final_month,
+                        row["__内部人员ID"],
+                        changed_overrides,
+                        reason="薪酬草稿页面人工调整",
+                        source_file="薪酬模块页面",
+                        conn=conn,
+                    )
 
                 # 计算应发工资。
                 gross = calc_gross_from_row(row)
@@ -1779,7 +1859,7 @@ with tab4:
         FROM payroll_monthly_records p
                  JOIN employees e ON p.emp_id = e.emp_id
         WHERE p.cost_month = ?
-        ORDER BY p.dept_name ASC, p.emp_id ASC
+        ORDER BY COALESCE(p.display_order, 999999), p.dept_name ASC, p.emp_id ASC
     """
 
     payroll_df = pd.read_sql_query(sql_ledger, conn, params=[query_month])

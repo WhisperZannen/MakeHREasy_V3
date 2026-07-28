@@ -105,7 +105,10 @@ class PayrollWorkflowTest(unittest.TestCase):
         self.assertEqual(snapshot["dept_name"], "原部门")
 
     def test_down_secondment_transition_month_only_pays_prior_performance(self):
-        from modules.core_payroll import generate_payroll_draft
+        from modules.core_payroll import (
+            generate_payroll_draft,
+            save_monthly_overrides,
+        )
 
         conn = self._connect()
         try:
@@ -131,10 +134,24 @@ class PayrollWorkflowTest(unittest.TestCase):
                 """,
                 (dept_id,),
             )
+            conn.execute(
+                """
+                INSERT INTO ss_monthly_records(
+                    record_id, cost_month, emp_id, fund_pers,
+                    pension_pers, medical_pers, unemp_pers, annuity_pers
+                ) VALUES ('2026-07_E1', '2026-07', 'E1', 930, 800, 200, 30, 150)
+                """
+            )
             conn.commit()
         finally:
             conn.close()
 
+        save_monthly_overrides(
+            "2026-07",
+            "E1",
+            {"perf_kpi_score": 100},
+            reason="测试已确认评分",
+        )
         july = generate_payroll_draft("2026-07", "2026-06")
         self.assertEqual(july["generated"], 1)
         conn = self._connect()
@@ -142,7 +159,9 @@ class PayrollWorkflowTest(unittest.TestCase):
             row = conn.execute(
                 """
                 SELECT base_salary, seniority_pay, comp_subsidy,
-                       perf_salary_calc, salary_source
+                       perf_salary_calc, salary_source,
+                       ss_pension_pers, ss_medical_mix, ss_unemp_pers,
+                       ss_fund_pers, ss_annuity_pers
                 FROM payroll_monthly_records
                 WHERE cost_month='2026-07' AND emp_id='E1'
                 """
@@ -154,6 +173,11 @@ class PayrollWorkflowTest(unittest.TestCase):
         self.assertEqual(row["comp_subsidy"], 0.0)
         self.assertGreater(row["perf_salary_calc"], 0.0)
         self.assertEqual(row["salary_source"], "下沉过渡月：仅发上月绩效")
+        self.assertEqual(row["ss_pension_pers"], 0.0)
+        self.assertEqual(row["ss_medical_mix"], 0.0)
+        self.assertEqual(row["ss_unemp_pers"], 0.0)
+        self.assertEqual(row["ss_fund_pers"], 0.0)
+        self.assertEqual(row["ss_annuity_pers"], 0.0)
 
         august = generate_payroll_draft("2026-08", "2026-07")
         self.assertEqual(august["generated"], 0)
@@ -163,6 +187,7 @@ class PayrollWorkflowTest(unittest.TestCase):
             generate_payroll_draft,
             recalculate_payroll_totals,
             save_payroll_identity,
+            save_monthly_overrides,
         )
 
         ok, message = save_payroll_identity(
@@ -173,6 +198,12 @@ class PayrollWorkflowTest(unittest.TestCase):
             "E1", "talent", "group", "2026-01-01"
         )
         self.assertTrue(ok, message)
+        save_monthly_overrides(
+            "2026-07",
+            "E1",
+            {"perf_kpi_score": 100},
+            reason="测试已确认评分",
+        )
 
         result = generate_payroll_draft("2026-07", "2026-06")
         self.assertEqual(result["generated"], 1)
@@ -303,6 +334,164 @@ class PayrollWorkflowTest(unittest.TestCase):
         self.assertEqual(result["selected_identity"], "talent:province")
         self.assertEqual(result["performance_multiplier"], 1.5)
         self.assertEqual(result["monthly_allowance"], 0.0)
+
+    def test_zero_score_is_not_changed_to_one_hundred_and_score_is_rounded_first(self):
+        from modules.core_payroll import (
+            generate_payroll_draft,
+            recalculate_payroll_performance,
+        )
+
+        generate_payroll_draft("2026-07", "2026-06")
+        recalculate_payroll_performance(
+            "2026-07",
+            [{"emp_id": "E1", "score": 0, "pack_coef": 1, "leader_coef": 1}],
+        )
+        conn = self._connect()
+        try:
+            zero_row = conn.execute(
+                """
+                SELECT perf_kpi_score, perf_salary_calc
+                FROM payroll_monthly_records
+                WHERE cost_month='2026-07' AND emp_id='E1'
+                """
+            ).fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(zero_row["perf_kpi_score"], 0.0)
+        self.assertEqual(zero_row["perf_salary_calc"], 0.0)
+
+        recalculate_payroll_performance(
+            "2026-07",
+            [
+                {
+                    "emp_id": "E1",
+                    "score": 49.608,
+                    "pack_coef": 1,
+                    "leader_coef": 1,
+                }
+            ],
+        )
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                """
+                SELECT perf_standard, perf_base, perf_excel_coef,
+                       perf_salary_calc
+                FROM payroll_monthly_records
+                WHERE cost_month='2026-07' AND emp_id='E1'
+                """
+            ).fetchone()
+        finally:
+            conn.close()
+        expected = round(
+            (row["perf_standard"] + row["perf_base"])
+            * round(49.608, 2)
+            / 100
+            * row["perf_excel_coef"],
+            2,
+        )
+        self.assertEqual(row["perf_salary_calc"], expected)
+
+    def test_leaver_is_included_for_last_performance_month(self):
+        from modules.core_payroll import (
+            generate_payroll_draft,
+            save_monthly_overrides,
+        )
+
+        conn = self._connect()
+        try:
+            conn.execute("UPDATE employees SET status='离职' WHERE emp_id='E1'")
+            conn.execute(
+                """
+                INSERT INTO personnel_changes(
+                    emp_id, change_type, old_dept_id, new_dept_id,
+                    old_pos_id, new_pos_id, old_tech_grade, new_tech_grade,
+                    old_post_rank, new_post_rank, old_post_grade, new_post_grade,
+                    change_date, change_reason
+                )
+                SELECT 'E1', '变为离职', dept_id, dept_id,
+                       pos_id, pos_id, tech_grade, tech_grade,
+                       post_rank, post_rank, post_grade, post_grade,
+                       '2026-06-18 00:00:00', '测试离职末次绩效'
+                FROM employees e
+                JOIN employee_profiles p ON p.emp_id=e.emp_id
+                WHERE e.emp_id='E1'
+                """
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        save_monthly_overrides(
+            "2026-07",
+            "E1",
+            {"perf_kpi_score": 100, "perf_salary_calc": 9150},
+            reason="确认7月发放离职月末次绩效",
+        )
+        result = generate_payroll_draft("2026-07", "2026-06")
+        self.assertEqual(result["generated"], 1)
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                """
+                SELECT base_salary, seniority_pay, ss_fund_pers, salary_source
+                FROM payroll_monthly_records
+                WHERE cost_month='2026-07' AND emp_id='E1'
+                """
+            ).fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(row["base_salary"], 0.0)
+        self.assertEqual(row["seniority_pay"], 0.0)
+        self.assertEqual(row["ss_fund_pers"], 0.0)
+        self.assertEqual(row["salary_source"], "离职次月：仅发离职月绩效")
+
+    def test_effective_person_rule_can_supply_known_individual_standard(self):
+        from modules.core_payroll import (
+            generate_payroll_draft,
+            save_monthly_overrides,
+        )
+
+        conn = self._connect()
+        try:
+            version_id = conn.execute(
+                "SELECT rule_version_id FROM payroll_rule_versions LIMIT 1"
+            ).fetchone()[0]
+            conn.execute(
+                """
+                INSERT INTO payroll_person_calculation_overrides(
+                    rule_version_id, emp_id, calculation_mode,
+                    effective_from_month, original_performance_override,
+                    incentive_pack_override, remarks, enabled
+                ) VALUES (?, 'E1', 'automatic', '2026-07', 1000, 2000,
+                          '测试个人标准', 1)
+                """,
+                (version_id,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        save_monthly_overrides(
+            "2026-07",
+            "E1",
+            {"perf_kpi_score": 100},
+            reason="测试已确认评分",
+        )
+        generate_payroll_draft("2026-07", "2026-06")
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                """
+                SELECT perf_standard, perf_base, perf_salary_calc
+                FROM payroll_monthly_records
+                WHERE cost_month='2026-07' AND emp_id='E1'
+                """
+            ).fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(row["perf_standard"], 1000.0)
+        self.assertEqual(row["perf_base"], 2000.0)
+        self.assertEqual(row["perf_salary_calc"], 3000.0)
 
 
 if __name__ == "__main__":

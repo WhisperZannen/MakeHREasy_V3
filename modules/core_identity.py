@@ -48,8 +48,10 @@ def resolve_internal_emp_id(value, conn=None) -> Optional[str]:
             db.close()
 
 
-def resolve_employee_reference(employee_no=None, id_card=None, name=None, conn=None) -> Optional[str]:
-    """按工号、身份证号、唯一姓名依次识别人；不向导入模板暴露内部键。"""
+def resolve_employee_reference(
+    employee_no=None, id_card=None, name=None, conn=None, department=None
+) -> Optional[str]:
+    """按工号、身份证号、姓名及部门依次识别人；不向导入模板暴露内部键。"""
     db, owned = _connect(conn)
     try:
         resolved = resolve_internal_emp_id(employee_no, db)
@@ -65,11 +67,32 @@ def resolve_employee_reference(employee_no=None, id_card=None, name=None, conn=N
         person_name = str(name or '').strip()
         if person_name:
             rows = db.execute(
-                "SELECT emp_id FROM employees WHERE name = ?", (person_name,)
+                """
+                SELECT e.emp_id, d.dept_name
+                FROM employees e
+                LEFT JOIN departments d ON d.dept_id=e.dept_id
+                WHERE e.name=?
+                """,
+                (person_name,),
             ).fetchall()
             if len(rows) == 1:
                 row = rows[0]
                 return str(row['emp_id'] if hasattr(row, 'keys') else row[0])
+            department_name = str(department or '').strip()
+            if department_name and rows:
+                exact = [
+                    row for row in rows
+                    if str(row['dept_name'] or '').strip() == department_name
+                ]
+                if len(exact) == 1:
+                    return str(exact[0]['emp_id'])
+                fuzzy = [
+                    row for row in rows
+                    if department_name in str(row['dept_name'] or '')
+                    or str(row['dept_name'] or '') in department_name
+                ]
+                if len(fuzzy) == 1:
+                    return str(fuzzy[0]['emp_id'])
         return None
     finally:
         if owned:
